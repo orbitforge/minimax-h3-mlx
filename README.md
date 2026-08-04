@@ -169,8 +169,33 @@ AdaLN sidecar payload is opened; and the base contains 850 tensors totaling 16,4
 bytes. Active base MLX memory is approximately 16.466 GB, approximately 11.7 GB below the previous
 full-transformer load.
 
-Not yet proven: complete streamed modulation-cache construction, end-to-end denoising, final render
-memory peak, swap-write reduction, or numerical parity of streamed cache generation.
+The v0.3c base receipt does not prove streamed cache construction or generation behavior; those remain
+separate validation lanes below.
+
+### Sequential streamed AdaLN cache construction (v0.3d)
+
+The bounded v0.3d real probe was run externally against the complete derived checkpoint. It opened 50
+sidecars in strict block order, with 50 unique files and one builder-owned payload released before the
+next sidecar opened. The 77-entry timetable produced six BF16 arrays per block, each with shape
+`(231, 5376)`, and an exact retained-cache size of `745,113,600` bytes. Total sidecar logical bytes
+processed were `13,828,147,200`; maximum one-block active-memory increase was `295,665,800` bytes.
+
+The measured peak active MLX memory was `17,494,943,308` bytes. Completed derived base plus retained
+cache active memory was `17,212,941,760` bytes. Cache construction took `2.926 s`, and the total probe
+took `5.881 s`. After releasing both cache and transformer, the measured result was `948` active bytes
+and zero allocator cache.
+
+The probe loaded no Qwen or VAE, performed no transformer forward, and did no denoising, decoding, or
+rendering. This receipt does not claim generation support. Still unproven are real original-resident
+versus streamed-sidecar numerical parity, real transformer-forward parity, denoising, rendering, the
+final generation peak, and swap-write reduction.
+
+The external real-cache probe is:
+
+```bash
+./.venv/bin/python scripts/probe_streamed_adaln_cache.py \
+  /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln
+```
 
 The bounded real load probe is:
 
@@ -336,11 +361,12 @@ first-step reallocation, and the actual benefit depends on the MLX allocator and
 The repository includes a v0.3b converter that creates a new
 `minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte sidecar per
 transformer block, manifests, and verification receipts. v0.3c consumes the derived base in
-cache-only mode; the original mixed-shard format remains the only generation-capable runtime format.
+cache-only mode, and v0.3d constructs the retained modulation cache sequentially; the original
+mixed-shard format remains the only generation-capable runtime format.
 The derived base has loaded and evaluated successfully, with component-level active MLX memory of
 approximately 16.466 GB—approximately 11.7 GB below the previous full-transformer load. Sidecar
-cache construction, denoising, render peak, swap-write reduction, and streamed numerical parity
-remain unproven.
+real transformer-forward parity, denoising, render peak, swap-write reduction, and streamed numerical
+parity remain unproven.
 
 #### v0.3b Metal consumer-compatibility receipt
 

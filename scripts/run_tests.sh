@@ -15,6 +15,7 @@ run() {
 
 $PY tests/test_dit_smoke.py || fail=1
 $PY tests/test_cache_only_loader.py || fail=1
+$PY tests/test_streamed_adaln.py || fail=1
 run tests/test_dit_parity.py
 run tests/test_video_vae_parity.py
 run tests/test_audio_vae_parity.py
