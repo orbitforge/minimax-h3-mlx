@@ -290,6 +290,85 @@ ordinary component-release purges remain at the text-encoder, transformer, and V
 none runs between denoising steps. This may reduce peak pressure and swap at the cost of some
 first-step reallocation, and the actual benefit depends on the MLX allocator and must be measured.
 
+### Derived streamed-AdaLN checkpoint forge
+
+The repository includes a v0.3b converter for a future cache-only transformer runtime. It creates a
+new `minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte
+sidecar per transformer block, manifests, and verification receipts. The original mixed-shard
+checkpoint remains untouched and remains the current runtime format; no runtime code consumes the
+derived format yet, and no streamed-memory reduction has been proven. No complete v1 derived
+checkpoint existed before the v0.3b schema and verifier correction; the v1 identifier is retained
+for this still-unpublished format.
+
+#### v0.3b Metal consumer-compatibility receipt
+
+Validated on 2026-08-04 with the local MLX consumer. Block 0 loaded successfully with `mx.load`:
+lazy active memory was `0`, evaluated active memory was `276,594,688` bytes, and allocator cache
+after evaluation was `0`. The sidecar contained exactly four tensors: `bias`, `biases`, and
+`scales` as BF16, and `weight` as U32, with shapes `(96768,)`, `(96768, 42)`, `(96768, 42)`,
+and `(96768, 672)` respectively. After release and `clear_cache`, active memory was `196,608`
+bytes and allocator cache was `0`.
+
+Block 5, reconstructed from a cross-source-shard group, produced the identical successful receipt:
+lazy active memory `0`, evaluated active memory `276,594,688` bytes, allocator cache `0`, the same
+four tensors, dtypes, and shapes, and after release active memory `196,608` bytes with allocator
+cache `0`. The terminal result was `MLX SIDECAR COMPATIBILITY PASSED`. In the probe, on-disk
+Safetensors labels `BF16` and `U32` are compared against the MLX constants
+`mlx.core.bfloat16` and `mlx.core.uint32` through their string representations; this is the
+intentional dtype-name normalization boundary.
+
+The source transformer is approximately 30.3 GB on disk. The derived checkpoint is approximately
+30.3 GB more, so keeping both requires approximately 60.6 GB decimal before filesystem overhead
+(about 28.3 GiB each, 56.5 GiB together). The base contains all 848 ordinary tensors and the two
+final-layer AdaLN tensors; only the 200 block-level AdaLN tensors move to sidecars. Sidecars copy
+the original packed quantized values and BF16 bytes without dequantization or NumPy conversion.
+
+Inspect topology and disk requirements without writing:
+
+```sh
+./.venv/bin/python scripts/build_streamed_adaln_checkpoint.py \
+  --source /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit \
+  --output /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln \
+  --dry-run
+```
+
+For bounded development validation, write at most the selected sidecars and a complete base
+classification manifest under `/tmp`; this does not write the 16.4 GB base payload:
+
+```sh
+./.venv/bin/python scripts/build_streamed_adaln_checkpoint.py \
+  --source /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit \
+  --output /tmp/minimax-h3-streamed-adaln-block-5 \
+  --blocks 5
+```
+
+The complete conversion is explicit and is not run by the test suite:
+
+```sh
+./.venv/bin/python scripts/build_streamed_adaln_checkpoint.py \
+  --source /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit \
+  --output /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln
+```
+
+Verify an existing derived or bounded output without writing:
+
+```sh
+./.venv/bin/python scripts/build_streamed_adaln_checkpoint.py \
+  --source /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit \
+  --output /tmp/minimax-h3-streamed-adaln-block-5 \
+  --verify
+```
+
+The forge refuses an existing destination unless `--force` is supplied. It stages output in an
+incomplete sibling directory and verifies exact dtype/shape/payload checksums before publication.
+First-time publication uses an atomic directory rename. `--force` uses exception-safe
+backup-and-rollback: it moves the existing destination to a sibling backup, installs the verified
+output, and restores the backup when a handled publication step fails; this replacement is not
+crash-atomic. The completion record is intentionally excluded from `per_file_checksums` because
+it authenticates the other artifacts. The progress report uses decimal GB and binary GiB separately
+and includes conservative temporary and replacement-space accounting. A failure removes the
+incomplete sibling and preserves the prior destination when rollback is possible.
+
 A first run produces a misty forest with tall trunks, a mossy log in the foreground and an orange
 fox form moving across the later frames — semantically faithful to the prompt, with audio muxed in.
 Beyond eyeballing it, three properties are what say the wiring is right rather than merely plausible:

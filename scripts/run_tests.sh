@@ -21,6 +21,7 @@ run tests/test_text_encoder_parity.py
 run tests/test_pipeline_staged_loading.py
 run tests/test_quant_roundtrip.py
 run tests/test_packing_parity.py
+run tests/test_checkpoint_forge.py
 echo
 [ $fail -eq 0 ] && echo "ALL SUITES PASSED" || echo "SOME SUITES FAILED"
 exit $fail
