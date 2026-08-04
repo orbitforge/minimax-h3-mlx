@@ -131,6 +131,7 @@ class MiniMaxH3Pipeline:
         dtype: mx.Dtype = mx.bfloat16,
         load_vision: bool = False,
         unload_text_encoder: bool = False,
+        keep_adaln: bool = False,
         verbose: bool = True,
     ) -> "MiniMaxH3Pipeline":
         """Load a released ``FL2VA/`` (or ``Ref2VA/``) directory.
@@ -148,11 +149,18 @@ class MiniMaxH3Pipeline:
             load_dit,
             load_video_vae,
             load_video_vae_config,
+            inspect_checkpoint_format,
         )
         from .text_encoder import MiniMaxH3TextEncoder
 
         root = Path(checkpoint_dir)
         dit_path = Path(transformer_dir) if transformer_dir else root / "transformer"
+        format_info = inspect_checkpoint_format(dit_path)
+        if format_info.checkpoint_format == "derived" and keep_adaln:
+            raise ValueError(
+                "--keep-adaln is not supported for derived checkpoints: block AdaLN weights live in "
+                "sidecars and resident derived loading is not implemented"
+            )
         config = PipelineConfig.from_model_index(root / "model_index.json")
         dit_config = DiTConfig.from_json(dit_path / "config.json")
         video_vae_config = load_video_vae_config(root / "video_vae")
@@ -181,7 +189,7 @@ class MiniMaxH3Pipeline:
         # map or evaluate any generation component before the request has been encoded and the
         # large conditioner has been released.
         generation_loaders = {
-            "dit": lambda: load_dit(dit_path),
+            "dit": lambda: load_dit(dit_path, keep_adaln=keep_adaln),
             "video_vae": lambda: load_video_vae(root / "video_vae"),
             "audio_vae": lambda: load_audio_vae(root / "audio_vae"),
         }
@@ -392,6 +400,16 @@ class MiniMaxH3Pipeline:
             return
         if self.dit is None:
             raise RuntimeError("Cannot build the AdaLN cache before the transformer is loaded.")
+        if getattr(self.dit, "construction_mode", "resident") == "cache_only":
+            if not drop_adaln:
+                raise RuntimeError(
+                    "--keep-adaln is not supported for derived checkpoints: block AdaLN weights "
+                    "are stored in sidecars and resident loading is not implemented"
+                )
+            raise RuntimeError(
+                "generation from a derived checkpoint is not supported in v0.3c: streamed AdaLN "
+                "sidecar cache construction has not occurred"
+            )
         started = time.perf_counter()
         if verbose:
             print(f"  [memory] before AdaLN cache construction: {_memory_snapshot()}", flush=True)

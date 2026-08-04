@@ -62,6 +62,7 @@ def main() -> int:
         transformer_dir=args.transformer,
         load_vision=bool(images),
         unload_text_encoder=not args.keep_text_encoder,
+        keep_adaln=args.keep_adaln,
     )
     result = pipe(
         args.prompt,

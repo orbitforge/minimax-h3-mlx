@@ -33,6 +33,10 @@ import mlx.nn as nn
 from .config import MODALITY_NUM, DiTConfig
 
 
+RESIDENT_CONSTRUCTION = "resident"
+CACHE_ONLY_CONSTRUCTION = "cache_only"
+
+
 def param_dtype(layer: nn.Module) -> mx.Dtype:
     """The dtype a layer's *activations* should be aligned to.
 
@@ -205,6 +209,25 @@ class AdaLayerNormModulation(nn.Module):
         return tuple(h[..., i * self.hidden_size : (i + 1) * self.hidden_size] for i in range(6))
 
 
+class CacheOnlyAdaLayerNormModulation(nn.Module):
+    """Parameter-free block AdaLN interface for a sidecar-backed transformer.
+
+    v0.3c deliberately does not read sidecars or construct their modulation table. Keeping a
+    parameter-free sentinel in the same module slot preserves the block interface while making it
+    impossible for a cache-only model to silently allocate or execute a resident projection.
+    """
+
+    def __init__(self, config: DiTConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+
+    def __call__(self, temb: mx.array) -> tuple[mx.array, ...]:
+        raise RuntimeError(
+            "cache-only transformer blocks require a complete modulation cache; "
+            "streamed AdaLN cache construction has not occurred"
+        )
+
+
 class AdaLayerNormModulationOut(nn.Module):
     """``final_layer.adaln_proj`` — the ``linear`` sub-name matches the checkpoint."""
 
@@ -265,13 +288,18 @@ class TokenRefiner(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm attention and feed-forward, each modulated by AdaLN parameters selected per row."""
 
-    def __init__(self, config: DiTConfig):
+    def __init__(self, config: DiTConfig, construction_mode: str = RESIDENT_CONSTRUCTION):
         super().__init__()
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = Attention(config)
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = FeedForward(config)
-        self.adaln_proj = AdaLayerNormModulation(config)
+        if construction_mode == RESIDENT_CONSTRUCTION:
+            self.adaln_proj = AdaLayerNormModulation(config)
+        elif construction_mode == CACHE_ONLY_CONSTRUCTION:
+            self.adaln_proj = CacheOnlyAdaLayerNormModulation(config)
+        else:
+            raise ValueError(f"unsupported transformer construction mode: {construction_mode!r}")
 
     def __call__(
         self,
@@ -299,9 +327,12 @@ class MiniMaxH3DiT(nn.Module):
     position grid, per-row modality tags and per-row timestep indices. See ``packing.py``.
     """
 
-    def __init__(self, config: DiTConfig):
+    def __init__(self, config: DiTConfig, construction_mode: str = RESIDENT_CONSTRUCTION):
         super().__init__()
+        if construction_mode not in (RESIDENT_CONSTRUCTION, CACHE_ONLY_CONSTRUCTION):
+            raise ValueError(f"unsupported transformer construction mode: {construction_mode!r}")
         self.config = config
+        self.construction_mode = construction_mode
 
         # 1. Per-modality input projections.
         self.video_patch_proj = nn.Linear(config.video_patch_dim, config.hidden_size, bias=True)
@@ -315,7 +346,10 @@ class MiniMaxH3DiT(nn.Module):
         self.token_refiner = TokenRefiner(config)
 
         # 4. The block stack.
-        self.blocks = [TransformerBlock(config) for _ in range(config.num_layers)]
+        self.blocks = [
+            TransformerBlock(config, construction_mode=construction_mode)
+            for _ in range(config.num_layers)
+        ]
 
         # 5. Shared output norm and the two per-modality heads. Both heads run over every row;
         #    the rows of each modality are selected afterwards.
@@ -357,9 +391,20 @@ class MiniMaxH3DiT(nn.Module):
             ``(video_velocity, audio_velocity)`` in the row order of ``video_indices`` /
             ``audio_indices``.
         """
-        seq_len = position_ids.shape[0]
+        if self.construction_mode == CACHE_ONLY_CONSTRUCTION and modulation_cache is None:
+            raise RuntimeError(
+                "cache-only transformer requires a complete modulation cache; "
+                "streamed AdaLN cache construction has not occurred"
+            )
         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
             raise ValueError(f"`position_ids` must be (seq_len, 3), got {position_ids.shape}.")
+        seq_len = position_ids.shape[0]
+        if self.construction_mode == CACHE_ONLY_CONSTRUCTION:
+            validate = getattr(modulation_cache, "validate_for", None)
+            if not callable(validate):
+                raise TypeError("cache-only transformer received an unsupported modulation cache")
+            validate(self.config, timestep, timestep_indices, seq_len)
+
         if token_tags.shape != (seq_len,) or timestep_indices.shape != (seq_len,):
             raise ValueError(
                 "`token_tags` and `timestep_indices` must be (seq_len,) matching `position_ids`, got "

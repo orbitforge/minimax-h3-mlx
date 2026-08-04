@@ -142,6 +142,47 @@ python scripts/generate.py "a red fox leaps over a mossy log" -o fox.mp4 \
   -t /path/to/MiniMax-H3-MLX-4bit
 ```
 
+### Streamed AdaLN derived base (v0.3c)
+
+The v0.3b forge can produce a complete derived checkpoint with format identifier
+`minimax-h3-mlx-streamed-adaln-v1`. `load_dit` detects that format only from a validated
+`conversion_manifest.json`; missing, bounded, pending, unsupported, or structurally incomplete
+derived output fails before model construction. The normal original checkpoint path remains
+resident-AdaLN compatible.
+
+For a complete derived checkpoint, the loader uses `base/`, constructs the transformer in explicit
+`cache_only` mode, and strictly requires the 848 ordinary transformer tensors plus the two
+`final_layer.adaln_proj.linear` tensors. All 50 block-level AdaLN projection modules are absent from
+the model tree: their packed weights, scales, quantization biases, and learned biases remain in the
+50 `adaln/` sidecars. The final-layer AdaLN projection remains resident and loadable.
+
+This slice does not open sidecars, build the modulation cache, run denoising, or support generation
+from the derived checkpoint. A cache-only forward rejects missing, partial, malformed, or
+timesteps-incomplete modulation data with an explicit error. `--keep-adaln` continues to mean the
+existing resident behavior for original checkpoints, but is rejected for derived checkpoints because
+resident sidecar loading is not implemented.
+
+Proven by the real derived-base load probe: the complete derived base loads successfully; all block
+attention and feed-forward parameters are present; block-level AdaLN parameters are absent; the
+final-layer AdaLN weight and bias remain resident; exactly five base payloads are opened and no
+AdaLN sidecar payload is opened; and the base contains 850 tensors totaling 16,464,048,640 logical
+bytes. Active base MLX memory is approximately 16.466 GB, approximately 11.7 GB below the previous
+full-transformer load.
+
+Not yet proven: complete streamed modulation-cache construction, end-to-end denoising, final render
+memory peak, swap-write reduction, or numerical parity of streamed cache generation.
+
+The bounded real load probe is:
+
+```bash
+./.venv/bin/python scripts/probe_derived_base_load.py \
+  /Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln
+```
+
+It loads only the five base shards and reports MLX active memory, allocator cache, peak memory,
+timings, tensor counts, model-tree invariants, sidecar-open proof, and release telemetry. It does not
+claim swap reduction or successful rendering.
+
 The core is quantized at the named width; `adaln_proj` is held at 8-bit in every build, which costs
 0.25% on the modulation table and takes 12.2 GB off each download.
 
@@ -292,13 +333,14 @@ first-step reallocation, and the actual benefit depends on the MLX allocator and
 
 ### Derived streamed-AdaLN checkpoint forge
 
-The repository includes a v0.3b converter for a future cache-only transformer runtime. It creates a
-new `minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte
-sidecar per transformer block, manifests, and verification receipts. The original mixed-shard
-checkpoint remains untouched and remains the current runtime format; no runtime code consumes the
-derived format yet, and no streamed-memory reduction has been proven. No complete v1 derived
-checkpoint existed before the v0.3b schema and verifier correction; the v1 identifier is retained
-for this still-unpublished format.
+The repository includes a v0.3b converter that creates a new
+`minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte sidecar per
+transformer block, manifests, and verification receipts. v0.3c consumes the derived base in
+cache-only mode; the original mixed-shard format remains the only generation-capable runtime format.
+The derived base has loaded and evaluated successfully, with component-level active MLX memory of
+approximately 16.466 GB—approximately 11.7 GB below the previous full-transformer load. Sidecar
+cache construction, denoising, render peak, swap-write reduction, and streamed numerical parity
+remain unproven.
 
 #### v0.3b Metal consumer-compatibility receipt
 
@@ -456,7 +498,7 @@ scripts/
   bench_dit.py          per-block timing at realistic packed lengths
   upload.py             publish to the Hub; refuses to run without the upstream LICENSE
   make_collection.py    build/refresh the Hub collection
-  run_tests.sh          all seven suites
+  run_tests.sh          all ten suites
 
 tests/           parity vs the reference, quant round-trip, smoke
 ```

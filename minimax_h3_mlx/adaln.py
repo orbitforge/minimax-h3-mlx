@@ -29,6 +29,26 @@ from .config import MODALITY_NUM
 from .dit import timestep_embedding
 
 
+def _stable_timestep_values(values: mx.array) -> list[float]:
+    return [round(float(value), 9) for value in values.tolist()]
+
+
+def _is_integer_dtype(dtype: mx.Dtype) -> bool:
+    return dtype in {
+        getattr(mx, name)
+        for name in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64")
+        if hasattr(mx, name)
+    }
+
+
+def _is_modulation_dtype(dtype: mx.Dtype) -> bool:
+    return dtype in {
+        getattr(mx, name)
+        for name in ("float16", "bfloat16", "float32")
+        if hasattr(mx, name)
+    }
+
+
 class ModulationCache:
     """Per-block AdaLN modulation, precomputed for a fixed set of distinct timesteps.
 
@@ -43,6 +63,81 @@ class ModulationCache:
 
     def get(self, block_index: int) -> tuple[mx.array, ...]:
         return self.tables[block_index]
+
+    def validate_for(
+        self,
+        config,
+        requested_timesteps: mx.array,
+        timestep_indices: mx.array,
+        packed_sequence_length: int,
+    ) -> None:
+        """Validate the complete cache boundary before a cache-only forward.
+
+        This intentionally checks structure and host-visible metadata only. It does not evaluate
+        the retained arrays, and v0.3c never constructs or reads sidecar files.
+        """
+        if not isinstance(self.timesteps, mx.array) or self.timesteps.ndim != 1:
+            raise ValueError("modulation cache timesteps must be a one-dimensional MLX array")
+        if self.num_timesteps == 0:
+            raise ValueError("modulation cache must contain at least one timestep")
+        if not isinstance(requested_timesteps, mx.array) or requested_timesteps.ndim != 1:
+            raise ValueError("requested transformer timesteps must be a one-dimensional MLX array")
+        if not isinstance(timestep_indices, mx.array) or timestep_indices.ndim != 1:
+            raise ValueError("transformer timestep_indices must be a one-dimensional MLX array")
+        if not _is_integer_dtype(timestep_indices.dtype):
+            raise ValueError("transformer timestep_indices must have an integer dtype")
+        if timestep_indices.shape[0] != packed_sequence_length:
+            raise ValueError(
+                "transformer timestep_indices count must equal the packed sequence length: "
+                f"got {timestep_indices.shape[0]}, expected {packed_sequence_length}"
+            )
+
+        if len(self.tables) != config.num_layers:
+            raise ValueError(
+                f"modulation cache is incomplete: expected {config.num_layers} block entries, "
+                f"got {len(self.tables)}"
+            )
+        expected_shape = (self.num_timesteps * MODALITY_NUM, config.hidden_size)
+        modulation_dtype: mx.Dtype | None = None
+        for block_index, table in enumerate(self.tables):
+            if not isinstance(table, tuple) or len(table) != 6:
+                raise ValueError(
+                    f"modulation cache block {block_index} must contain six modulation tensors"
+                )
+            for tensor_index, tensor in enumerate(table):
+                if not isinstance(tensor, mx.array) or tensor.shape != expected_shape:
+                    actual = getattr(tensor, "shape", None)
+                    raise ValueError(
+                        f"modulation cache block {block_index} tensor {tensor_index} has shape "
+                        f"{actual}; expected {expected_shape}"
+                    )
+                if not _is_modulation_dtype(tensor.dtype):
+                    raise ValueError(
+                        f"modulation cache block {block_index} tensor {tensor_index} has dtype "
+                        f"{tensor.dtype}; expected float16, bfloat16, or float32"
+                    )
+                if modulation_dtype is None:
+                    modulation_dtype = tensor.dtype
+                elif tensor.dtype != modulation_dtype:
+                    raise ValueError("modulation cache arrays must use one consistent floating dtype")
+
+        try:
+            cached = _stable_timestep_values(self.timesteps)
+            requested = _stable_timestep_values(requested_timesteps)
+            indices = timestep_indices.tolist()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError("modulation cache metadata is not host-readable") from exc
+        if len(requested) != len(cached):
+            raise ValueError(
+                "requested timetable count must equal cached timetable count: "
+                f"got {len(requested)}, expected {len(cached)}"
+            )
+        if len(set(cached)) != len(cached):
+            raise ValueError("modulation cache timetable contains duplicate entries")
+        if requested != cached:
+            raise ValueError("requested timetable must exactly match cached timetable in order")
+        if any(index < 0 or index >= self.num_timesteps for index in indices):
+            raise ValueError("modulation cache does not contain every requested timestep index")
 
     @property
     def num_timesteps(self) -> int:
@@ -111,7 +206,9 @@ def drop_adaln_weights(dit) -> int:
     """
     freed = 0
     for block in dit.blocks:
-        linear = block.adaln_proj.linear
+        linear = getattr(block.adaln_proj, "linear", None)
+        if linear is None:
+            continue
         for name in ("weight", "bias", "scales", "biases"):
             param = getattr(linear, name, None)
             if isinstance(param, mx.array):
