@@ -272,6 +272,24 @@ draw is not bit-identical to the reference's, though everything around it is.
 ./.venv/bin/python scripts/generate.py "a red fox leaps over a mossy log" -o fox.mp4
 ```
 
+The CLI defaults to the 0.2 MP 16:9 canvas (608x352) to keep local Apple Silicon experiments
+within a smaller memory envelope. Use `--megapixels`, or explicit `--height` and `--width`, when
+you intentionally want to move toward the 768-pixel training canvas.
+
+The CLI uses phase-isolated staged loading: Qwen is loaded first, the prompt (and any images) are
+encoded, and the resulting conditioning is materialized before the transformer is loaded. The
+transformer builds its AdaLN cache, denoises, and is released before either decoder VAE is loaded.
+Video and audio decoding are also separate phases. Image-conditioned runs temporarily load the
+video VAE to encode keyframes, release it for transformer denoising, then reload it for final video
+decoding; that reload is the cost of keeping transformer and decoder residency disjoint.
+The default lifecycle releases Qwen before generation; `--keep-text-encoder` intentionally retains
+it after encoding for repeated in-process use and therefore increases memory overlap with the
+transformer.
+After AdaLN projections are dropped, the dedicated AdaLN allocator purge runs once before denoising;
+ordinary component-release purges remain at the text-encoder, transformer, and VAE boundaries, and
+none runs between denoising steps. This may reduce peak pressure and swap at the cost of some
+first-step reallocation, and the actual benefit depends on the MLX allocator and must be measured.
+
 A first run produces a misty forest with tall trunks, a mossy log in the foreground and an orange
 fox form moving across the later frames — semantically faithful to the prompt, with audio muxed in.
 Beyond eyeballing it, three properties are what say the wiring is right rather than merely plausible:

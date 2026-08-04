@@ -24,6 +24,7 @@ unmasked attention path available.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 
 import mlx.core as mx
 import numpy as np
@@ -88,18 +89,25 @@ class PackedSequence:
     num_condition_audio_rows: int
 
 
-def resolve_canvas_size(aspect_width: float, aspect_height: float) -> tuple[int, int]:
+def resolve_canvas_size(
+    aspect_width: float,
+    aspect_height: float,
+    megapixels: float | None = None,
+) -> tuple[int, int]:
     """Resolve a display aspect ratio into a MiniMax-H3 canvas.
 
-    The short edge starts at 768, the area is capped at ``768 * 1344`` and both axes are rounded to
-    the nearest multiple of 32 — so the final area may end up slightly above the pre-rounding
-    budget. Only the ratio of the arguments matters.
+    By default, the short edge starts at 768 and the area is capped at
+    ``768 * 1344``. When ``megapixels`` is provided, it selects a smaller or
+    larger area budget instead. Both axes are aligned to a multiple of 32, so
+    the final area may end up slightly above the pre-rounding budget.
 
     Returns:
         ``(height, width)`` of the canvas.
     """
     if aspect_width <= 0 or aspect_height <= 0:
         raise ValueError(f"The aspect ratio must be positive, got {aspect_width}:{aspect_height}.")
+    if megapixels is not None and megapixels <= 0:
+        raise ValueError(f"`megapixels` must be positive, got {megapixels}.")
 
     ratio = aspect_width / aspect_height
     if not MIN_ASPECT_RATIO <= ratio <= MAX_ASPECT_RATIO:
@@ -108,17 +116,26 @@ def resolve_canvas_size(aspect_width: float, aspect_height: float) -> tuple[int,
             f"{aspect_width}:{aspect_height} ({ratio:g})."
         )
 
-    if ratio >= 1.0:
-        width, height = SHORT_EDGE * ratio, float(SHORT_EDGE)
-    else:
-        width, height = float(SHORT_EDGE), SHORT_EDGE / ratio
+    if megapixels is None:
+        if ratio >= 1.0:
+            width, height = SHORT_EDGE * ratio, float(SHORT_EDGE)
+        else:
+            width, height = float(SHORT_EDGE), SHORT_EDGE / ratio
 
-    area = width * height
-    if area > MAX_PIXELS:
-        scale = (MAX_PIXELS / area) ** 0.5
-        width, height = width * scale, height * scale
+        area = width * height
+        if area > MAX_PIXELS:
+            scale = (MAX_PIXELS / area) ** 0.5
+            width, height = width * scale, height * scale
+    else:
+        area = megapixels * 1_000_000
+        height = (area / ratio) ** 0.5
+        width = height * ratio
 
     m = CANVAS_MULTIPLE
+    if megapixels is not None:
+        # Match the ComfyUI size presets: round each axis upward so the
+        # requested area is not undershot after alignment.
+        return max(m, ceil(height / m) * m), max(m, ceil(width / m) * m)
     return max(m, round(height / m) * m), max(m, round(width / m) * m)
 
 

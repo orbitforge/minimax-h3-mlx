@@ -51,6 +51,12 @@ class ModulationCache:
     def nbytes(self) -> int:
         return sum(t.nbytes for table in self.tables for t in table)
 
+    def materialize(self) -> None:
+        """Evaluate every array retained by the denoising cache."""
+        arrays = [self.timesteps]
+        arrays.extend(tensor for table in self.tables for tensor in table)
+        mx.eval(*arrays)
+
     @classmethod
     def build(
         cls,

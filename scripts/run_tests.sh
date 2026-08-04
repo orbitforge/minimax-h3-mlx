@@ -5,13 +5,20 @@ set -u
 cd "$(dirname "$0")/.."
 PY=./.venv/bin/python
 fail=0
-run() { echo; echo "=== $1 ==="; $PY "$1" 2>&1 | grep -vE "^(Modular|/opt/homebrew.*Warning|  WeightNorm)" || fail=1; }
+run() {
+  echo
+  echo "=== $1 ==="
+  $PY "$1" 2>&1 | grep -vE "^(Modular|/opt/homebrew.*Warning|  WeightNorm)"
+  statuses=("${PIPESTATUS[@]}")
+  [ "${statuses[0]}" -eq 0 ] || fail=1
+}
 
-python3 tests/test_dit_smoke.py || fail=1
+$PY tests/test_dit_smoke.py || fail=1
 run tests/test_dit_parity.py
 run tests/test_video_vae_parity.py
 run tests/test_audio_vae_parity.py
 run tests/test_text_encoder_parity.py
+run tests/test_pipeline_staged_loading.py
 run tests/test_quant_roundtrip.py
 run tests/test_packing_parity.py
 echo

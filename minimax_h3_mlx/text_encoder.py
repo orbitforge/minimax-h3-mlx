@@ -79,9 +79,27 @@ class MiniMaxH3TextEncoder:
         self.model_config.text_config = self.text_config
         self.model_config.vision_config = self.vision_config
 
-        self.language = Qwen3VLModel(self.text_config)
-        self.vision = VisionModel(self.vision_config) if load_vision else None
-        self._load_weights(model_dir, dtype, verbose)
+        # MLX-community Qwen checkpoints carry quantization metadata and use
+        # MLX's packed weight names.  Let mlx-vlm construct/quantize those
+        # modules; the raw H3 checkpoint path below remains available for the
+        # original safetensors release.
+        if raw.get("quantization") or raw.get("quantization_config"):
+            from mlx_vlm.utils import load_model
+
+            if verbose:
+                print("  loading quantized Qwen checkpoint with mlx-vlm")
+            loaded = load_model(model_dir, lazy=True, strict=False)
+            self.language = loaded.language_model.model
+            self.language.layers = self.language.layers[:num_layers]
+            self.vision = loaded.vision_tower if load_vision else None
+            self.skipped_tensors = 0
+            mx.eval(self.language.parameters())
+            if self.vision is not None:
+                mx.eval(self.vision.parameters())
+        else:
+            self.language = Qwen3VLModel(self.text_config)
+            self.vision = VisionModel(self.vision_config) if load_vision else None
+            self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
         self.vision_start_token_id = raw["vision_start_token_id"]
@@ -171,7 +189,10 @@ class MiniMaxH3TextEncoder:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(str(self._model_dir.parent / "processor"))
+            processor_dir = self._model_dir.parent / "processor"
+            if not processor_dir.exists():
+                processor_dir = self._model_dir
+            self._processor = AutoProcessor.from_pretrained(str(processor_dir))
         return self._processor
 
     # -- request presentation --------------------------------------------------------------

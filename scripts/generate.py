@@ -2,10 +2,11 @@
 
     ./.venv/bin/python scripts/generate.py "a red fox leaps over a mossy log" -o fox.mp4
 
-Read the performance section of the README first: a step at the released 768-pixel canvas is ~8.8
-minutes for a 5 s clip and ~1 hour for 15 s on an M3 Ultra, because MiniMax has not released its
-sparse-attention implementation. `--height/--width` shrink the canvas for wiring checks, but H3 was
-trained for a 768 short edge and anything else is off-distribution.
+The CLI defaults to a 0.2 MP canvas (608x352 at 16:9), which is a safer starting point on smaller
+Apple Silicon machines. Read the performance section of the README before selecting the released
+768-pixel canvas: a step there is ~8.8 minutes for a 5 s clip on an M3 Ultra because MiniMax has
+not released its sparse-attention implementation. `--megapixels` or `--height/--width` can select
+larger canvases explicitly; anything below the 768-pixel training canvas is off-distribution.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ def main() -> int:
     parser.add_argument("-s", "--steps", type=int, default=16, help="sigma grid points; drives steps - 1 forwards")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--aspect", type=int, nargs=2, default=(16, 9))
+    parser.add_argument("--megapixels", type=float, default=0.2,
+                        help="default canvas area in megapixels (default: 0.2; ignored with height/width)")
     parser.add_argument("--height", type=int, default=None, help="canvas override, multiple of 32")
     parser.add_argument("--width", type=int, default=None, help="canvas override, multiple of 32")
     parser.add_argument("--image", action="append", default=None, help="keyframe image (repeatable)")
@@ -41,6 +44,8 @@ def main() -> int:
                         help="anchor for each --image, in order")
     parser.add_argument("--keep-adaln", action="store_true",
                         help="keep the 13B adaln_proj resident instead of caching and dropping it")
+    parser.add_argument("--keep-text-encoder", action="store_true",
+                        help="keep the Qwen conditioner resident after prompt encoding")
     args = parser.parse_args()
 
     images = None
@@ -53,12 +58,16 @@ def main() -> int:
         parser.error(f"--anchor must be given once per --image ({len(images)} images, {len(anchors)} anchors)")
 
     pipe = MiniMaxH3Pipeline.from_pretrained(
-        args.checkpoint, transformer_dir=args.transformer, load_vision=bool(images)
+        args.checkpoint,
+        transformer_dir=args.transformer,
+        load_vision=bool(images),
+        unload_text_encoder=not args.keep_text_encoder,
     )
     result = pipe(
         args.prompt,
         duration_seconds=args.duration,
         aspect=tuple(args.aspect),
+        megapixels=args.megapixels,
         num_inference_steps=args.steps,
         seed=args.seed,
         images=images,
