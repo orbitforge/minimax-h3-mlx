@@ -6,8 +6,16 @@ drives two independent schedules over one shared transformer forward.
 
 from __future__ import annotations
 
-import mlx.core as mx
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
+
+
+def _mx() -> Any:
+    """Import MLX only when a production scheduler array is actually requested."""
+    import mlx.core as mx
+    return mx
 
 
 def _linspace_1_to_0(n: int) -> np.ndarray:
@@ -46,8 +54,8 @@ class MiniMaxH3Scheduler:
         if shift <= 0:
             raise ValueError(f"`shift` must be positive, got {shift}.")
         self._shift = float(shift)
-        self.sigmas: mx.array | None = None
-        self.timesteps: mx.array | None = None
+        self.sigmas: Any | None = None
+        self.timesteps: Any | None = None
         self.num_inference_steps: int | None = None
         self._step_index: int | None = None
 
@@ -68,7 +76,7 @@ class MiniMaxH3Scheduler:
     def set_timesteps(
         self,
         num_inference_steps: int | None = None,
-        sigmas: list[float] | mx.array | None = None,
+        sigmas: list[float] | Any | None = None,
     ) -> None:
         """Build the sigma / timestep schedule.
 
@@ -90,13 +98,14 @@ class MiniMaxH3Scheduler:
                 if not values or v != values[-1]:
                     values.append(v)
         else:
-            values = [float(v) for v in (sigmas.tolist() if isinstance(sigmas, mx.array) else sigmas)]
+            values = [float(v) for v in (sigmas.tolist() if hasattr(sigmas, "tolist") else sigmas)]
             decreasing = all(b < a for a, b in zip(values, values[1:]))
             if len(values) < 2 or not decreasing or values[-1] != 0.0:
                 raise ValueError(
                     "`sigmas` must hold at least two strictly decreasing values ending at 0.0."
                 )
 
+        mx = _mx()
         self.sigmas = mx.array(values, dtype=mx.float32)
         self.timesteps = mx.array([1.0 - s for s in values[:-1]], dtype=mx.float32)
         self.num_inference_steps = len(values) - 1
@@ -112,7 +121,7 @@ class MiniMaxH3Scheduler:
             "Passed `timestep` is not in `self.timesteps`. Use values from `scheduler.timesteps`."
         )
 
-    def scale_noise(self, sample: mx.array, timestep: float, noise: mx.array) -> mx.array:
+    def scale_noise(self, sample: Any, timestep: float, noise: Any) -> Any:
         """Rectified-flow forward process in MiniMax-H3's ``t`` convention: ``x_t = t*x0 + (1-t)*noise``.
 
         Used to noise conditioning anchors, where ``t`` is a ``noise_aug`` level rather than a
@@ -121,7 +130,7 @@ class MiniMaxH3Scheduler:
         t32 = np.float32(timestep)
         return float(t32) * sample + float(np.float32(1.0) - t32) * noise
 
-    def step(self, model_output: mx.array, timestep: float, sample: mx.array) -> mx.array:
+    def step(self, model_output: Any, timestep: float, sample: Any) -> Any:
         """One Euler (``eta = 0``) step.
 
         The model output is a **data-ward** velocity, so the denoised estimate is
@@ -134,8 +143,15 @@ class MiniMaxH3Scheduler:
                 "Passing integer indices as timesteps is not supported; pass one of the "
                 "`scheduler.timesteps` values."
             )
+        requested_index = self.index_for_timestep(timestep)
         if self._step_index is None:
-            self._step_index = self.index_for_timestep(timestep)
+            self._step_index = requested_index
+        elif self._step_index != requested_index:
+            raise ValueError(
+                f"scheduler cursor mismatch: cursor={self._step_index}, requested={requested_index}"
+            )
+        if self._step_index >= self.num_inference_steps:
+            raise IndexError("scheduler has no remaining transition")
 
         # The sigma used for x0 is recovered from the *timestep* the transformer was conditioned
         # on, while the Euler ratio below uses the sigma grid: for sigma < 0.5 the float32 round
@@ -150,6 +166,147 @@ class MiniMaxH3Scheduler:
         ratio = sigma_next / sigma
         one_minus_ratio = float(np.float32(1.0) - ratio)
 
+        mx = _mx()
         prev = float(ratio) * sample.astype(mx.float32) + one_minus_ratio * denoised.astype(mx.float32)
         self._step_index += 1
         return prev.astype(sample.dtype)
+
+    def transition(self, step_index: int) -> "MiniMaxH3ScheduleTransition":
+        if not isinstance(step_index, int) or isinstance(step_index, bool):
+            raise ValueError(f"step_index must be an integer, got {step_index!r}")
+        if self.sigmas is None or self.timesteps is None or self.num_inference_steps is None:
+            raise ValueError("scheduler has no configured timestep schedule")
+        if step_index < 0 or step_index >= self.num_inference_steps:
+            raise IndexError(
+                f"step_index {step_index} is outside the valid range [0, {self.num_inference_steps})"
+            )
+        return MiniMaxH3ScheduleTransition(
+            step_index=step_index,
+            current_timestep=float(self.timesteps[step_index].item()),
+            next_timestep=1.0 - float(self.sigmas[step_index + 1].item()),
+            current_sigma=float(self.sigmas[step_index].item()),
+            next_sigma=float(self.sigmas[step_index + 1].item()),
+        )
+
+
+@dataclass(frozen=True)
+class MiniMaxH3ScheduleTransition:
+    """The canonical, observable transition consumed by one-step denoising."""
+
+    step_index: int
+    current_timestep: float
+    next_timestep: float
+    current_sigma: float
+    next_sigma: float
+
+
+@dataclass(frozen=True)
+class MiniMaxH3MultimodalScheduleTransition:
+    """The complete state for one adjacent video/audio transition."""
+
+    step_index: int
+    video_current_timestep: float
+    video_next_timestep: float
+    video_current_sigma: float
+    video_next_sigma: float
+    audio_current_timestep: float
+    audio_next_timestep: float
+    audio_current_sigma: float
+    audio_next_sigma: float
+
+
+class MiniMaxH3MultimodalScheduler:
+    """One production update over MiniMax-H3's video and audio schedules.
+
+    H3 has one transformer forward but two rectified-flow schedules.  Keeping this adapter next to
+    the scalar scheduler makes that fact explicit while giving the production denoising seam one
+    update operation to call.  ``step`` is intentionally not a loop: it performs exactly one video
+    update and one audio update for the selected adjacent transition.
+    """
+
+    prediction_parameterization = "velocity"
+    input_scaling = "identity"
+    update_method = "rectified-flow-euler-data-ward-velocity-v1"
+
+    def __init__(self, video: MiniMaxH3Scheduler, audio: MiniMaxH3Scheduler):
+        self.video = video
+        self.audio = audio
+        if video.timesteps is None or audio.timesteps is None:
+            raise ValueError("both modality schedulers must have a canonical schedule before construction")
+        if video.num_inference_steps != audio.num_inference_steps:
+            raise ValueError("video and audio schedules must have the same number of inference steps")
+
+    @property
+    def num_inference_steps(self) -> int:
+        return int(self.video.num_inference_steps or 0)
+
+    @property
+    def timesteps(self) -> Any:
+        return self.video.timesteps
+
+    def transition(self, step_index: int) -> MiniMaxH3MultimodalScheduleTransition:
+        if not isinstance(step_index, int) or isinstance(step_index, bool):
+            raise ValueError(f"step_index must be an integer, got {step_index!r}")
+        if step_index < 0 or step_index >= self.num_inference_steps:
+            raise IndexError(
+                f"step_index {step_index} is outside the valid range [0, {self.num_inference_steps})"
+            )
+        video = self.video.transition(step_index)
+        audio = self.audio.transition(step_index)
+        if video.step_index != audio.step_index:
+            raise ValueError("video and audio scalar transitions disagree on step index")
+        if not (0.0 <= video.next_sigma < video.current_sigma and 0.0 <= audio.next_sigma < audio.current_sigma):
+            raise ValueError("both modality next sigmas must be nonnegative and below current sigma")
+        return MiniMaxH3MultimodalScheduleTransition(
+            step_index=step_index,
+            video_current_timestep=video.current_timestep,
+            video_next_timestep=video.next_timestep,
+            video_current_sigma=video.current_sigma,
+            video_next_sigma=video.next_sigma,
+            audio_current_timestep=audio.current_timestep,
+            audio_next_timestep=audio.next_timestep,
+            audio_current_sigma=audio.current_sigma,
+            audio_next_sigma=audio.next_sigma,
+        )
+
+    def prepare_model_input(
+        self, video_sample: Any, audio_sample: Any, step_index: int
+    ) -> tuple[Any, Any]:
+        """Return scheduler-prepared inputs; H3's production contract is identity scaling."""
+        self.transition(step_index)
+        return video_sample, audio_sample
+
+    def step(
+        self,
+        video_prediction: Any,
+        audio_prediction: Any,
+        video_sample: Any,
+        audio_sample: Any,
+        step_index: int,
+    ) -> tuple[Any, Any]:
+        transition = self.transition(step_index)
+        expected_cursor = step_index
+        for label, scalar in (("video", self.video), ("audio", self.audio)):
+            if scalar.step_index is not None and scalar.step_index != expected_cursor:
+                raise ValueError(
+                    f"{label} scheduler cursor mismatch: cursor={scalar.step_index}, expected={expected_cursor}"
+                )
+        # The scalar schedulers own the exact float32 arithmetic and their mutable cursor.  The
+        # adapter is the single production update boundary and restores the batch dimension.
+        video_next = self.video.step(video_prediction[0], transition.video_current_timestep, video_sample[0])[None]
+        audio_next = self.audio.step(audio_prediction[0], transition.audio_current_timestep, audio_sample[0])[None]
+        expected_next_cursor = step_index + 1
+        if self.video.step_index != expected_next_cursor or self.audio.step_index != expected_next_cursor:
+            raise ValueError("video and audio scalar cursors did not advance to the same next index")
+        return video_next, audio_next
+
+    def configuration(self) -> dict[str, object]:
+        return {
+            "identity": "MiniMaxH3MultimodalScheduler",
+            "video": {"identity": "MiniMaxH3Scheduler", "shift": self.video.shift},
+            "audio": {"identity": "MiniMaxH3Scheduler", "shift": self.audio.shift},
+            "num_inference_steps": self.num_inference_steps,
+            "prediction_parameterization": self.prediction_parameterization,
+            "input_scaling": self.input_scaling,
+            "update_method": self.update_method,
+        }
