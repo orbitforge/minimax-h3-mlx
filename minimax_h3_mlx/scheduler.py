@@ -18,6 +18,13 @@ def _mx() -> Any:
     return mx
 
 
+def _float32(value: Any) -> Any:
+    """Promote MLX values without forcing MLX onto NumPy scheduler fakes."""
+    if getattr(value, "__mlx_array__", False) or value.__class__.__module__.startswith("mlx."):
+        return value.astype(_mx().float32)
+    return np.asarray(value, dtype=np.float32)
+
+
 def _linspace_1_to_0(n: int) -> np.ndarray:
     """``linspace(1, 0, n)`` in float32, bit-identical to ``torch.linspace``.
 
@@ -291,10 +298,15 @@ class MiniMaxH3MultimodalScheduler:
                 raise ValueError(
                     f"{label} scheduler cursor mismatch: cursor={scalar.step_index}, expected={expected_cursor}"
                 )
-        # The scalar schedulers own the exact float32 arithmetic and their mutable cursor.  The
-        # adapter is the single production update boundary and restores the batch dimension.
-        video_next = self.video.step(video_prediction[0], transition.video_current_timestep, video_sample[0])[None]
-        audio_next = self.audio.step(audio_prediction[0], transition.audio_current_timestep, audio_sample[0])[None]
+        # The production pipeline promotes each transformer prediction to float32 before the
+        # scalar Euler update. Preserve that boundary here as well; the samples remain in their
+        # production bfloat16 storage dtype and the scalar schedulers own the exact float32 math.
+        video_next = self.video.step(
+            _float32(video_prediction[0]), transition.video_current_timestep, video_sample[0]
+        )[None]
+        audio_next = self.audio.step(
+            _float32(audio_prediction[0]), transition.audio_current_timestep, audio_sample[0]
+        )[None]
         expected_next_cursor = step_index + 1
         if self.video.step_index != expected_next_cursor or self.audio.step_index != expected_next_cursor:
             raise ValueError("video and audio scalar cursors did not advance to the same next index")
