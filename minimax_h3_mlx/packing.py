@@ -231,6 +231,15 @@ def unpack_audio_tokens(rows: mx.array, num_audio_latents: int) -> mx.array:
     return x.transpose(0, 2, 1)
 
 
+def pack_audio_latents(latents: mx.array) -> mx.array:
+    """Pack native ``(2, latent_channels, L)`` audio into channel-major rows."""
+    if latents.ndim != 3 or latents.shape[0] != AUDIO_CHANNELS:
+        raise ValueError(
+            f"audio latents must have native shape (2, channels, length), got {latents.shape}"
+        )
+    return latents.transpose(0, 2, 1).reshape(-1, latents.shape[1])
+
+
 def _spatial_position_grid(dim: int, patch: int, sqrt_area: float) -> np.ndarray:
     """One aspect-normalized spatial rotary axis.
 

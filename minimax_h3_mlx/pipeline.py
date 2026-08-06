@@ -36,6 +36,7 @@ from .packing import (
     audio_latent_num_frames,
     build_packed_sequence,
     build_row_timesteps,
+    pack_audio_latents,
     patchify_video_latents,
     resolve_canvas_size,
     unpack_audio_tokens,
@@ -578,9 +579,10 @@ class MiniMaxH3Pipeline:
                 (1, video_config.latent_channels, num_latent_frames, latent_height, latent_width)
             ).astype(mx.float32)
             video_rows = patchify_video_latents(latents, patch_size)
-            audio_rows = mx.random.normal(
-                (num_audio_latents * AUDIO_CHANNELS, audio_config.latent_channels)
+            audio_latents = mx.random.normal(
+                (AUDIO_CHANNELS, audio_config.latent_channels, num_audio_latents)
             ).astype(mx.float32)
+            audio_rows = pack_audio_latents(audio_latents)
             if condition_rows is not None:
                 video_rows = mx.concatenate([condition_rows, video_rows])
 
