@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 import mlx.nn as nn
 
+from .video_decode_layout import resolve_video_decode_layout
+
 
 @dataclass
 class VideoVAEConfig:
@@ -450,11 +452,11 @@ class VideoVAE(nn.Module):
         self.quant_conv = CausalConv3d(2 * config.latent_channels, 2 * config.latent_channels, 1)
         self.post_quant_conv = CausalConv3d(config.latent_channels, config.latent_channels, 1)
 
-        ratio_t = config.temporal_compression_ratio
-        self.frame_pre_padding = (-config.clip_length) % ratio_t
-        self.tokens_chunk_size = math.ceil(config.clip_length / ratio_t)
-        self.token_overlap = (-config.token_drop) % self.tokens_chunk_size
-        self.frame_overlap = max(self.token_overlap * ratio_t - self.frame_pre_padding, 0)
+        self.decode_layout = resolve_video_decode_layout(config)
+        self.frame_pre_padding = self.decode_layout.frame_pre_padding
+        self.tokens_chunk_size = self.decode_layout.tokens_chunk_size
+        self.token_overlap = self.decode_layout.token_overlap
+        self.frame_overlap = self.decode_layout.frame_overlap
 
         self.use_tiling = True
         self.tile_sample_min_height = 256
@@ -602,10 +604,11 @@ class VideoVAE(nn.Module):
         number of chunks, and the extra pixel frames are cut off again.
         """
         z = z.transpose(0, 2, 3, 4, 1)  # -> (B, D, H, W, C)
-        chunk_tokens = self.tokens_chunk_size
-        token_drop = self.config.token_drop
-        ratio_t = self.config.temporal_compression_ratio
-        chunk_num_frames = chunk_tokens * ratio_t
+        layout = self.decode_layout
+        chunk_tokens = layout.tokens_chunk_size
+        token_drop = layout.token_drop
+        ratio_t = layout.temporal_compression_ratio
+        chunk_num_frames = layout.chunk_num_frames
 
         num_tokens = z.shape[1] + token_drop
         pad_tokens = (-num_tokens) % chunk_tokens
@@ -614,7 +617,7 @@ class VideoVAE(nn.Module):
             # `token_drop` consumes a whole chunk's worth of lead-in, so the shortest decodable
             # latent is one full chunk beyond it. The reference has the same floor; it just fails
             # with an empty concatenate instead of saying so.
-            minimum = 2 * chunk_tokens - token_drop
+            minimum = layout.minimum_latent_frames
             raise ValueError(
                 f"Too few latent frames to decode: got {z.shape[1]}, need at least {minimum} "
                 f"(chunk {chunk_tokens} latent frames, token_drop {token_drop})."
@@ -626,14 +629,14 @@ class VideoVAE(nn.Module):
         decoded, overlap = [], None
         for i in range(num_chunks):
             start = i * chunk_tokens
-            clip = self._decode_clip(z[:, start : start + chunk_tokens + self.token_overlap])
+            clip = self._decode_clip(z[:, start : start + chunk_tokens + layout.token_overlap])
             for j in range(int(token_drop > 0) + 1):
                 frame_start = j * chunk_num_frames
                 chunk = clip[:, frame_start : frame_start + chunk_num_frames]
-                chunk = chunk[:, self.frame_pre_padding :]
+                chunk = chunk[:, layout.frame_pre_padding :]
                 if j == 0:
                     if overlap is not None:
-                        chunk = self._blend(overlap, chunk, self.frame_overlap, axis=1)
+                        chunk = self._blend(overlap, chunk, layout.frame_overlap, axis=1)
                     decoded.append(chunk)
                 else:
                     overlap = chunk
@@ -646,7 +649,7 @@ class VideoVAE(nn.Module):
         # chunk's last latent frame only covers `clip_length % ratio_t` pixel frames; others cover
         # `ratio_t`.
         if pad_tokens > 0:
-            intra_tail = self.config.clip_length % ratio_t
+            intra_tail = layout.tail_trim_remainder
             before_pad = z.shape[1] - pad_tokens
             pad_frames = sum(
                 intra_tail if intra_tail and (before_pad + k) % chunk_tokens == 0 else ratio_t
