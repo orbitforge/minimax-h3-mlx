@@ -309,6 +309,7 @@ Things that cost real debugging time here and generalize to other diffusion port
 | Text encoder | **done** — `hidden_states[50]` matches HF to 5.0e-08 |
 | Checkpoint loaders | **done** — all four components load from the release, zero key mismatches |
 | Pipeline / denoise loop | **done** — generates prompt-faithful video + synced audio |
+| Derived full-schedule proof | **done** — v0.5d functional proof passed; canonical timing remains future work |
 | Quant set | **done** — f32 / bf16 / 8 / 6 / 4-bit published; 3-bit built but withheld |
 
 All four components were loaded from the released checkpoint and exercised:
@@ -361,8 +362,9 @@ first-step reallocation, and the actual benefit depends on the MLX allocator and
 The repository includes a v0.3b converter that creates a new
 `minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte sidecar per
 transformer block, manifests, and verification receipts. v0.3c consumes the derived base in
-cache-only mode, and v0.3d constructs the retained modulation cache sequentially; the original
-mixed-shard format remains the only generation-capable runtime format.
+cache-only mode, and v0.3d constructs the retained modulation cache sequentially. At those earlier
+slices the original mixed-shard format remained the only generation-capable runtime format; v0.5d
+below closes that gap.
 The derived base has loaded and evaluated successfully, with component-level active MLX memory of
 approximately 16.466 GB—approximately 11.7 GB below the previous full-transformer load. Sidecar
 real transformer-forward parity, denoising, render peak, swap-write reduction, and streamed numerical
@@ -451,6 +453,36 @@ Beyond eyeballing it, three properties are what say the wiring is right rather t
 
 Output is written with no extra dependencies: stereo WAV through the standard library's `wave`
 module, video piped as raw RGB into `ffmpeg` (with a PNG-sequence fallback if it is absent).
+
+#### v0.5d derived full-schedule functional proof
+
+`V0.5D_FUNCTIONAL_PROOF_PASSED` is recorded from the preserved real run at
+`out/v0.5d/dodecahedron-seed-0-16pt-terminal-02` with `functional_success: true`.
+`canonical_timing_eligible: false`. Reason: `No uncontended-host operator declaration/process snapshot.`
+These timings are engineering evidence, not canonical benchmarks.
+
+| Phase | Verified result |
+|---|---|
+| Conditioning | 103 tokens; `[1,103,5120]`; bfloat16; release succeeded with allocator cache `0` |
+| Derived denoising | Cache-only streamed-AdaLN v1; 15 transitions; 15 transformer forwards; 15 cache sessions created/released; 750 sidecar opens/releases; 750 validated block pairs; maximum simultaneous sidecars `1`; overlap violations `0`; dense reconstruction `0` |
+| Derived memory | Peak active memory `17,218,975,504` bytes; final derived release active/cache `256 / 0` |
+| Denoising timing | Total `41.372048 s`; cache construction total `27.861136 s`; mean `1.857409 s`; fastest transition step 6 `2.575642 s`; slowest step 0 `3.864866 s` |
+| Video | Raw `[1,3,30,128,128]`; RGB `[30,128,128,3]`; 30 frames at 128×128 and 24 fps; peak `11,161,857,908` bytes; release allocator cache `0` |
+| Audio | Raw `[2,1,40000]`; waveform `[2,40000]`; stereo, 32 kHz, 40,000 samples/channel, 1.25 s; peak `2,678,107,956` bytes; release allocator cache `0` |
+| MP4 | H.264/yuv420p video, 128×128, 24 fps, 30 frames; AAC stereo audio at 32 kHz for 1.25 s; 59,122 bytes; SHA-256 `89ba3ae8…b3388a3f`; atomic publication passed |
+| Lifecycle | All workers terminated; all release gates passed; final allocator cache `0`; no retry, replacement worker, or suppressed failure |
+
+This is the first successful MP4 path from the derived full schedule. Attempt 01 remains preserved
+as a failed historical receipt (the derived worker hit a PEP 3118 `B` item-size mismatch); Slice 5C's
+bfloat16 conditioning-boundary correction is carried forward and verified by the v0.5d conditioning
+receipt. The preserved evidence does not independently emit or certify the exact 850-base-tensor
+count; video and audio worker receipts do not split VAE load time from decode time; the staged
+partial MP4 SHA was not retained; and host-process inspection was unavailable. None of these limits
+invalidate the functional proof.
+
+Real MLX execution is currently constrained by the Codex/macOS Metal sandbox and must be launched
+from ordinary Terminal. Canonical benchmark timing therefore remains future work. Cache construction
+is the next identified optimization target.
 
 ### Validation
 

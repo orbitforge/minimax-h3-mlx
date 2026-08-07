@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Sequence
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -35,6 +35,37 @@ class OneStepResult:
     audio_next_timestep: float
     audio_current_sigma: float
     audio_next_sigma: float
+
+
+@dataclass(frozen=True)
+class ValidatedForwardResult:
+    """Validated inputs and predictions from exactly one transformer invocation."""
+
+    video_prediction: Any
+    audio_prediction: Any
+    input_video_latent: Any
+    input_audio_latent: Any
+    prepared_video: Any
+    prepared_audio: Any
+    transition: Mapping[str, Any]
+
+
+def materialize_predictions(video_prediction: Any, audio_prediction: Any) -> None:
+    """Materialize both predictions without converting MLX arrays through the host.
+
+    MLX arrays use one explicit ``mx.eval`` boundary.  Small deferred test doubles may expose a
+    ``materialize`` method; that method models the same lazy-execution boundary without importing
+    MLX in the test process.
+    """
+    values = (video_prediction, audio_prediction)
+    for value in values:
+        materialize = getattr(value, "materialize", None)
+        if callable(materialize):
+            materialize()
+    mlx_values = [value for value in values if _mlx_core_for(value) is not None]
+    if mlx_values:
+        mx = _mlx_core_for(mlx_values[0])
+        mx.eval(*mlx_values)
 
 
 @dataclass(frozen=True)
@@ -229,49 +260,94 @@ def denoise_loop(
             step_video_input = _copy(video_latent)
             step_audio_input = _copy(audio_latent)
             cache = None
-            if modulation_cache_provider is not None:
-                cache = _provider_cache(modulation_cache_provider, step_index, timestep, transition)
-                cache_acquisitions += 1
+            cache_acquired = False
+            step_primary_error: BaseException | None = None
+            step_cleanup_error: BaseException | None = None
+            step_cleanup_attempted = False
+            step_cleanup_succeeded = False
             try:
-                if modulation_cache_provider is not None:
-                    token = getattr(cache, "session_token", None)
-                    if token is None:
-                        token = getattr(modulation_cache_provider, "last_session_token", None)
-                    if token is not None:
-                        if token in acquired_tokens:
-                            raise ValueError("modulation cache session token was reused across timesteps")
-                        acquired_tokens.add(token)
-                # This is the orchestration boundary: the counter does not depend on an optional
-                # transformer attribute and remains truthful when the call raises.
-                transformer_calls += 1
-                result = one_step_denoise(
-                    transformer,
-                    scheduler,
-                    video_latent=video_latent,
-                    audio_latent=audio_latent,
-                    text_embedding=text_embedding,
-                    timestep=timestep,
-                    timestep_indices=step_timestep_indices,
-                    token_tags=token_tags,
-                    position_ids=position_ids,
-                    video_indices=video_indices,
-                    audio_indices=audio_indices,
-                    text_indices=text_indices,
-                    step_index=step_index,
-                    modulation_cache=cache,
-                    expected_video_shape=expected_video_shape,
-                    expected_audio_shape=expected_audio_shape,
-                    expected_text_shape=expected_text_shape,
-                    expected_prediction_dtype=expected_prediction_dtype,
-                )
-                # one_step_denoise includes exactly one scheduler.step call.  Count it only after
-                # the complete one-step operation has returned successfully.
-                scheduler_updates += 1
+                try:
+                    if modulation_cache_provider is not None:
+                        cache = _provider_cache(modulation_cache_provider, step_index, timestep, transition)
+                        cache_acquired = True
+                        cache_acquisitions += 1
+                        token = getattr(cache, "session_token", None)
+                        if token is None:
+                            token = getattr(modulation_cache_provider, "last_session_token", None)
+                        if token is not None:
+                            if token in acquired_tokens:
+                                raise ValueError("modulation cache session token was reused across timesteps")
+                            acquired_tokens.add(token)
+                    # This is the orchestration boundary: the counter does not depend on an optional
+                    # transformer attribute and remains truthful when the call raises.
+                    transformer_calls += 1
+                    result = one_step_denoise(
+                        transformer,
+                        scheduler,
+                        video_latent=video_latent,
+                        audio_latent=audio_latent,
+                        text_embedding=text_embedding,
+                        timestep=timestep,
+                        timestep_indices=step_timestep_indices,
+                        token_tags=token_tags,
+                        position_ids=position_ids,
+                        video_indices=video_indices,
+                        audio_indices=audio_indices,
+                        text_indices=text_indices,
+                        step_index=step_index,
+                        modulation_cache=cache,
+                        expected_video_shape=expected_video_shape,
+                        expected_audio_shape=expected_audio_shape,
+                        expected_text_shape=expected_text_shape,
+                        expected_prediction_dtype=expected_prediction_dtype,
+                    )
+                    # one_step_denoise includes exactly one scheduler.step call.  Count it only after
+                    # the complete one-step operation has returned successfully.
+                    scheduler_updates += 1
+                except BaseException as exc:
+                    step_primary_error = exc
+                    raise
             finally:
                 if modulation_cache_provider is not None:
-                    _release_step_cache(modulation_cache_provider, step_index, cache)
-                    cache = None
-                    cache_releases += 1
+                    step_cleanup_attempted = True
+                    try:
+                        if cache_acquired:
+                            _release_step_cache(modulation_cache_provider, step_index, cache)
+                            cache_releases += 1
+                        else:
+                            # A provider may have opened a session before its builder failed.  Give
+                            # it one explicit failure-cleanup seam when it supplies one; providers
+                            # without that seam own their cleanup inside cache_for_step().
+                            cleanup_failed_step = getattr(modulation_cache_provider, "cleanup_failed_step", None)
+                            if callable(cleanup_failed_step):
+                                cleanup_failed_step(step_index, cache)
+                        step_cleanup_succeeded = True
+                    except BaseException as cleanup_exc:
+                        step_cleanup_error = cleanup_exc
+                        step_cleanup_succeeded = False
+                        if step_primary_error is None:
+                            raise
+                        # Keep the computational exception as the active exception.  The outer
+                        # evidence block below receives the cleanup exception as a diagnostic.
+                        setattr(step_primary_error, "denoise_cleanup_error", cleanup_exc)
+                    finally:
+                        if step_primary_error is not None and not cache_acquired:
+                            existing_cleanup = getattr(step_primary_error, "cache_cleanup_error", None)
+                            if existing_cleanup is not None:
+                                step_cleanup_error = existing_cleanup
+                                step_cleanup_succeeded = False
+                            step_cleanup_attempted = bool(
+                                getattr(step_primary_error, "cache_cleanup_attempted", step_cleanup_attempted)
+                            )
+                            step_cleanup_succeeded = bool(
+                                getattr(step_primary_error, "cache_cleanup_succeeded", step_cleanup_succeeded)
+                            )
+                        if step_primary_error is not None:
+                            setattr(step_primary_error, "denoise_cleanup_attempted", step_cleanup_attempted)
+                            setattr(step_primary_error, "denoise_cleanup_succeeded", step_cleanup_succeeded)
+                        if step_cleanup_error is not None and step_primary_error is not None:
+                            setattr(step_primary_error, "denoise_cleanup_error", step_cleanup_error)
+                        cache = None
             receipts.append(DenoiseStepReceipt(
                 step_index=step_index,
                 timestep=timestep,
@@ -312,6 +388,10 @@ def denoise_loop(
         exc.denoise_scheduler_updates = scheduler_updates
         exc.denoise_cache_acquisitions = cache_acquisitions
         exc.denoise_cache_releases = cache_releases
+        exc.denoise_primary_error = exc
+        exc.denoise_cleanup_attempted = getattr(exc, "denoise_cleanup_attempted", False)
+        exc.denoise_cleanup_succeeded = getattr(exc, "denoise_cleanup_succeeded", False)
+        exc.denoise_cleanup_error = getattr(exc, "denoise_cleanup_error", None)
         raise
     finally:
         # Drop local orchestration references on both success and failure.  The returned result owns
@@ -328,14 +408,31 @@ def _shape_dtype(value: Any) -> dict[str, Any]:
     return {"shape": [int(item) for item in value.shape], "dtype": _dtype_name(value.dtype)}
 
 
-def _copy(value: Any) -> Any:
+def copy_runtime_array(value: Any) -> Any:
+    """Copy a runtime array without routing an MLX value through NumPy.
+
+    ``mx.asarray(..., copy=True)`` is the explicit MLX-native copy boundary.  Evaluating the
+    result here makes the copy's ownership and materialization observable before the caller can
+    release or mutate the source.  Non-MLX values retain their existing object/NumPy copy
+    semantics, including the small typed fakes used by the contract tests.
+    """
+    mx = _mlx_core_for(value)
+    if mx is not None:
+        asarray = getattr(mx, "asarray", None)
+        evaluate = getattr(mx, "eval", None)
+        if not callable(asarray) or not callable(evaluate):
+            raise RuntimeError("MLX runtime copy requires mlx.core.asarray and mlx.core.eval")
+        copied = asarray(value, copy=True)
+        evaluate(copied)
+        return copied
     copier = getattr(value, "copy", None)
     if callable(copier):
         return copier()
-    if _mlx_core_for(value) is not None:
-        mx = _mlx_core_for(value)
-        return mx.array(value)
     return np.array(value, copy=True)
+
+
+def _copy(value: Any) -> Any:
+    return copy_runtime_array(value)
 
 
 def _mlx_core_for(value: Any) -> Any | None:
@@ -433,6 +530,179 @@ def _transition(scheduler: Any, step_index: int) -> Mapping[str, Any]:
     return value
 
 
+def validated_transformer_forward(
+    transformer: Any,
+    scheduler: Any,
+    *,
+    video_latent: Any,
+    audio_latent: Any,
+    text_embedding: Any,
+    timestep: Any,
+    timestep_indices: Any,
+    token_tags: Any,
+    position_ids: Any,
+    video_indices: Any,
+    audio_indices: Any,
+    text_indices: Any,
+    step_index: int,
+    modulation_cache: Any = None,
+    expected_video_shape: tuple[int, ...] | None = CANONICAL_VIDEO_SHAPE,
+    expected_audio_shape: tuple[int, ...] | None = CANONICAL_AUDIO_SHAPE,
+    expected_text_shape: tuple[int, ...] | None = CANONICAL_TEXT_SHAPE,
+    expected_video_dtype: str = CANONICAL_VIDEO_DTYPE,
+    expected_audio_dtype: str = CANONICAL_AUDIO_DTYPE,
+    expected_text_dtype: str = CANONICAL_TEXT_DTYPE,
+    expected_prediction_dtype: str = CANONICAL_PREDICTION_DTYPE,
+    materialize: Callable[[Any, Any], None] | None = None,
+) -> ValidatedForwardResult:
+    """Validate the production forward contract and materialize both predictions.
+
+    This is intentionally the only transformer-forward contract used by the production one-step
+    path and the v0.5d full-schedule proof.  The caller decides when to perform the scheduler
+    update; in particular, v0.5d releases its streamed cache and drops its local reference before
+    calling the scheduler.
+    """
+    if not isinstance(step_index, int) or isinstance(step_index, bool):
+        raise ValueError(f"step_index must be an integer, got {step_index!r}")
+    transition = _transition(scheduler, step_index)
+    cursor = getattr(scheduler, "step_index", None)
+    if cursor is not None and cursor != step_index:
+        raise ValueError(f"scheduler cursor mismatch: cursor={cursor}, requested={step_index}")
+    prepare = getattr(scheduler, "prepare_model_input", None)
+    if not callable(prepare):
+        raise ValueError("scheduler contract is incomplete: prepare_model_input is required")
+    parameterization = getattr(scheduler, "prediction_parameterization", None)
+    if parameterization != "velocity":
+        raise ValueError(
+            f"unsupported prediction parameterization: {parameterization!r}; expected 'velocity'"
+        )
+    if getattr(scheduler, "input_scaling", None) != "identity":
+        raise ValueError("unsupported model-input scaling contract; expected scheduler input_scaling='identity'")
+
+    if expected_video_shape is not None:
+        _require_array(video_latent, label="video latent", shape=expected_video_shape, dtype=expected_video_dtype)
+    if expected_audio_shape is not None:
+        _require_array(audio_latent, label="audio latent", shape=expected_audio_shape, dtype=expected_audio_dtype)
+    if text_embedding is None:
+        if expected_text_shape is not None:
+            raise ValueError("text embedding is required by the transformer forward contract")
+    elif expected_text_shape is not None:
+        _require_array(text_embedding, label="text embedding", shape=expected_text_shape, dtype=expected_text_dtype)
+
+    _require_vector(timestep, label="timestep", dtype="float32")
+    _require_vector(timestep_indices, label="timestep indices", dtype="int32")
+    _require_vector(token_tags, label="token tags", dtype="int32")
+    position_shape = tuple(int(item) for item in getattr(position_ids, "shape", ()))
+    if len(position_shape) != 2 or position_shape[1] != 3:
+        raise ValueError(f"position IDs shape mismatch: got {position_shape}, expected (sequence_length, 3)")
+    if _dtype_name(getattr(position_ids, "dtype", None)) != "float32":
+        raise ValueError(
+            f"position IDs dtype mismatch: got {_dtype_name(getattr(position_ids, 'dtype', None))!r}, expected 'float32'"
+        )
+    _finite(position_ids, "position IDs")
+    _require_vector(video_indices, label="video indices", dtype="int32")
+    _require_vector(audio_indices, label="audio indices", dtype="int32")
+    _require_vector(text_indices, label="text indices", dtype="int32")
+    sequence_length = int(token_tags.shape[0])
+    if (
+        timestep_indices.shape != token_tags.shape
+        or position_shape[0] != sequence_length
+    ):
+        raise ValueError("packed timetable arrays must agree on sequence length")
+    current_values = timestep if _mlx_core_for(timestep) is not None else np.asarray(timestep, dtype=np.float32).reshape(-1)
+    mx = _mlx_core_for(timestep)
+    for value in (transition["video_current_timestep"], transition["audio_current_timestep"]):
+        if mx is not None:
+            present = mx.any(current_values == np.float32(value))
+            mx.eval(present)
+            is_present = bool(_scalar(present))
+        else:
+            is_present = bool(np.any(current_values == np.float32(value)))
+        if not is_present:
+            raise ValueError("a modality current timestep is not present in the scheduler input timestep tensor")
+
+    video_input = _copy(video_latent)
+    audio_input = _copy(audio_latent)
+    prepared_video, prepared_audio = prepare(video_input, audio_input, step_index)
+    if expected_video_shape is not None:
+        _require_array(
+            prepared_video,
+            label="prepared video model input",
+            shape=expected_video_shape,
+            dtype=expected_video_dtype,
+        )
+    if expected_audio_shape is not None:
+        _require_array(
+            prepared_audio,
+            label="prepared audio model input",
+            shape=expected_audio_shape,
+            dtype=expected_audio_dtype,
+        )
+
+    kwargs = {"modulation_cache": modulation_cache}
+    if modulation_cache is None:
+        kwargs.pop("modulation_cache")
+    prediction = transformer(
+        prepared_video,
+        prepared_audio,
+        text_embedding,
+        timestep,
+        timestep_indices,
+        token_tags,
+        position_ids,
+        video_indices,
+        audio_indices,
+        text_indices,
+        **kwargs,
+    )
+    if not isinstance(prediction, (tuple, list)) or len(prediction) != 2:
+        raise ValueError("transformer must return separate video and audio predictions")
+    video_prediction, audio_prediction = prediction
+    if materialize is None:
+        materialize_predictions(video_prediction, audio_prediction)
+    else:
+        materialize(video_prediction, audio_prediction)
+    if expected_video_shape is not None:
+        _require_array(
+            video_prediction,
+            label="video transformer prediction",
+            shape=expected_video_shape,
+            dtype=expected_prediction_dtype,
+        )
+    if expected_audio_shape is not None:
+        _require_array(
+            audio_prediction,
+            label="audio transformer prediction",
+            shape=expected_audio_shape,
+            dtype=expected_prediction_dtype,
+        )
+    return ValidatedForwardResult(
+        video_prediction=video_prediction,
+        audio_prediction=audio_prediction,
+        input_video_latent=video_input,
+        input_audio_latent=audio_input,
+        prepared_video=prepared_video,
+        prepared_audio=prepared_audio,
+        transition=transition,
+    )
+
+
+def validate_updated_latents(
+    video_latent: Any,
+    audio_latent: Any,
+    *,
+    expected_video_shape: tuple[int, ...],
+    expected_audio_shape: tuple[int, ...],
+    expected_video_dtype: str = CANONICAL_VIDEO_DTYPE,
+    expected_audio_dtype: str = CANONICAL_AUDIO_DTYPE,
+) -> tuple[Any, Any]:
+    """Materialize and validate scheduler-updated video and audio rows."""
+    materialize_predictions(video_latent, audio_latent)
+    _require_array(video_latent, label="updated video latent", shape=expected_video_shape, dtype=expected_video_dtype)
+    _require_array(audio_latent, label="updated audio latent", shape=expected_audio_shape, dtype=expected_audio_dtype)
+    return video_latent, audio_latent
+
+
 def one_step_denoise(
     transformer: Any,
     scheduler: Any,
@@ -461,85 +731,45 @@ def one_step_denoise(
     step_index)` and returns the two updated batched latents.  This keeps scheduler semantics out of
     probes and makes call counts directly testable without importing MLX.
     """
-    if not isinstance(step_index, int) or isinstance(step_index, bool):
-        raise ValueError(f"step_index must be an integer, got {step_index!r}")
-    transition = _transition(scheduler, step_index)
-    prepare = getattr(scheduler, "prepare_model_input", None)
     update = getattr(scheduler, "step", None)
-    if not callable(prepare) or not callable(update):
+    if not callable(update):
         raise ValueError("scheduler contract is incomplete: prepare_model_input and step are required")
-    parameterization = getattr(scheduler, "prediction_parameterization", None)
-    if parameterization != "velocity":
-        raise ValueError(
-            f"unsupported prediction parameterization: {parameterization!r}; expected 'velocity'"
-        )
-    if getattr(scheduler, "input_scaling", None) != "identity":
-        raise ValueError("unsupported model-input scaling contract; expected scheduler input_scaling='identity'")
-
-    _require_array(video_latent, label="video latent", shape=expected_video_shape, dtype=CANONICAL_VIDEO_DTYPE)
-    _require_array(audio_latent, label="audio latent", shape=expected_audio_shape, dtype=CANONICAL_AUDIO_DTYPE)
-    _require_array(text_embedding, label="text embedding", shape=expected_text_shape, dtype=CANONICAL_TEXT_DTYPE)
-    _require_vector(timestep, label="timestep", dtype="float32")
-    _require_vector(timestep_indices, label="timestep indices", dtype="int32")
-    _require_vector(token_tags, label="token tags", dtype="int32")
-    _require_array(position_ids, label="position IDs", shape=(int(position_ids.shape[0]), 3), dtype="float32")
-    _require_vector(video_indices, label="video indices", dtype="int32")
-    _require_vector(audio_indices, label="audio indices", dtype="int32")
-    _require_vector(text_indices, label="text indices", dtype="int32")
-    if timestep_indices.shape != token_tags.shape or position_ids.shape[0] != token_tags.shape[0]:
-        raise ValueError("packed timetable arrays must agree on sequence length")
-    mx = _mlx_core_for(timestep)
-    current_values = timestep if mx is not None else np.asarray(timestep, dtype=np.float32).reshape(-1)
-    if mx is not None:
-        required_timesteps = (
-            transition["video_current_timestep"], transition["audio_current_timestep"])
-        for value in required_timesteps:
-            present = mx.any(current_values == np.float32(value))
-            mx.eval(present)
-            if not bool(_scalar(present)):
-                raise ValueError("a modality current timestep is not present in the scheduler input timestep tensor")
-    else:
-        for value in (transition["video_current_timestep"], transition["audio_current_timestep"]):
-            if not np.any(current_values == np.float32(value)):
-                raise ValueError("a modality current timestep is not present in the scheduler input timestep tensor")
-
-    video_input = _copy(video_latent)
-    audio_input = _copy(audio_latent)
-    prepared_video, prepared_audio = prepare(video_input, audio_input, step_index)
-    _require_array(prepared_video, label="prepared video model input", shape=expected_video_shape, dtype=CANONICAL_VIDEO_DTYPE)
-    _require_array(prepared_audio, label="prepared audio model input", shape=expected_audio_shape, dtype=CANONICAL_AUDIO_DTYPE)
-
-    kwargs = {
-        "modulation_cache": modulation_cache,
-    }
-    if modulation_cache is None:
-        kwargs.pop("modulation_cache")
-    # This is deliberately the only transformer invocation in the seam.
-    prediction = transformer(
-        prepared_video,
-        prepared_audio,
-        text_embedding,
-        timestep,
-        timestep_indices,
-        token_tags,
-        position_ids,
-        video_indices,
-        audio_indices,
-        text_indices,
-        **kwargs,
+    forward = validated_transformer_forward(
+        transformer,
+        scheduler,
+        video_latent=video_latent,
+        audio_latent=audio_latent,
+        text_embedding=text_embedding,
+        timestep=timestep,
+        timestep_indices=timestep_indices,
+        token_tags=token_tags,
+        position_ids=position_ids,
+        video_indices=video_indices,
+        audio_indices=audio_indices,
+        text_indices=text_indices,
+        step_index=step_index,
+        modulation_cache=modulation_cache,
+        expected_video_shape=expected_video_shape,
+        expected_audio_shape=expected_audio_shape,
+        expected_text_shape=expected_text_shape,
+        expected_prediction_dtype=expected_prediction_dtype,
     )
-    if not isinstance(prediction, (tuple, list)) or len(prediction) != 2:
-        raise ValueError("transformer must return separate video and audio predictions")
-    video_prediction, audio_prediction = prediction
-    _require_array(video_prediction, label="video transformer prediction", shape=expected_video_shape, dtype=expected_prediction_dtype)
-    _require_array(audio_prediction, label="audio transformer prediction", shape=expected_audio_shape, dtype=expected_prediction_dtype)
+    transition = forward.transition
+    video_prediction = forward.video_prediction
+    audio_prediction = forward.audio_prediction
+    video_input = forward.input_video_latent
+    audio_input = forward.input_audio_latent
 
     updated = update(video_prediction, audio_prediction, video_input, audio_input, step_index)
     if not isinstance(updated, (tuple, list)) or len(updated) != 2:
         raise ValueError("scheduler step must return separate video and audio updated latents")
     updated_video, updated_audio = updated
-    _require_array(updated_video, label="updated video latent", shape=expected_video_shape, dtype=CANONICAL_VIDEO_DTYPE)
-    _require_array(updated_audio, label="updated audio latent", shape=expected_audio_shape, dtype=CANONICAL_AUDIO_DTYPE)
+    validate_updated_latents(
+        updated_video,
+        updated_audio,
+        expected_video_shape=expected_video_shape,
+        expected_audio_shape=expected_audio_shape,
+    )
     if _exact_equal(video_latent, updated_video):
         raise ValueError("production denoising step left the video latent unchanged")
     if _exact_equal(audio_latent, updated_audio):
