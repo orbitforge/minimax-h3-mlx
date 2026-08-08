@@ -27,6 +27,31 @@ def geometry(size: int) -> dict[str, object]:
     return probe.canonical_geometry_contract(size)
 
 
+def valid_ffprobe_json(size: int) -> dict[str, object]:
+    return {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": size,
+                "height": size,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "pix_fmt": "yuv420p",
+                "nb_frames": "30",
+                "duration": "1.25",
+            },
+            {
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "channels": 2,
+                "sample_rate": "32000",
+            },
+        ],
+        "format": {"duration": "1.25", "size": "12"},
+    }
+
+
 def write_rgb_frame_set(directory: Path, *, size: int) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for index in range(probe.VIDEO_FRAME_COUNT):
@@ -107,17 +132,26 @@ class FakeFFmpegRunner:
         empty_output: bool = False,
         timeout: bool = False,
         stderr: str = "",
+        ffprobe_json: dict[str, object] | None = None,
     ) -> None:
         self.returncode = returncode
         self.write_output = write_output
         self.empty_output = empty_output
         self.timeout = timeout
         self.stderr = stderr
+        self.ffprobe_json = ffprobe_json or valid_ffprobe_json(128)
         self.calls: list[tuple[list[str], dict[str, object]]] = []
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append((argv, dict(kwargs)))
+        if Path(argv[0]).name == "ffprobe":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(self.ffprobe_json),
+                stderr="",
+            )
         if Path(argv[0]).name != "ffmpeg":
             raise AssertionError(f"unexpected subprocess: {argv[0]}")
         if self.timeout:
@@ -296,10 +330,11 @@ class Slice3B3B2AFFmpegStagingTests(unittest.TestCase):
                     run_staging(paths, runner=runner)
                 self.assertEqual(runner.calls, [])
 
-    def test_256_execute_mp4_mux_dispatches_to_staging_without_ffprobe(self):
+    def test_256_execute_mp4_mux_stages_then_validates_without_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = media_fixture(Path(directory), size=256)
-            runner = FakeFFmpegRunner()
+            runner = FakeFFmpegRunner(ffprobe_json=valid_ffprobe_json(256))
+
             result = probe.execute_mp4_mux(
                 frames_directory=paths["frames"],
                 video_manifest_path=paths["video_frame_manifest"],
@@ -313,8 +348,13 @@ class Slice3B3B2AFFmpegStagingTests(unittest.TestCase):
                 geometry=geometry(256),
                 subprocess_runner=runner,
             )
-            self.assertEqual(result["status"], "staged")
-            self.assertEqual([Path(call[0][0]).name for call in runner.calls], ["ffmpeg"])
+            self.assertEqual(result["status"], "validated")
+            self.assertEqual(result["video_width"], 256)
+            self.assertEqual(result["video_height"], 256)
+            self.assertEqual(result["invocation_counts"], {"ffmpeg": 1, "ffprobe": 1})
+            self.assertEqual([Path(call[0][0]).name for call in runner.calls], ["ffmpeg", "ffprobe"])
+            self.assertEqual(Path(result["ffprobe_argv"][0]).name, "ffprobe")
+            self.assertTrue(paths["mp4_partial"].is_file())
             self.assertFalse(paths["mp4"].exists())
             self.assertFalse(paths["mp4_manifest"].exists())
 

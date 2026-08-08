@@ -5250,10 +5250,24 @@ def validate_ffprobe_json(
     probe_json: Mapping[str, Any],
     *,
     mp4_path: Path | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate exactly one H.264 video stream, one AAC stereo stream, and 1.25 s duration."""
+    """Validate one geometry-bound H.264/AAC stream pair and the locked 1.25 s duration."""
     if not isinstance(probe_json, Mapping):
         raise ValueError("ffprobe JSON must be an object")
+    if expected_geometry is not None and geometry is not None:
+        raise ValueError("provide only one of expected_geometry or geometry")
+    selected_geometry_argument = expected_geometry if expected_geometry is not None else geometry
+    selected_geometry = (
+        canonical_geometry_contract(geometry=selected_geometry_argument)
+        if selected_geometry_argument is not None
+        else canonical_geometry_contract()
+    )
+    expected_width = int(selected_geometry["video_width"])
+    expected_height = int(selected_geometry["video_height"])
+    expected_frame_count = int(selected_geometry["frames"])
+    expected_frame_rate = int(selected_geometry["fps"])
     streams = probe_json.get("streams")
     if not isinstance(streams, list):
         raise ValueError("ffprobe JSON is missing its streams array")
@@ -5271,11 +5285,13 @@ def validate_ffprobe_json(
         raise ValueError(f"ffprobe video codec must be H.264, got {codec_name!r}")
     width = _integer_probe_value(video.get("width"), "video.width")
     height = _integer_probe_value(video.get("height"), "video.height")
-    if width != VIDEO_FRAME_WIDTH or height != VIDEO_FRAME_HEIGHT:
-        raise ValueError(f"ffprobe video dimensions must be 128x128, got {width}x{height}")
+    if width != expected_width or height != expected_height:
+        raise ValueError(
+            f"ffprobe video dimensions must be {expected_width}x{expected_height}, got {width}x{height}"
+        )
     frame_rate, frame_rate_field = _probe_frame_rate(video)
-    if not math.isclose(frame_rate, VIDEO_FRAME_FPS, rel_tol=0.0, abs_tol=1e-6):
-        raise ValueError(f"ffprobe video frame rate must be 24 fps, got {frame_rate:g}")
+    if not math.isclose(frame_rate, expected_frame_rate, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"ffprobe video frame rate must be {expected_frame_rate} fps, got {frame_rate:g}")
     pixel_format = video.get("pix_fmt")
     if not isinstance(pixel_format, str) or pixel_format != MP4_EXPECTED_PIXEL_FORMAT:
         raise ValueError(f"ffprobe pixel format must be yuv420p, got {pixel_format!r}")
@@ -5307,10 +5323,12 @@ def validate_ffprobe_json(
             )
     duration_evidence = stream_duration if stream_duration is not None else format_duration
     if frame_count is None:
-        if not math.isclose(duration_evidence * frame_rate, VIDEO_FRAME_COUNT, rel_tol=0.0, abs_tol=0.5):
-            raise ValueError("ffprobe video duration/frame-rate evidence is inconsistent with 30 frames")
-    elif frame_count != VIDEO_FRAME_COUNT:
-        raise ValueError(f"ffprobe video frame count must be 30, got {frame_count}")
+        if not math.isclose(duration_evidence * frame_rate, expected_frame_count, rel_tol=0.0, abs_tol=0.5):
+            raise ValueError(
+                f"ffprobe video duration/frame-rate evidence is inconsistent with {expected_frame_count} frames"
+            )
+    elif frame_count != expected_frame_count:
+        raise ValueError(f"ffprobe video frame count must be {expected_frame_count}, got {frame_count}")
 
     audio_codec_name = audio.get("codec_name")
     if not isinstance(audio_codec_name, str) or audio_codec_name.lower() != MP4_EXPECTED_AUDIO_CODEC:
@@ -5347,7 +5365,7 @@ def validate_ffprobe_json(
             "frame_rate": frame_rate,
             "frame_rate_field": frame_rate_field,
             "pixel_format": pixel_format,
-            "frame_count": frame_count if frame_count is not None else VIDEO_FRAME_COUNT,
+            "frame_count": frame_count if frame_count is not None else expected_frame_count,
             "frame_count_field": frame_count_field,
             "duration_seconds": duration_evidence,
         },
@@ -5911,6 +5929,7 @@ def _ffmpeg_staging_receipt(
         "ffmpeg_exit_code": None,
         "staged_mp4_path": str(partial),
         "staged_mp4_nonzero": False,
+        "staged_mp4_identity": None,
         "final_mp4_path": str(final),
         "final_mp4_published": False,
         "mp4_manifest_path": str(manifest_file),
@@ -5993,14 +6012,44 @@ def validate_ffmpeg_staging_receipt(
         raise ValueError("ffmpeg staging receipt frame manifest identity is invalid")
     if receipt.get("wav_manifest_identity") != AUDIO_WAV_MANIFEST_IDENTITY:
         raise ValueError("ffmpeg staging receipt WAV manifest identity is invalid")
+    source_validation = receipt.get("source_validation")
+    if not isinstance(source_validation, Mapping):
+        raise ValueError("ffmpeg staging receipt is missing source validation evidence")
+    source_video = source_validation.get("video")
+    source_audio = source_validation.get("audio")
+    if (
+        not isinstance(source_video, Mapping)
+        or source_video.get("manifest_identity") != VIDEO_FRAME_MANIFEST_IDENTITY
+        or source_video.get("manifest_sha256") != receipt.get("frame_manifest_sha256")
+    ):
+        raise ValueError("ffmpeg staging receipt frame validation evidence is stale")
+    if (
+        not isinstance(source_audio, Mapping)
+        or source_audio.get("manifest_identity") != AUDIO_WAV_MANIFEST_IDENTITY
+        or source_audio.get("manifest_sha256") != receipt.get("wav_manifest_sha256")
+    ):
+        raise ValueError("ffmpeg staging receipt WAV validation evidence is stale")
     argv = receipt.get("ffmpeg_argv")
     if not isinstance(argv, list) or not argv:
         raise ValueError("ffmpeg staging receipt is missing ffmpeg argv")
     if receipt.get("ffmpeg_exit_code") != 0:
         raise ValueError("ffmpeg staging receipt does not prove exit code zero")
+    ffmpeg_receipt = receipt.get("ffmpeg")
+    if (
+        not isinstance(ffmpeg_receipt, Mapping)
+        or ffmpeg_receipt.get("invoked") is not True
+        or ffmpeg_receipt.get("status") != "completed"
+    ):
+        raise ValueError("ffmpeg staging receipt does not prove an ffmpeg invocation")
+    if ffmpeg_receipt.get("returncode") != 0:
+        raise ValueError("ffmpeg staging receipt ffmpeg receipt does not prove exit code zero")
     partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
     if receipt.get("staged_mp4_nonzero") is not True or not partial.is_file() or partial.stat().st_size <= 0:
         raise ValueError("ffmpeg staging receipt does not prove a nonzero staged MP4")
+    identity = receipt.get("staged_mp4_identity")
+    actual_identity = _mp4_file_evidence(partial)
+    if not isinstance(identity, Mapping) or dict(identity) != actual_identity:
+        raise ValueError("ffmpeg staging receipt staged MP4 identity is stale")
     if receipt.get("final_mp4_published") is not False:
         raise ValueError("ffmpeg staging receipt claims final MP4 publication")
     if receipt.get("ffprobe", {}).get("invoked") is not False:
@@ -6008,6 +6057,204 @@ def validate_ffmpeg_staging_receipt(
     if receipt.get("invocation_counts") != {"ffmpeg": 1, "ffprobe": 0}:
         raise ValueError("ffmpeg staging receipt does not prove exactly one ffmpeg invocation")
     return dict(receipt)
+
+
+def _ffprobe_staging_receipt(
+    staging_receipt: Mapping[str, Any],
+    *,
+    geometry: Mapping[str, Any],
+    partial: Path,
+    final: Path,
+    manifest_file: Path,
+) -> dict[str, Any]:
+    return {
+        "status": "not_performed",
+        "geometry": dict(geometry),
+        "selected_geometry": dict(geometry),
+        "video_width": int(geometry["video_width"]),
+        "video_height": int(geometry["video_height"]),
+        "video_codec": None,
+        "pixel_format": None,
+        "frame_rate": None,
+        "frame_count": None,
+        "audio_codec": None,
+        "audio_channels": None,
+        "audio_sample_rate": None,
+        "duration": None,
+        "duration_seconds": None,
+        "frame_manifest_identity": staging_receipt.get("frame_manifest_identity"),
+        "frame_manifest_sha256": staging_receipt.get("frame_manifest_sha256"),
+        "wav_manifest_identity": staging_receipt.get("wav_manifest_identity"),
+        "wav_manifest_sha256": staging_receipt.get("wav_manifest_sha256"),
+        "ffmpeg_staging_receipt": dict(staging_receipt),
+        "ffmpeg": dict(staging_receipt.get("ffmpeg") or {}),
+        "ffmpeg_argv": staging_receipt.get("ffmpeg_argv"),
+        "ffmpeg_exit_code": staging_receipt.get("ffmpeg_exit_code"),
+        "ffprobe": _empty_mux_subprocess_receipt("ffprobe"),
+        "ffprobe_argv": None,
+        "ffprobe_exit_code": None,
+        "ffprobe_json_sha256": None,
+        "probe_metadata": None,
+        "staged_mp4_path": str(partial),
+        "staged_mp4_nonzero": False,
+        "staged_mp4_identity": None,
+        "final_mp4_path": str(final),
+        "final_mp4_published": False,
+        "mp4_manifest_path": str(manifest_file),
+        "mp4_manifest_created": False,
+        "source_validation": staging_receipt.get("source_validation", {}),
+        "launch_gate": staging_receipt.get("launch_gate", {}),
+        "retry_suppressed": True,
+        "invocation_counts": {"ffmpeg": 1, "ffprobe": 0},
+    }
+
+
+def validate_ffprobe_staging_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one successful ffprobe inspection while retaining the MP4 in its staged path."""
+    if receipt.get("status") != "validated":
+        raise ValueError("ffprobe staging receipt is not successful")
+    if expected_geometry is not None and geometry is not None:
+        raise ValueError("provide only one of expected_geometry or geometry")
+    expected_geometry_argument = expected_geometry if expected_geometry is not None else geometry
+    selected_value = receipt.get("selected_geometry", receipt.get("geometry"))
+    if not isinstance(selected_value, Mapping):
+        raise ValueError("ffprobe staging receipt is missing selected geometry")
+    selected = canonical_geometry_contract(geometry=selected_value)
+    if expected_geometry_argument is not None:
+        expected = canonical_geometry_contract(geometry=expected_geometry_argument)
+        validate_geometry_contract(selected, expected=expected)
+        selected = expected
+    validate_geometry_contract(selected)
+    if receipt.get("geometry") != selected or receipt.get("selected_geometry") != selected:
+        raise ValueError("ffprobe staging receipt selected geometry aliases differ")
+
+    staging = receipt.get("ffmpeg_staging_receipt")
+    if not isinstance(staging, Mapping):
+        raise ValueError("ffprobe staging receipt is missing the ffmpeg staging receipt")
+    validated_staging = validate_ffmpeg_staging_receipt(staging, expected_geometry=selected)
+    for field in (
+        "ffmpeg_argv",
+        "ffmpeg_exit_code",
+        "staged_mp4_path",
+        "staged_mp4_nonzero",
+        "frame_manifest_identity",
+        "frame_manifest_sha256",
+        "wav_manifest_identity",
+        "wav_manifest_sha256",
+    ):
+        if receipt.get(field) != validated_staging.get(field):
+            raise ValueError(f"ffprobe staging receipt {field} differs from ffmpeg staging evidence")
+
+    ffprobe = receipt.get("ffprobe")
+    if (
+        not isinstance(ffprobe, Mapping)
+        or ffprobe.get("invoked") is not True
+        or ffprobe.get("status") != "completed"
+    ):
+        raise ValueError("ffprobe staging receipt does not prove an ffprobe invocation")
+    if ffprobe.get("returncode") != 0 or receipt.get("ffprobe_exit_code") != 0:
+        raise ValueError("ffprobe staging receipt does not prove ffprobe exit code zero")
+    ffprobe_argv = receipt.get("ffprobe_argv")
+    if not isinstance(ffprobe_argv, list) or not ffprobe_argv:
+        raise ValueError("ffprobe staging receipt is missing ffprobe argv")
+    if ffprobe.get("argv") != ffprobe_argv:
+        raise ValueError("ffprobe staging receipt ffprobe argv linkage is stale")
+    if receipt.get("invocation_counts") != {"ffmpeg": 1, "ffprobe": 1}:
+        raise ValueError("ffprobe staging receipt does not prove exactly one ffprobe invocation")
+    if receipt.get("retry_suppressed") is not True:
+        raise ValueError("ffprobe staging receipt does not suppress retries")
+
+    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
+    identity = receipt.get("staged_mp4_identity")
+    actual_identity = _mp4_file_evidence(partial)
+    if receipt.get("staged_mp4_nonzero") is not True:
+        raise ValueError("ffprobe staging receipt does not prove a nonzero staged MP4")
+    if not isinstance(identity, Mapping) or dict(identity) != actual_identity:
+        raise ValueError("ffprobe staging receipt staged MP4 identity is stale")
+    if receipt.get("final_mp4_published") is not False:
+        raise ValueError("ffprobe staging receipt claims final MP4 publication")
+    if receipt.get("mp4_manifest_created") is not False:
+        raise ValueError("ffprobe staging receipt claims an MP4 manifest")
+    final = Path(str(receipt.get("final_mp4_path", ""))).resolve()
+    manifest_file = Path(str(receipt.get("mp4_manifest_path", ""))).resolve()
+    if final.exists() or manifest_file.exists():
+        raise ValueError("ffprobe staging receipt exposes final MP4 publication artifacts")
+
+    probe_metadata = receipt.get("probe_metadata")
+    if not isinstance(probe_metadata, Mapping):
+        raise ValueError("ffprobe staging receipt is missing validated probe metadata")
+    video = probe_metadata.get("video")
+    audio = probe_metadata.get("audio")
+    container = probe_metadata.get("container")
+    if not isinstance(video, Mapping) or not isinstance(audio, Mapping) or not isinstance(container, Mapping):
+        raise ValueError("ffprobe staging receipt media metadata is incomplete")
+    expected_media = {
+        "video_width": int(selected["video_width"]),
+        "video_height": int(selected["video_height"]),
+        "video_codec": MP4_EXPECTED_VIDEO_CODEC,
+        "pixel_format": MP4_EXPECTED_PIXEL_FORMAT,
+        "frame_rate": int(selected["fps"]),
+        "frame_count": int(selected["frames"]),
+        "audio_codec": MP4_EXPECTED_AUDIO_CODEC,
+        "audio_channels": 2,
+        "audio_sample_rate": AUDIO_SAMPLE_RATE,
+    }
+    actual_media = {
+        "video_width": video.get("width"),
+        "video_height": video.get("height"),
+        "video_codec": video.get("codec_name"),
+        "pixel_format": video.get("pixel_format"),
+        "frame_rate": video.get("frame_rate"),
+        "frame_count": video.get("frame_count"),
+        "audio_codec": audio.get("codec_name"),
+        "audio_channels": audio.get("channels"),
+        "audio_sample_rate": audio.get("sample_rate"),
+    }
+    for field, expected in expected_media.items():
+        actual = actual_media[field]
+        if field == "frame_rate":
+            if not isinstance(actual, (int, float)) or isinstance(actual, bool) or not math.isclose(
+                float(actual), float(expected), rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(f"ffprobe staging receipt {field} does not match selected media contract")
+        elif field in {"video_codec", "audio_codec"}:
+            if not isinstance(actual, str) or actual.lower() != expected:
+                raise ValueError(f"ffprobe staging receipt {field} does not match selected media contract")
+        elif actual != expected:
+            raise ValueError(f"ffprobe staging receipt {field} does not match selected media contract")
+        if field == "frame_rate":
+            receipt_value = receipt.get(field)
+            if not isinstance(receipt_value, (int, float)) or isinstance(receipt_value, bool) or not math.isclose(
+                float(receipt_value), float(actual), rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(f"ffprobe staging receipt {field} is not bound to probe metadata")
+        elif receipt.get(field) != actual:
+            raise ValueError(f"ffprobe staging receipt {field} is not bound to probe metadata")
+    duration = _numeric_probe_value(container.get("duration_seconds"), "probe.container.duration_seconds")
+    if not _duration_within_tolerance(duration):
+        raise ValueError("ffprobe staging receipt duration is outside the locked tolerance")
+    for field in ("duration", "duration_seconds"):
+        value = _numeric_probe_value(receipt.get(field), f"ffprobe receipt {field}")
+        if not math.isclose(value, duration, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"ffprobe staging receipt {field} is not bound to probe metadata")
+    probe_hash = receipt.get("ffprobe_json_sha256")
+    if not isinstance(probe_hash, str) or len(probe_hash) != 64:
+        raise ValueError("ffprobe staging receipt JSON checksum is invalid")
+    if receipt.get("frame_manifest_identity") != VIDEO_FRAME_MANIFEST_IDENTITY:
+        raise ValueError("ffprobe staging receipt frame manifest identity is invalid")
+    if receipt.get("wav_manifest_identity") != AUDIO_WAV_MANIFEST_IDENTITY:
+        raise ValueError("ffprobe staging receipt WAV manifest identity is invalid")
+    return dict(receipt)
+
+
+# Compatibility names for callers that refer to the validated staged artifact as an ffprobe receipt.
+validate_ffprobe_receipt = validate_ffprobe_staging_receipt
+validate_ffprobe_validation_receipt = validate_ffprobe_staging_receipt
 
 
 def execute_ffmpeg_staging(
@@ -6098,6 +6345,7 @@ def execute_ffmpeg_staging(
         receipt["staged_mp4_nonzero"] = staged_nonzero
         if not staged_nonzero:
             raise ValueError("ffmpeg completed successfully without a nonzero staged MP4")
+        receipt["staged_mp4_identity"] = _mp4_file_evidence(partial)
         if final.exists():
             raise ValueError("ffmpeg staging unexpectedly exposed a final MP4")
         receipt.update(
@@ -6121,6 +6369,158 @@ def execute_ffmpeg_staging(
             started=started,
         )
     raise AssertionError("unreachable ffmpeg staging path")
+
+
+def _raise_ffprobe_validation_failure(
+    primary: BaseException,
+    *,
+    receipt: Mapping[str, Any],
+    partial: Path,
+    started: float,
+) -> NoReturn:
+    partial_before = _mp4_file_evidence(partial)
+    cleanup_error: BaseException | None = None
+    try:
+        if partial.exists():
+            if not partial.is_file():
+                raise IsADirectoryError(f"staged MP4 path is not a file: {partial}")
+            partial.unlink()
+    except BaseException as exc:
+        cleanup_error = exc
+    failed_receipt = {
+        **dict(receipt),
+        "status": "failed",
+        "partial_cleanup_policy": "delete_partial_mp4_after_failure",
+        "partial_before_cleanup": partial_before,
+        "partial_after_cleanup": _mp4_file_evidence(partial),
+        "staged_mp4_identity": partial_before,
+        "staged_mp4_nonzero": partial_before.get("size_bytes", 0) > 0,
+        "final_mp4_published": False,
+        "mp4_manifest_created": False,
+        "retry_suppressed": True,
+        "invocation_counts": {
+            "ffmpeg": 1 if receipt.get("ffmpeg", {}).get("invoked") is True else 0,
+            "ffprobe": 1 if receipt.get("ffprobe", {}).get("invoked") is True else 0,
+        },
+        "primary_error": error_receipt(primary),
+        "cleanup_error": error_receipt(cleanup_error),
+        **failure_fields(
+            primary,
+            cleanup_error,
+            cleanup_attempted=True,
+            cleanup_succeeded=cleanup_error is None,
+        ),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    raise MP4MuxFailure(primary, receipt=failed_receipt, cleanup_error=cleanup_error) from primary
+
+
+def execute_ffprobe_validation(
+    staging_receipt: Mapping[str, Any],
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    subprocess_runner: Callable[..., Any] | None = None,
+    ffprobe_binary: str = "ffprobe",
+    timeout_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Inspect one successfully staged MP4 without creating or publishing its final artifact."""
+    if geometry is not None and expected_geometry is not None:
+        raise ValueError("provide only one of geometry or expected_geometry")
+    selected_geometry = expected_geometry if expected_geometry is not None else geometry
+    if selected_geometry is None:
+        selected_geometry = staging_receipt.get("selected_geometry", staging_receipt.get("geometry"))
+    if not isinstance(selected_geometry, Mapping) and not isinstance(
+        selected_geometry, ProductionMultimodalGeometry
+    ):
+        raise ValueError("ffprobe validation requires selected geometry")
+    core_geometry = canonical_geometry_contract(geometry=selected_geometry)
+    validated_staging = validate_ffmpeg_staging_receipt(
+        staging_receipt,
+        expected_geometry=core_geometry,
+    )
+    partial = Path(str(validated_staging.get("staged_mp4_path", ""))).resolve()
+    final_value = validated_staging.get("final_mp4_path")
+    manifest_value = validated_staging.get("mp4_manifest_path")
+    if not isinstance(final_value, str) or not final_value:
+        raise ValueError("ffmpeg staging receipt is missing final MP4 path")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise ValueError("ffmpeg staging receipt is missing MP4 manifest path")
+    final = Path(final_value).resolve()
+    manifest_file = Path(manifest_value).resolve()
+    if final.exists():
+        raise FileExistsError(f"refusing existing final MP4: {final}")
+    if manifest_file.exists():
+        raise FileExistsError(f"refusing existing MP4 manifest: {manifest_file}")
+
+    runner = subprocess_runner or _default_mux_subprocess_runner
+    started = time.perf_counter()
+    receipt = _ffprobe_staging_receipt(
+        validated_staging,
+        geometry=core_geometry,
+        partial=partial,
+        final=final,
+        manifest_file=manifest_file,
+    )
+    receipt["staged_mp4_nonzero"] = True
+    receipt["staged_mp4_identity"] = _mp4_file_evidence(partial)
+    ffprobe_argv = build_ffprobe_command(partial, ffprobe_binary=ffprobe_binary)
+    receipt["ffprobe_argv"] = list(ffprobe_argv)
+    try:
+        ffprobe_receipt, runner_error = _run_mux_subprocess(
+            "ffprobe",
+            ffprobe_argv,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+        receipt["ffprobe"] = dict(ffprobe_receipt)
+        receipt["ffprobe_exit_code"] = ffprobe_receipt.get("returncode")
+        receipt["invocation_counts"] = {"ffmpeg": 1, "ffprobe": 1}
+        if runner_error is not None:
+            raise runner_error
+        if ffprobe_receipt.get("returncode") != 0:
+            raise RuntimeError(f"ffprobe exited with status {ffprobe_receipt.get('returncode')}")
+        try:
+            probe_json = json.loads(ffprobe_receipt.get("stdout", ""))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("ffprobe did not return valid JSON") from exc
+        if not isinstance(probe_json, Mapping):
+            raise ValueError("ffprobe JSON must be an object")
+        receipt["ffprobe_json_sha256"] = _stable_probe_json_sha256(probe_json)
+        probe_metadata = validate_ffprobe_json(
+            probe_json,
+            mp4_path=partial,
+            expected_geometry=core_geometry,
+        )
+        receipt["probe_metadata"] = _json_safe(probe_metadata)
+        receipt.update(
+            {
+                "video_codec": probe_metadata["video"]["codec_name"],
+                "pixel_format": probe_metadata["video"]["pixel_format"],
+                "frame_rate": probe_metadata["video"]["frame_rate"],
+                "frame_count": probe_metadata["video"]["frame_count"],
+                "audio_codec": probe_metadata["audio"]["codec_name"],
+                "audio_channels": probe_metadata["audio"]["channels"],
+                "audio_sample_rate": probe_metadata["audio"]["sample_rate"],
+                "duration": probe_metadata["container"]["duration_seconds"],
+                "duration_seconds": probe_metadata["container"]["duration_seconds"],
+                "status": "validated",
+                "final_mp4_published": False,
+                "mp4_manifest_created": False,
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+        )
+        return validate_ffprobe_staging_receipt(receipt, expected_geometry=core_geometry)
+    except MP4MuxFailure:
+        raise
+    except BaseException as exc:
+        _raise_ffprobe_validation_failure(
+            exc,
+            receipt=receipt,
+            partial=partial,
+            started=started,
+        )
+    raise AssertionError("unreachable ffprobe validation path")
 
 
 # Name the pre-ffprobe seam explicitly for callers that do not need the legacy 128 publication path.
@@ -6156,7 +6556,7 @@ def execute_mp4_mux(
     )
     if selected_geometry is not None:
         if selected_core_geometry["video_width"] == 256:
-            return execute_ffmpeg_staging(
+            staging_receipt = execute_ffmpeg_staging(
                 frames_directory=frames_directory,
                 video_manifest_path=video_manifest_path,
                 wav_path=wav_path,
@@ -6169,6 +6569,13 @@ def execute_mp4_mux(
                 geometry=selected_core_geometry,
                 subprocess_runner=subprocess_runner,
                 ffmpeg_binary=ffmpeg_binary,
+                timeout_seconds=timeout_seconds,
+            )
+            return execute_ffprobe_validation(
+                staging_receipt,
+                geometry=selected_core_geometry,
+                subprocess_runner=subprocess_runner,
+                ffprobe_binary=ffprobe_binary,
                 timeout_seconds=timeout_seconds,
             )
     validate_mux_launch_gate(launch_gate)
