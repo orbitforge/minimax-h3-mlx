@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 from math import prod
+from numbers import Integral
 from typing import Any
 
 from .video_decode_layout import VideoDecodeLayout
@@ -36,6 +37,10 @@ class ProductionMultimodalGeometry:
     audio_raw_shape: tuple[int, int, int]
     waveform_shape: tuple[int, int]
     alignment_evidence: tuple[str, ...]
+    # The production v0.5b bridge has no text rows in its standalone packing contract.  The
+    # v0.5d/e core contract supplies the locked 103 text rows explicitly while reusing this same
+    # geometry object rather than introducing a second geometry type.
+    text_token_count: int = 0
 
     @classmethod
     def canonical(
@@ -44,12 +49,37 @@ class ProductionMultimodalGeometry:
         audio_config: Any,
         dit_config: Any,
         video_layout: VideoDecodeLayout,
+        *,
+        width: int = 128,
+        height: int = 128,
+        text_token_count: int = 0,
     ) -> "ProductionMultimodalGeometry":
-        width = height = 128
+        if isinstance(width, bool) or not isinstance(width, Integral):
+            raise ValueError("canonical video width must be an integer")
+        if isinstance(height, bool) or not isinstance(height, Integral):
+            raise ValueError("canonical video height must be an integer")
+        if isinstance(text_token_count, bool) or not isinstance(text_token_count, Integral):
+            raise ValueError("canonical text row count must be an integer")
+        width = int(width)
+        height = int(height)
+        text_token_count = int(text_token_count)
+        if width != height:
+            raise ValueError(f"canonical video geometry must be square, got {width}x{height}")
+        if width < 128 or height < 128:
+            raise ValueError("canonical video geometry must be at least 128x128")
+        if text_token_count < 0:
+            raise ValueError("canonical text row count must be nonnegative")
         fps = 24
         frames = 30
         video_channels = int(video_config.latent_channels)
         spatial_ratio = int(video_config.spatial_compression_ratio)
+        if spatial_ratio <= 0:
+            raise ValueError("video spatial compression ratio must be positive")
+        if width % spatial_ratio or height % spatial_ratio:
+            raise ValueError(
+                f"canonical video dimensions {width}x{height} are not divisible by the VAE "
+                f"spatial compression ratio {spatial_ratio}"
+            )
         latent_height = height // spatial_ratio
         latent_width = width // spatial_ratio
         audio_rate = int(audio_config.sampling_rate)
@@ -93,6 +123,7 @@ class ProductionMultimodalGeometry:
                 f"video decoder F={latent_frames} -> {video_decode_frame_count(latent_frames, video_layout)} frames",
                 f"spatial {latent_height}x{latent_width} * {spatial_ratio} = {height}x{width}",
             ),
+            text_token_count=text_token_count,
         )
         geometry.validate(video_config, audio_config, video_layout)
         return geometry
@@ -101,11 +132,62 @@ class ProductionMultimodalGeometry:
     def duration_seconds(self) -> float:
         return float(self.video_duration)
 
+    @property
+    def text_row_range(self) -> tuple[int, int]:
+        return (0, self.text_token_count)
+
+    @property
+    def audio_row_range(self) -> tuple[int, int]:
+        start = self.text_token_count
+        return (start, start + self.audio_token_count)
+
+    @property
+    def video_row_range(self) -> tuple[int, int]:
+        start = self.text_token_count + self.audio_token_count
+        return (start, start + self.video_token_count)
+
+    @property
+    def total_packed_rows(self) -> int:
+        return self.text_token_count + self.audio_token_count + self.video_token_count
+
+    @property
+    def video_rows(self) -> int:
+        return self.video_token_count
+
+    @property
+    def audio_rows(self) -> int:
+        return self.audio_token_count
+
+    @property
+    def position_ids_shape(self) -> tuple[int, int]:
+        return (self.total_packed_rows, 3)
+
+    @property
+    def token_tags_shape(self) -> tuple[int]:
+        return (self.total_packed_rows,)
+
+    @property
+    def video_indices_shape(self) -> tuple[int]:
+        return (self.video_rows,)
+
+    @property
+    def audio_indices_shape(self) -> tuple[int]:
+        return (self.audio_rows,)
+
+    @property
+    def text_indices_shape(self) -> tuple[int]:
+        return (self.text_token_count,)
+
     def validate(self, video_config: Any, audio_config: Any, layout: VideoDecodeLayout) -> None:
         if self.video_duration != self.audio_duration:
             raise ValueError("video and audio durations are not exactly aligned")
         if self.video_width != self.video_height or self.video_width < 128:
             raise ValueError("canonical video geometry must be square and at least 128 pixels")
+        if self.text_token_count < 0:
+            raise ValueError("canonical text row count must be nonnegative")
+        spatial_ratio = int(video_config.spatial_compression_ratio)
+        if self.video_width % spatial_ratio or self.video_height % spatial_ratio:
+            raise ValueError("canonical video dimensions are not divisible by the VAE spatial compression ratio")
         if self.video_latent_shape[2] < layout.minimum_latent_frames:
             raise ValueError("canonical video latent frame count is below the decoder minimum")
         pt, ph, pw = self.video_patch_size

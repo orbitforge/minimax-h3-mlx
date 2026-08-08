@@ -47,6 +47,8 @@ from minimax_h3_mlx.denoise import (
     validate_updated_latents,
     validated_transformer_forward,
 )
+from minimax_h3_mlx.geometry import ProductionMultimodalGeometry
+from minimax_h3_mlx.video_decode_layout import VideoDecodeLayout
 
 
 LOCKED_PROMPT = (
@@ -70,6 +72,12 @@ EXPECTED_VIDEO_SIGMA_POINTS = 16
 EXPECTED_AUDIO_SIGMA_POINTS = 16
 EXPECTED_DENOISING_TRANSITIONS = 15
 EXPECTED_TRANSFORMER_FORWARDS = 15
+
+# Slice 3B2 exposes only these two square core geometries.  The downstream decoder/media
+# validators below intentionally retain their frozen 128x128 constants until Slice 3B3.
+DEFAULT_VIDEO_SIZE = 128
+PROOF_VIDEO_SIZES = (128, 256)
+FULL_RUN_256_GATE_MESSAGE = "256x256 full-run decoder/media support is not enabled until Slice 3B3"
 
 VIDEO_NATIVE_SHAPE = (1, 24, 9, 8, 8)
 AUDIO_NATIVE_SHAPE = (2, 32, 50)
@@ -173,6 +181,10 @@ ATTRIBUTION_SESSION_EVENT = "cache_attribution"
 FINAL_ARTIFACT_SCHEMA_VERSION = 1
 FINGERPRINT_METHOD = "sha256-logical-shape-dtype-plus-canonical-float32-values-v1"
 RNG_METHOD = "mlx.core.random.seed(0)+mlx.core.random.normal-float32-video-then-audio-v1"
+RNG_METHODOLOGY_LIMITATION = (
+    "The larger 256x256 video latent consumes additional global random values before audio noise; "
+    "audio noise is therefore not claimed bit-identical across geometries."
+)
 DERIVED_FORMAT_IDENTIFIER = "minimax-h3-mlx-streamed-adaln-v1"
 DERIVED_SCHEMA_VERSION = 1
 EXPECTED_DERIVED_BASE_TENSOR_COUNT = 850
@@ -424,7 +436,7 @@ REPORT_KEYS = frozenset(
     }
 )
 
-FINAL_ARTIFACT_KEYS = frozenset(
+LEGACY_FINAL_ARTIFACT_KEYS = frozenset(
     {
         "artifact_identity",
         "schema_version",
@@ -450,6 +462,7 @@ FINAL_ARTIFACT_KEYS = frozenset(
         "checkpoint_identity",
     }
 )
+FINAL_ARTIFACT_KEYS = frozenset((*LEGACY_FINAL_ARTIFACT_KEYS, "geometry"))
 
 
 def _json_safe(value: Any) -> Any:
@@ -793,8 +806,34 @@ def _serialized_array(value: Any) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(value))
 
 
-def conditioning_artifact_binding(path: Path, arrays: Mapping[str, Any]) -> dict[str, Any]:
+def _conditioning_array_shapes(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, tuple[int, ...]]:
+    contract = _geometry_contract(geometry)
+    return {
+        "text_conditioning": EXPECTED_CONDITIONING_SHAPE,
+        "token_ids": (1, EXPECTED_TOKEN_COUNT),
+        "token_presence_mask": (1, EXPECTED_TOKEN_COUNT),
+        "text_token_tags": (EXPECTED_TOKEN_COUNT,),
+        "initial_video_native": tuple(int(value) for value in contract["video_native_shape"]),
+        "initial_audio_native": tuple(int(value) for value in contract["audio_native_shape"]),
+        "packed_position_ids": tuple(int(value) for value in contract["position_ids_shape"]),
+        "packed_token_tags": tuple(int(value) for value in contract["token_tags_shape"]),
+        "packed_video_indices": tuple(int(value) for value in contract["video_indices_shape"]),
+        "packed_audio_indices": tuple(int(value) for value in contract["audio_indices_shape"]),
+        "packed_text_indices": tuple(int(value) for value in contract["text_indices_shape"]),
+    }
+
+
+def conditioning_artifact_binding(
+    path: Path,
+    arrays: Mapping[str, Any],
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the exact byte and per-array receipt for the conditioning NPZ."""
+    geometry_contract = canonical_geometry_contract(geometry=geometry) if geometry is not None else canonical_geometry_contract()
+    expected_shapes = _conditioning_array_shapes(geometry_contract)
     keys = set(arrays)
     if keys != set(CONDITIONING_ARRAY_KEYS):
         raise ValueError(
@@ -807,11 +846,12 @@ def conditioning_artifact_binding(path: Path, arrays: Mapping[str, Any]) -> dict
         "sha256": sha256_file(path),
         "array_keys": sorted(CONDITIONING_ARRAY_KEYS),
         "arrays": {},
+        "geometry": geometry_contract,
     }
     for key in sorted(CONDITIONING_ARRAY_KEYS):
         array = _serialized_array(arrays[key])
         logical_dtype = CONDITIONING_LOGICAL_DTYPES[key]
-        if tuple(array.shape) != CONDITIONING_ARRAY_SHAPES[key]:
+        if tuple(array.shape) != expected_shapes[key]:
             raise ValueError(f"conditioning array {key} has noncanonical shape {tuple(array.shape)}")
         if np.dtype(array.dtype).name != CONDITIONING_STORAGE_DTYPES[key]:
             raise ValueError(f"conditioning array {key} has noncanonical storage dtype {array.dtype}")
@@ -829,13 +869,32 @@ def validate_conditioning_artifact_binding(
     path: Path,
     *,
     arrays: Mapping[str, Any] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     """Validate the NPZ bytes, schema, dtypes, fingerprints, and packed-layout binding."""
+    receipt_geometry = receipt.get("geometry")
+    selected_geometry = geometry if geometry is not None else (receipt_geometry if isinstance(receipt_geometry, Mapping) else None)
+    expected_geometry = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+    validate_geometry_contract(expected_geometry)
+    if isinstance(receipt_geometry, Mapping):
+        validate_geometry_contract(receipt_geometry, expected=expected_geometry)
+    elif expected_geometry["video_width"] != DEFAULT_VIDEO_SIZE:
+        raise ValueError("conditioning receipt is missing explicit non-default geometry identity")
     binding = receipt.get("conditioning_artifact")
     if not isinstance(binding, Mapping):
         raise ValueError("conditioning receipt is missing its artifact binding")
-    if set(binding) != {"sha256", "array_keys", "arrays"}:
+    binding_keys = set(binding)
+    legacy_binding_keys = {"sha256", "array_keys", "arrays"}
+    current_binding_keys = {*legacy_binding_keys, "geometry"}
+    if binding_keys not in (legacy_binding_keys, current_binding_keys):
         raise ValueError("conditioning artifact binding schema is incomplete")
+    if binding_keys == legacy_binding_keys and expected_geometry["video_width"] != DEFAULT_VIDEO_SIZE:
+        raise ValueError("conditioning artifact binding is missing explicit non-default geometry identity")
+    if "geometry" in binding:
+        binding_geometry = binding.get("geometry")
+        if not isinstance(binding_geometry, Mapping):
+            raise ValueError("conditioning artifact binding geometry is invalid")
+        validate_geometry_contract(binding_geometry, expected=expected_geometry)
     loaded = dict(arrays) if arrays is not None else _load_npz(path)
     if set(loaded) != set(CONDITIONING_ARRAY_KEYS):
         raise ValueError(
@@ -850,12 +909,13 @@ def validate_conditioning_artifact_binding(
     recorded_arrays = binding.get("arrays")
     if not isinstance(recorded_arrays, Mapping) or set(recorded_arrays) != set(CONDITIONING_ARRAY_KEYS):
         raise ValueError("conditioning receipt per-array binding is incomplete")
+    expected_shapes = _conditioning_array_shapes(expected_geometry)
     for key in sorted(CONDITIONING_ARRAY_KEYS):
         array = np.asarray(loaded[key])
         recorded = recorded_arrays[key]
         if not isinstance(recorded, Mapping):
             raise ValueError(f"conditioning receipt binding for {key} is invalid")
-        expected_shape = list(CONDITIONING_ARRAY_SHAPES[key])
+        expected_shape = list(expected_shapes[key])
         if tuple(array.shape) != tuple(expected_shape):
             raise ValueError(f"conditioning array {key} has noncanonical shape {tuple(array.shape)}")
         if recorded.get("shape") != expected_shape:
@@ -898,13 +958,14 @@ def validate_conditioning_artifact_binding(
             raise ValueError(f"conditioning artifact {array_key} differs from its receipt")
 
     packing = receipt.get("packing")
-    if not isinstance(packing, Mapping) or packing.get("total_rows") != EXPECTED_TOTAL_ROWS:
-        raise ValueError("conditioning artifact packed row count is not locked")
+    expected_packing = packed_contract(EXPECTED_TOKEN_COUNT, geometry=expected_geometry)
+    if not isinstance(packing, Mapping) or packing.get("total_rows") != expected_geometry["total_packed_rows"]:
+        raise ValueError("conditioning artifact packed row count is not bound to the selected geometry")
     row_count = int(packing["total_rows"])
-    expected_shapes = {key: CONDITIONING_ARRAY_SHAPES[key] for key in (
+    expected_packed_shapes = {key: expected_shapes[key] for key in (
         "packed_position_ids", "packed_token_tags", "packed_video_indices", "packed_audio_indices", "packed_text_indices"
     )}
-    for key, expected_shape in expected_shapes.items():
+    for key, expected_shape in expected_packed_shapes.items():
         if tuple(loaded[key].shape) != expected_shape or expected_shape[0] != row_count and key in {"packed_position_ids", "packed_token_tags"}:
             raise ValueError(f"conditioning artifact {key} row count or shape is invalid")
     recorded_packed_shapes = {
@@ -915,9 +976,11 @@ def validate_conditioning_artifact_binding(
         "packed_text_indices": packing.get("text_indices_shape"),
     }
     for key, shape in recorded_packed_shapes.items():
-        if shape is not None and list(expected_shapes[key]) != list(shape):
+        if shape is not None and list(expected_packed_shapes[key]) != list(shape):
             raise ValueError(f"conditioning receipt packed shape for {key} differs from the artifact")
-    expected_ranges = derive_row_ranges(EXPECTED_TOKEN_COUNT)
+    if packing.get("row_ranges") != expected_packing["row_ranges"]:
+        raise ValueError("conditioning artifact row ranges do not match the selected geometry")
+    expected_ranges = derive_row_ranges(EXPECTED_TOKEN_COUNT, geometry=expected_geometry)
     expected_indices = {
         "packed_text_indices": np.arange(*expected_ranges["text"], dtype=np.int32),
         "packed_audio_indices": np.arange(*expected_ranges["target_audio"], dtype=np.int32),
@@ -929,8 +992,8 @@ def validate_conditioning_artifact_binding(
     expected_tags = np.concatenate(
         [
             np.asarray(loaded["text_token_tags"], dtype=np.int32),
-            np.full(EXPECTED_TARGET_AUDIO_ROWS, 2, dtype=np.int32),
-            np.full(EXPECTED_TARGET_VIDEO_ROWS, 0, dtype=np.int32),
+            np.full(expected_geometry["target_audio_rows"], 2, dtype=np.int32),
+            np.full(expected_geometry["target_video_rows"], 0, dtype=np.int32),
         ]
     )
     if not np.array_equal(loaded["packed_token_tags"], expected_tags):
@@ -1462,47 +1525,253 @@ def prompt_receipt(prompt: str, token_ids: Any | None = None) -> dict[str, Any]:
     return result
 
 
-def canonical_geometry_contract() -> dict[str, Any]:
+def validate_video_size(video_size: Any) -> int:
+    """Resolve the proof-only selector without permitting arbitrary resolutions."""
+    if isinstance(video_size, bool) or not isinstance(video_size, int):
+        raise ValueError("proof video size must be one of 128 or 256")
+    if video_size not in PROOF_VIDEO_SIZES:
+        raise ValueError(f"proof video size must be one of 128 or 256, got {video_size}")
+    return int(video_size)
+
+
+def validate_full_run_video_size(video_size: Any) -> int:
+    """Fail closed before an output attempt or worker can be started for 256x256."""
+    size = validate_video_size(video_size)
+    if size == 256:
+        raise ValueError(FULL_RUN_256_GATE_MESSAGE)
+    return size
+
+
+def _proof_video_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        latent_channels=24,
+        out_channels=3,
+        spatial_compression_ratio=16,
+        temporal_compression_ratio=4,
+        clip_length=17,
+        token_drop=3,
+    )
+
+
+def _proof_audio_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        latent_channels=32,
+        sampling_rate=32_000,
+        decoder_rates=(5, 5, 2, 2, 2, 2, 2),
+        hop_length=800,
+    )
+
+
+def _proof_dit_config() -> SimpleNamespace:
+    return SimpleNamespace(patch_size=(1, 2, 2))
+
+
+def _proof_video_layout() -> VideoDecodeLayout:
+    return VideoDecodeLayout(
+        clip_length=17,
+        temporal_compression_ratio=4,
+        tokens_chunk_size=5,
+        token_drop=3,
+        token_overlap=2,
+        frame_pre_padding=3,
+        frame_overlap=5,
+        chunk_num_frames=20,
+        tail_trim_remainder=1,
+        minimum_latent_frames=7,
+    )
+
+
+def resolve_core_geometry(
+    video_size: int = DEFAULT_VIDEO_SIZE,
+    *,
+    video_config: Any | None = None,
+    audio_config: Any | None = None,
+    dit_config: Any | None = None,
+    video_layout: VideoDecodeLayout | Any | None = None,
+) -> ProductionMultimodalGeometry:
+    """Resolve the one proof selector through the shared production geometry contract."""
+    size = validate_video_size(video_size)
+    supplied = (video_config, audio_config, dit_config, video_layout)
+    if all(value is None for value in supplied):
+        video_config = _proof_video_config()
+        audio_config = _proof_audio_config()
+        dit_config = _proof_dit_config()
+        video_layout = _proof_video_layout()
+    elif any(value is None for value in supplied):
+        raise ValueError("runtime geometry resolution requires all source configs and the video layout")
+    return ProductionMultimodalGeometry.canonical(
+        video_config,
+        audio_config,
+        dit_config,
+        video_layout,
+        width=size,
+        height=size,
+        text_token_count=EXPECTED_TOKEN_COUNT,
+    )
+
+
+def _geometry_contract_from_object(geometry: ProductionMultimodalGeometry) -> dict[str, Any]:
+    row_ranges = {
+        "text": list(geometry.text_row_range),
+        "target_audio": list(geometry.audio_row_range),
+        "target_video": list(geometry.video_row_range),
+        "text_rows": int(geometry.text_token_count),
+        "target_audio_rows": int(geometry.audio_rows),
+        "target_video_rows": int(geometry.video_rows),
+        "total_rows": int(geometry.total_packed_rows),
+    }
     return {
-        "resolution": [128, 128],
-        "frames": 30,
-        "fps": 24,
-        "duration_seconds": 1.25,
-        "video_native_latent_shape": list(VIDEO_NATIVE_SHAPE),
-        "audio_native_latent_shape": list(AUDIO_NATIVE_SHAPE),
-        "audio_sample_rate": 32_000,
-        "audio_samples_per_channel": 40_000,
-        "text_rows": EXPECTED_TOKEN_COUNT,
-        "target_audio_rows": EXPECTED_TARGET_AUDIO_ROWS,
-        "target_video_rows": EXPECTED_TARGET_VIDEO_ROWS,
-        "total_rows": EXPECTED_TOTAL_ROWS,
+        "resolution": [int(geometry.video_width), int(geometry.video_height)],
+        "video_width": int(geometry.video_width),
+        "video_height": int(geometry.video_height),
+        "frames": int(geometry.video_frames),
+        "fps": int(geometry.video_fps),
+        "duration_seconds": geometry.duration_seconds,
+        "video_native_shape": list(geometry.video_latent_shape),
+        "video_native_latent_shape": list(geometry.video_latent_shape),
+        "audio_native_shape": list(geometry.audio_latent_shape),
+        "audio_native_latent_shape": list(geometry.audio_latent_shape),
+        "audio_sample_rate": int(geometry.audio_sample_rate),
+        "audio_samples_per_channel": int(geometry.audio_samples),
+        "text_rows": int(geometry.text_token_count),
+        "audio_rows": int(geometry.audio_rows),
+        "target_audio_rows": int(geometry.audio_rows),
+        "target_video_rows": int(geometry.video_rows),
+        "video_rows": int(geometry.video_rows),
+        "total_rows": int(geometry.total_packed_rows),
+        "total_packed_rows": int(geometry.total_packed_rows),
+        "video_row_width": int(geometry.video_patch_width),
+        "audio_row_width": int(geometry.audio_patch_width),
+        "video_patch_size": list(geometry.video_patch_size),
+        "position_ids_shape": list(geometry.position_ids_shape),
+        "token_tags_shape": list(geometry.token_tags_shape),
+        "video_indices_shape": list(geometry.video_indices_shape),
+        "audio_indices_shape": list(geometry.audio_indices_shape),
+        "text_indices_shape": list(geometry.text_indices_shape),
+        "row_ranges": row_ranges,
+        "spatial_compression_ratio": int(geometry.video_width // geometry.video_latent_shape[4]),
+        "rng_method": RNG_METHOD,
+        "rng_draw_order": ["video_native", "audio_native"],
+        "rng_methodology_limitation": RNG_METHODOLOGY_LIMITATION,
     }
 
 
-def derive_row_ranges(text_rows: int) -> dict[str, Any]:
+def _geometry_contract(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    *,
+    video_size: int = DEFAULT_VIDEO_SIZE,
+) -> dict[str, Any]:
+    if geometry is None:
+        return _geometry_contract_from_object(resolve_core_geometry(video_size))
+    if isinstance(geometry, Mapping):
+        return dict(geometry)
+    if not isinstance(geometry, ProductionMultimodalGeometry):
+        raise TypeError("geometry must be ProductionMultimodalGeometry or a geometry mapping")
+    return _geometry_contract_from_object(geometry)
+
+
+GEOMETRY_IDENTITY_FIELDS = (
+    "video_width",
+    "video_height",
+    "video_native_shape",
+    "video_rows",
+    "total_packed_rows",
+    "row_ranges",
+    "position_ids_shape",
+    "token_tags_shape",
+    "video_indices_shape",
+    "audio_indices_shape",
+    "text_indices_shape",
+)
+
+
+def validate_geometry_contract(
+    geometry: Mapping[str, Any],
+    *,
+    expected: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> None:
+    required = set(GEOMETRY_IDENTITY_FIELDS) | {
+        "resolution",
+        "frames",
+        "fps",
+        "duration_seconds",
+        "audio_native_shape",
+        "video_native_latent_shape",
+        "audio_native_latent_shape",
+        "audio_rows",
+        "text_rows",
+        "target_audio_rows",
+        "target_video_rows",
+        "total_rows",
+    }
+    missing = sorted(required - set(geometry))
+    if missing:
+        raise ValueError(f"geometry contract is missing fields: {missing}")
+    if geometry["resolution"] != [geometry["video_width"], geometry["video_height"]]:
+        raise ValueError("geometry resolution does not match its explicit width and height")
+    if geometry["video_native_shape"] != geometry["video_native_latent_shape"]:
+        raise ValueError("geometry native video shape aliases differ")
+    if geometry["audio_native_shape"] != geometry["audio_native_latent_shape"]:
+        raise ValueError("geometry native audio shape aliases differ")
+    if geometry["video_rows"] != geometry["target_video_rows"]:
+        raise ValueError("geometry video row aliases differ")
+    if geometry["total_packed_rows"] != geometry["total_rows"]:
+        raise ValueError("geometry packed row aliases differ")
+    if expected is not None:
+        expected_contract = _geometry_contract(expected)
+        for field in GEOMETRY_IDENTITY_FIELDS:
+            if geometry.get(field) != expected_contract.get(field):
+                raise ValueError(f"geometry field {field} does not match the selected core contract")
+
+
+def canonical_geometry_contract(
+    video_size: int = DEFAULT_VIDEO_SIZE,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if geometry is None:
+        geometry = resolve_core_geometry(video_size)
+    contract = _geometry_contract(geometry)
+    validate_geometry_contract(contract)
+    return contract
+
+
+def derive_row_ranges(
+    text_rows: int,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if not isinstance(text_rows, int) or isinstance(text_rows, bool) or text_rows <= 0:
         raise ValueError("text row count must be a positive integer")
+    contract = _geometry_contract(geometry)
+    audio_rows = int(contract["target_audio_rows"])
+    video_rows = int(contract["target_video_rows"])
     audio_start = text_rows
-    video_start = audio_start + EXPECTED_TARGET_AUDIO_ROWS
+    video_start = audio_start + audio_rows
     return {
         "text": [0, text_rows],
         "target_audio": [audio_start, video_start],
-        "target_video": [video_start, video_start + EXPECTED_TARGET_VIDEO_ROWS],
+        "target_video": [video_start, video_start + video_rows],
         "text_rows": text_rows,
-        "target_audio_rows": EXPECTED_TARGET_AUDIO_ROWS,
-        "target_video_rows": EXPECTED_TARGET_VIDEO_ROWS,
-        "total_rows": text_rows + EXPECTED_TARGET_AUDIO_ROWS + EXPECTED_TARGET_VIDEO_ROWS,
+        "target_audio_rows": audio_rows,
+        "target_video_rows": video_rows,
+        "total_rows": text_rows + audio_rows + video_rows,
     }
 
 
-def packed_contract(text_rows: int = EXPECTED_TOKEN_COUNT) -> dict[str, Any]:
-    ranges = derive_row_ranges(text_rows)
+def packed_contract(
+    text_rows: int = EXPECTED_TOKEN_COUNT,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = _geometry_contract(geometry)
+    ranges = derive_row_ranges(text_rows, geometry=contract)
     return {
         "row_order": "[text | target audio | target video]",
         "row_ranges": ranges,
         "text_rows": text_rows,
-        "target_audio_rows": EXPECTED_TARGET_AUDIO_ROWS,
-        "target_video_rows": EXPECTED_TARGET_VIDEO_ROWS,
+        "target_audio_rows": int(contract["target_audio_rows"]),
+        "target_video_rows": int(contract["target_video_rows"]),
         "total_rows": ranges["total_rows"],
         "feature_widths": {"text": 5120, "target_audio": EXPECTED_AUDIO_ROW_WIDTH, "target_video": EXPECTED_VIDEO_ROW_WIDTH},
         "attention_mask": None,
@@ -1510,8 +1779,13 @@ def packed_contract(text_rows: int = EXPECTED_TOKEN_COUNT) -> dict[str, Any]:
     }
 
 
-def validate_packed_contract(contract: Mapping[str, Any], *, expected_text_rows: int = EXPECTED_TOKEN_COUNT) -> None:
-    expected = packed_contract(expected_text_rows)
+def validate_packed_contract(
+    contract: Mapping[str, Any],
+    *,
+    expected_text_rows: int = EXPECTED_TOKEN_COUNT,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> None:
+    expected = packed_contract(expected_text_rows, geometry=geometry)
     if contract.get("row_order") != expected["row_order"]:
         raise ValueError("packed row order must be [text | target audio | target video]")
     if contract.get("row_ranges") != expected["row_ranges"]:
@@ -1530,6 +1804,7 @@ def deterministic_input_receipt(video: Any, audio: Any) -> dict[str, Any]:
         "rng_implementation": RNG_METHOD,
         "seed": CANONICAL_SEED,
         "draw_order": ["video_native", "audio_native"],
+        "methodology_limitation": RNG_METHODOLOGY_LIMITATION,
         "fingerprint_method": FINGERPRINT_METHOD,
         "video": shape_dtype(video, logical_dtype="float32") | {"fingerprint": array_fingerprint(video, logical_dtype="float32")},
         "audio": shape_dtype(audio, logical_dtype="float32") | {"fingerprint": array_fingerprint(audio, logical_dtype="float32")},
@@ -5928,6 +6203,8 @@ def _base_report(args: argparse.Namespace, paths: Mapping[str, Any]) -> dict[str
     operator_declared_uncontended = getattr(args, "operator_declared_uncontended", False)
     if type(operator_declared_uncontended) is not bool:
         raise TypeError("operator_declared_uncontended must be a literal boolean declaration")
+    selected_video_size = validate_video_size(getattr(args, "video_size", DEFAULT_VIDEO_SIZE))
+    core_geometry = canonical_geometry_contract(selected_video_size)
     report = {
         "status": "incomplete",
         "run_state": "incomplete",
@@ -5971,8 +6248,8 @@ def _base_report(args: argparse.Namespace, paths: Mapping[str, Any]) -> dict[str
             "chat_template": None,
             "special_tokens": False,
         },
-        "geometry": canonical_geometry_contract(),
-        "packing": packed_contract(),
+        "geometry": core_geometry,
+        "packing": packed_contract(geometry=core_geometry),
         "schedule_contract": {},
         "conditioning_worker": {},
         "derived_worker": {},
@@ -6156,6 +6433,7 @@ def _conditioning_worker_parser(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--derived-transformer", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument("--video-size", type=int, choices=PROOF_VIDEO_SIZES, default=DEFAULT_VIDEO_SIZE)
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--tolerance", required=True, type=int)
@@ -6168,6 +6446,7 @@ def _derived_worker_parser(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--checkpoint-root", required=True)
     parser.add_argument("--derived-transformer", required=True)
     parser.add_argument("--attempt-identifier", required=True)
+    parser.add_argument("--video-size", type=int, choices=PROOF_VIDEO_SIZES, default=DEFAULT_VIDEO_SIZE)
     parser.add_argument("--conditioning-artifact", required=True)
     parser.add_argument("--conditioning-receipt", required=True)
     parser.add_argument("--final-artifact", required=True)
@@ -6196,10 +6475,10 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
     try:
         validate_locked_prompt(args.prompt)
         validate_seed(args.seed)
+        selected_video_size = validate_video_size(args.video_size)
         import mlx.core as mx
 
         from minimax_h3_mlx.config import DiTConfig
-        from minimax_h3_mlx.geometry import ProductionMultimodalGeometry
         from minimax_h3_mlx.load import load_audio_vae_config, load_video_vae_config
         from minimax_h3_mlx.packing import build_packed_sequence
         from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
@@ -6227,29 +6506,34 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
             raise ValueError("conditioning dtype is not bfloat16")
         receipt["completed_stages"].extend(["conditioning-worker-started", "text-encoder-loaded", "prompt-tokenized-and-conditioned"])
 
-        mx.random.seed(args.seed)
-        video_native = mx.random.normal(VIDEO_NATIVE_SHAPE).astype(mx.float32)
-        audio_native = mx.random.normal(AUDIO_NATIVE_SHAPE).astype(mx.float32)
-        mx.eval(conditioning, input_ids, video_native, audio_native)
-
         derived_config = DiTConfig.from_json(derived / "config.json")
         video_config = load_video_vae_config(root / "video_vae")
         audio_config = load_audio_vae_config(root / "audio_vae")
         layout_info = resolve_video_decode_layout(video_config)
-        geometry = ProductionMultimodalGeometry.canonical(video_config, audio_config, derived_config, layout_info)
-        if tuple(geometry.video_latent_shape) != VIDEO_NATIVE_SHAPE or tuple(geometry.audio_latent_shape) != AUDIO_NATIVE_SHAPE:
-            raise ValueError("runtime geometry differs from locked 128x128/30-frame geometry")
+        geometry = resolve_core_geometry(
+            selected_video_size,
+            video_config=video_config,
+            audio_config=audio_config,
+            dit_config=derived_config,
+            video_layout=layout_info,
+        )
+
+        mx.random.seed(args.seed)
+        video_native = mx.random.normal(geometry.video_latent_shape).astype(mx.float32)
+        audio_native = mx.random.normal(geometry.audio_latent_shape).astype(mx.float32)
+        mx.eval(conditioning, input_ids, video_native, audio_native)
+
         layout = build_packed_sequence(
             np.asarray(token_tags, dtype=np.int64),
-            VIDEO_NATIVE_SHAPE[2],
-            VIDEO_NATIVE_SHAPE[3],
-            VIDEO_NATIVE_SHAPE[4],
-            AUDIO_NATIVE_SHAPE[2],
+            geometry.video_latent_shape[2],
+            geometry.video_latent_shape[3],
+            geometry.video_latent_shape[4],
+            geometry.audio_latent_shape[2],
             tuple(derived_config.patch_size),
             keyframe_anchors=(),
         )
-        if int(layout.sequence_length) != EXPECTED_TOTAL_ROWS:
-            raise ValueError(f"packed row count is {layout.sequence_length}, expected {EXPECTED_TOTAL_ROWS}")
+        if int(layout.sequence_length) != geometry.total_packed_rows:
+            raise ValueError(f"packed row count is {layout.sequence_length}, expected {geometry.total_packed_rows}")
 
         schedule_started = time.perf_counter()
         schedule_video = MiniMaxH3Scheduler(shift=VIDEO_SHIFT)
@@ -6278,13 +6562,13 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
             "packed_text_indices": np.asarray(layout.text_indices, dtype=np.int32),
         }
         _write_npz(artifact_path, artifact_arrays)
-        packed = packed_contract(token_count)
+        packed = packed_contract(token_count, geometry=geometry)
         packed["position_ids_shape"] = list(layout.position_ids.shape)
         packed["token_tags_shape"] = list(layout.token_tags.shape)
         packed["video_indices_shape"] = list(layout.video_indices.shape)
         packed["audio_indices_shape"] = list(layout.audio_indices.shape)
         packed["text_indices_shape"] = list(layout.text_indices.shape)
-        validate_packed_contract(packed)
+        validate_packed_contract(packed, geometry=geometry)
         receipt["prompt"] = prompt_receipt(args.prompt, token_ids_np)
         receipt["tokenizer"] = {
             "entrypoint": "MiniMaxH3TextEncoder.tokenizer",
@@ -6305,7 +6589,7 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
             "attention_mask_policy": "create_attention_mask(hidden_states, None)",
         }
         receipt["deterministic_inputs"] = deterministic_input_receipt(video_np, audio_np)
-        receipt["geometry"] = canonical_geometry_contract()
+        receipt["geometry"] = canonical_geometry_contract(geometry=geometry)
         receipt["packing"] = packed
         receipt["schedule_contract"] = schedule.receipt()
         receipt["artifact_schema"] = {
@@ -6313,8 +6597,8 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
             "arrays": sorted(CONDITIONING_ARRAY_KEYS),
             "conditioning_released_before_derived_worker": True,
         }
-        receipt["conditioning_artifact"] = conditioning_artifact_binding(artifact_path, artifact_arrays)
-        validate_conditioning_artifact_binding(receipt, artifact_path)
+        receipt["conditioning_artifact"] = conditioning_artifact_binding(artifact_path, artifact_arrays, geometry=geometry)
+        validate_conditioning_artifact_binding(receipt, artifact_path, geometry=geometry)
         receipt["completed_stages"].extend(["metadata-and-input-artifact-written", "full-schedule-contract-constructed"])
     except BaseException as exc:
         primary = exc
@@ -6344,13 +6628,22 @@ def _conditioning_worker_main(argv: Sequence[str]) -> int:
     return 0
 
 
-def _native_from_packed(video: Any, audio: Any, *, config: Any) -> tuple[Any, Any]:
+def _native_from_packed(
+    video: Any,
+    audio: Any,
+    *,
+    config: Any,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> tuple[Any, Any]:
     from minimax_h3_mlx.packing import unpatchify_video_tokens, unpack_audio_tokens
 
+    contract = _geometry_contract(geometry)
+    video_shape = tuple(int(value) for value in contract["video_native_shape"])
+    audio_shape = tuple(int(value) for value in contract["audio_native_shape"])
     native_video = unpatchify_video_tokens(
-        video[0], VIDEO_NATIVE_SHAPE[2], VIDEO_NATIVE_SHAPE[3], VIDEO_NATIVE_SHAPE[4], VIDEO_NATIVE_SHAPE[1], tuple(config.patch_size)
+        video[0], video_shape[2], video_shape[3], video_shape[4], video_shape[1], tuple(config.patch_size)
     )
-    native_audio = unpack_audio_tokens(audio[0], AUDIO_NATIVE_SHAPE[2])
+    native_audio = unpack_audio_tokens(audio[0], audio_shape[2])
     return native_video, native_audio
 
 
@@ -6369,9 +6662,11 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
     primary: BaseException | None = None
     cleanup: BaseException | None = None
     provider: StreamedCacheSessionProvider | None = None
+    core_geometry: dict[str, Any] | None = None
     event_writer = JsonlEventWriter(Path(args.event_file).resolve())
     started = time.perf_counter()
     try:
+        selected_video_size = validate_video_size(args.video_size)
         import mlx.core as mx
         from mlx.utils import tree_flatten
 
@@ -6382,10 +6677,18 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
         from minimax_h3_mlx.scheduler import MiniMaxH3MultimodalScheduler, MiniMaxH3Scheduler
 
         conditioning_receipt = _read_json_object(Path(args.conditioning_receipt), "conditioning worker receipt")
-        validate_conditioning_receipt(conditioning_receipt)
-        arrays = validate_conditioning_artifact_binding(conditioning_receipt, Path(args.conditioning_artifact))
-        if tuple(arrays["initial_video_native"].shape) != VIDEO_NATIVE_SHAPE or tuple(arrays["initial_audio_native"].shape) != AUDIO_NATIVE_SHAPE:
-            raise ValueError("conditioning artifact native latent shapes do not match the locked geometry")
+        core_geometry = canonical_geometry_contract(selected_video_size)
+        receipt["geometry"] = core_geometry
+        validate_conditioning_receipt(conditioning_receipt, expected_geometry=core_geometry)
+        arrays = validate_conditioning_artifact_binding(
+            conditioning_receipt,
+            Path(args.conditioning_artifact),
+            geometry=core_geometry,
+        )
+        expected_video_native_shape = tuple(int(value) for value in core_geometry["video_native_shape"])
+        expected_audio_native_shape = tuple(int(value) for value in core_geometry["audio_native_shape"])
+        if tuple(arrays["initial_video_native"].shape) != expected_video_native_shape or tuple(arrays["initial_audio_native"].shape) != expected_audio_native_shape:
+            raise ValueError("conditioning artifact native latent shapes do not match the selected geometry")
         if tuple(arrays["text_conditioning"].shape) != EXPECTED_CONDITIONING_SHAPE:
             raise ValueError("conditioning artifact text shape is not (1,103,5120)")
         derived_root = Path(args.derived_transformer).resolve()
@@ -6413,8 +6716,8 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
             num_condition_video_rows=0,
             num_condition_audio_rows=0,
         )
-        if layout.sequence_length != EXPECTED_TOTAL_ROWS:
-            raise ValueError("derived worker packed sequence row count is not 347")
+        if layout.sequence_length != core_geometry["total_packed_rows"]:
+            raise ValueError("derived worker packed sequence row count does not match the selected geometry")
 
         schedule_started = time.perf_counter()
         scheduler_video = MiniMaxH3Scheduler(shift=VIDEO_SHIFT)
@@ -6477,10 +6780,10 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
             text_embedding=text,
             packed_inputs=packed,
             cache_provider=provider,
-            native_latent_provider=lambda video, audio: _native_from_packed(video, audio, config=config),
+            native_latent_provider=lambda video, audio: _native_from_packed(video, audio, config=config, geometry=core_geometry),
             memory_snapshot=lambda: _memory_snapshot(mx),
-            expected_video_shape=(1, EXPECTED_TARGET_VIDEO_ROWS, EXPECTED_VIDEO_ROW_WIDTH),
-            expected_audio_shape=(1, EXPECTED_TARGET_AUDIO_ROWS, EXPECTED_AUDIO_ROW_WIDTH),
+            expected_video_shape=(1, core_geometry["video_rows"], core_geometry["video_row_width"]),
+            expected_audio_shape=(1, core_geometry["audio_rows"], core_geometry["audio_row_width"]),
             expected_text_shape=EXPECTED_CONDITIONING_SHAPE,
             expected_video_dtype="bfloat16",
             expected_audio_dtype="bfloat16",
@@ -6502,6 +6805,7 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
             "artifact_identity": "minimax-h3-mlx-v05d-final-native-latent",
             "schema_version": FINAL_ARTIFACT_SCHEMA_VERSION,
             "attempt_identifier": args.attempt_identifier,
+            "geometry": core_geometry,
             "native_video": shape_dtype(final_video_np, logical_dtype="bfloat16") | {"fingerprint": array_fingerprint(final_video_np, logical_dtype="bfloat16")},
             "native_audio": shape_dtype(final_audio_np, logical_dtype="bfloat16") | {"fingerprint": array_fingerprint(final_audio_np, logical_dtype="bfloat16")},
             "packed_final_state_fingerprint": packed_state_fingerprint(result.final_video_latent, result.final_audio_latent),
@@ -6536,6 +6840,7 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
             metadata,
             arrays={"final_video_native": final_video_np, "final_audio_native": final_audio_np},
             require_worker_termination=False,
+            geometry=core_geometry,
         )
         _write_npz(final_artifact_path, {"final_video_native": final_video_np, "final_audio_native": final_audio_np})
         _write_json(final_metadata_path, metadata)
@@ -7024,7 +7329,11 @@ def validate_worker_boundary(receipt: Mapping[str, Any], *, identity: str) -> No
         raise ValueError(f"{identity} worker did not exit successfully")
 
 
-def validate_conditioning_receipt(receipt: Mapping[str, Any]) -> None:
+def validate_conditioning_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> None:
     """Validate the conditioning boundary before a derived worker can be launched."""
     if receipt.get("status") != "success":
         raise ValueError("conditioning receipt is not successful")
@@ -7042,20 +7351,23 @@ def validate_conditioning_receipt(receipt: Mapping[str, Any]) -> None:
     token_ids = tokenizer.get("token_ids") if isinstance(tokenizer, Mapping) else None
     if not isinstance(token_ids, list) or len(token_ids) != 1 or len(token_ids[0]) != EXPECTED_TOKEN_COUNT:
         raise ValueError("conditioning receipt token IDs are incomplete")
-    validate_packed_contract(receipt.get("packing", {}))
-    geometry = receipt.get("geometry")
-    if not isinstance(geometry, Mapping) or geometry.get("total_rows") != EXPECTED_TOTAL_ROWS:
-        raise ValueError("conditioning receipt geometry is incomplete")
+    receipt_geometry = receipt.get("geometry")
+    selected_geometry = expected_geometry if expected_geometry is not None else (receipt_geometry if isinstance(receipt_geometry, Mapping) else None)
+    geometry = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+    if not isinstance(receipt_geometry, Mapping):
+        if geometry["video_width"] != DEFAULT_VIDEO_SIZE:
+            raise ValueError("conditioning receipt geometry is missing explicit non-default identity")
+    else:
+        validate_geometry_contract(receipt_geometry, expected=geometry)
+    validate_packed_contract(receipt.get("packing", {}), geometry=geometry)
     release = receipt.get("conditioning_release")
     if not isinstance(release, Mapping) or release.get("passed") is not True:
         raise ValueError("conditioning release gate did not pass")
     binding = receipt.get("conditioning_artifact")
-    if (
-        not isinstance(binding, Mapping)
-        or set(binding) != {"sha256", "array_keys", "arrays"}
-        or binding.get("array_keys") != sorted(CONDITIONING_ARRAY_KEYS)
-    ):
+    if not isinstance(binding, Mapping) or binding.get("array_keys") != sorted(CONDITIONING_ARRAY_KEYS):
         raise ValueError("conditioning receipt is missing an exact artifact binding")
+    if geometry["video_width"] != DEFAULT_VIDEO_SIZE and "geometry" not in binding:
+        raise ValueError("conditioning receipt artifact binding is missing non-default geometry identity")
 
 
 def _artifact_required_arrays() -> set[str]:
@@ -7069,8 +7381,10 @@ def validate_final_artifact(
     require_worker_termination: bool = True,
     artifact_path: Path | None = None,
     metadata_path: Path | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> None:
-    if set(artifact) != FINAL_ARTIFACT_KEYS:
+    artifact_keys = set(artifact)
+    if artifact_keys not in (set(LEGACY_FINAL_ARTIFACT_KEYS), set(FINAL_ARTIFACT_KEYS)):
         raise ValueError(f"final artifact schema mismatch: missing={sorted(FINAL_ARTIFACT_KEYS - set(artifact))}, unexpected={sorted(set(artifact) - FINAL_ARTIFACT_KEYS)}")
     if artifact.get("artifact_identity") != "minimax-h3-mlx-v05d-final-native-latent" or artifact.get("schema_version") != FINAL_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("final native latent artifact identity mismatch")
@@ -7080,6 +7394,16 @@ def validate_final_artifact(
         raise ValueError("final artifact must identify the derived worker")
     if not isinstance(artifact.get("checkpoint_identity"), Mapping):
         raise ValueError("final artifact checkpoint identity is missing")
+    artifact_geometry = artifact.get("geometry")
+    selected_geometry = geometry if geometry is not None else (artifact_geometry if isinstance(artifact_geometry, Mapping) else None)
+    expected_geometry = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+    if artifact_geometry is None:
+        if expected_geometry["video_width"] != DEFAULT_VIDEO_SIZE:
+            raise ValueError("final artifact is missing explicit non-default geometry identity")
+    elif not isinstance(artifact_geometry, Mapping):
+        raise ValueError("final artifact geometry identity is invalid")
+    else:
+        validate_geometry_contract(artifact_geometry, expected=expected_geometry)
     exit_receipt = artifact.get("worker_exit_receipt")
     if require_worker_termination and (
         not isinstance(exit_receipt, Mapping)
@@ -7095,7 +7419,9 @@ def validate_final_artifact(
         raise ValueError("final artifact scheduler-update counts are incomplete")
     validate_schedule_contract(artifact.get("schedule_contract", {}))
     validate_lifecycle_totals(artifact.get("streamed_adaln_lifecycle", {}))
-    for label, expected_shape in (("native_video", VIDEO_NATIVE_SHAPE), ("native_audio", AUDIO_NATIVE_SHAPE)):
+    expected_video_shape = tuple(int(value) for value in expected_geometry["video_native_shape"])
+    expected_audio_shape = tuple(int(value) for value in expected_geometry["audio_native_shape"])
+    for label, expected_shape in (("native_video", expected_video_shape), ("native_audio", expected_audio_shape)):
         value = artifact.get(label)
         if not isinstance(value, Mapping) or tuple(value.get("shape", ())) != expected_shape or value.get("dtype") != "bfloat16" or not value.get("fingerprint"):
             raise ValueError(f"final artifact {label} schema is invalid")
@@ -7108,7 +7434,7 @@ def validate_final_artifact(
             )
         video_array = np.asarray(arrays["final_video_native"])
         audio_array = np.asarray(arrays["final_audio_native"])
-        if tuple(video_array.shape) != VIDEO_NATIVE_SHAPE or tuple(audio_array.shape) != AUDIO_NATIVE_SHAPE:
+        if tuple(video_array.shape) != expected_video_shape or tuple(audio_array.shape) != expected_audio_shape:
             raise ValueError("final native latent arrays have the wrong shape")
         if video_array.dtype != np.dtype(np.float32) or audio_array.dtype != np.dtype(np.float32):
             raise ValueError("final native latent NPZ storage dtype must be float32")
@@ -7151,6 +7477,7 @@ def validate_derived_decoder_gate(
     derived_worker_attempts: int = 1,
     expected_attempt_identifier: str | None = None,
     expected_checkpoint_identity: Mapping[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate every derived prerequisite before a decoder worker can be launched."""
     gates: dict[str, bool] = {}
@@ -7211,10 +7538,11 @@ def validate_derived_decoder_gate(
     )
 
     metadata: dict[str, Any] = {}
+    geometry_contract: dict[str, Any] | None = None
     arrays: dict[str, np.ndarray] = {}
 
     def load_metadata() -> None:
-        nonlocal metadata
+        nonlocal metadata, geometry_contract
         metadata = _read_json_object(Path(metadata_path), "final native latent metadata")
         if metadata.get("metadata_sha256") != stable_metadata_sha256(metadata):
             raise ValueError("final native latent metadata checksum/linkage is stale")
@@ -7222,6 +7550,10 @@ def validate_derived_decoder_gate(
             raise ValueError("final native latent metadata attempt identifier mismatch")
         if expected_checkpoint_identity is not None and metadata.get("checkpoint_identity") != _json_safe(dict(expected_checkpoint_identity)):
             raise ValueError("final native latent metadata checkpoint identity mismatch")
+        artifact_geometry = metadata.get("geometry")
+        selected_geometry = expected_geometry if expected_geometry is not None else (artifact_geometry if isinstance(artifact_geometry, Mapping) else None)
+        geometry_contract = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+        validate_geometry_contract(geometry_contract, expected=expected_geometry) if expected_geometry is not None else None
 
     check("final-native-latent-metadata-linkage", load_metadata, phase="derived-finalization")
 
@@ -7237,18 +7569,20 @@ def validate_derived_decoder_gate(
 
     def video_shape_and_dtype() -> None:
         descriptor = metadata.get("native_video")
-        if tuple(arrays["final_video_native"].shape) != VIDEO_NATIVE_SHAPE or not isinstance(descriptor, Mapping):
-            raise ValueError("final video latent shape is not (1,24,9,8,8)")
-        if tuple(descriptor.get("shape", ())) != VIDEO_NATIVE_SHAPE or descriptor.get("dtype") != "bfloat16":
+        expected_shape = tuple(int(value) for value in geometry_contract["video_native_shape"])
+        if tuple(arrays["final_video_native"].shape) != expected_shape or not isinstance(descriptor, Mapping):
+            raise ValueError("final video latent shape does not match the selected geometry")
+        if tuple(descriptor.get("shape", ())) != expected_shape or descriptor.get("dtype") != "bfloat16":
             raise ValueError("final video latent logical shape or dtype is invalid")
 
     check("video-latent-shape-and-logical-dtype", video_shape_and_dtype, phase="derived-finalization")
 
     def audio_shape_and_dtype() -> None:
         descriptor = metadata.get("native_audio")
-        if tuple(arrays["final_audio_native"].shape) != AUDIO_NATIVE_SHAPE or not isinstance(descriptor, Mapping):
-            raise ValueError("final audio latent shape is not (2,32,50)")
-        if tuple(descriptor.get("shape", ())) != AUDIO_NATIVE_SHAPE or descriptor.get("dtype") != "bfloat16":
+        expected_shape = tuple(int(value) for value in geometry_contract["audio_native_shape"])
+        if tuple(arrays["final_audio_native"].shape) != expected_shape or not isinstance(descriptor, Mapping):
+            raise ValueError("final audio latent shape does not match the selected geometry")
+        if tuple(descriptor.get("shape", ())) != expected_shape or descriptor.get("dtype") != "bfloat16":
             raise ValueError("final audio latent logical shape or dtype is invalid")
 
     check("audio-latent-shape-and-logical-dtype", audio_shape_and_dtype, phase="derived-finalization")
@@ -7309,6 +7643,7 @@ def validate_derived_decoder_gate(
             arrays=arrays,
             artifact_path=Path(artifact_path),
             metadata_path=Path(metadata_path),
+            geometry=geometry_contract,
         ),
         phase="derived-release-gate",
     )
@@ -7724,6 +8059,9 @@ def _parent_run(
     process_snapshot_runner: Callable[..., Any] | None = None,
     mux_timeout_seconds: float = 120.0,
 ) -> dict[str, Any]:
+    selected_video_size = validate_video_size(getattr(args, "video_size", DEFAULT_VIDEO_SIZE))
+    validate_full_run_video_size(selected_video_size)
+    core_geometry = canonical_geometry_contract(selected_video_size)
     root = Path(args.checkpoint_root).expanduser().resolve()
     derived = Path(args.derived_transformer).expanduser().resolve()
     report["phase_order"].append("preflight")
@@ -7738,7 +8076,7 @@ def _parent_run(
     report["schedule_contract"] = build_full_schedule().receipt()
     report["timing_telemetry"]["schedule_construction_seconds"] = time.perf_counter() - schedule_started
     report["prompt"] = prompt_receipt(args.prompt)
-    validate_packed_contract(report["packing"])
+    validate_packed_contract(report["packing"], geometry=core_geometry)
     _write_json(Path(paths["report"]), report)
 
     conditioning_arguments = [
@@ -7746,6 +8084,7 @@ def _parent_run(
         "--derived-transformer", str(derived),
         "--prompt", args.prompt,
         "--seed", str(args.seed),
+        "--video-size", str(selected_video_size),
         "--artifact", paths["conditioning_artifact"],
         "--receipt", paths["conditioning_receipt"],
         "--tolerance", str(args.active_memory_tolerance_bytes),
@@ -7760,8 +8099,8 @@ def _parent_run(
         raise PhaseFailure("conditioning-worker", conditioning.get("primary_error") or "conditioning worker boundary failed", cleanup=conditioning.get("cleanup_error"), details={"child": conditioning}, cleanup_attempted=True)
     validate_worker_boundary(conditioning, identity="conditioning")
     try:
-        validate_conditioning_receipt(conditioning)
-        validate_conditioning_artifact_binding(conditioning, Path(paths["conditioning_artifact"]))
+        validate_conditioning_receipt(conditioning, expected_geometry=core_geometry)
+        validate_conditioning_artifact_binding(conditioning, Path(paths["conditioning_artifact"]), geometry=core_geometry)
     except BaseException as exc:
         raise PhaseFailure("conditioning-release-gate", exc, details={"child": conditioning}) from exc
     report["prompt"] = conditioning.get("prompt", report["prompt"])
@@ -7776,6 +8115,7 @@ def _parent_run(
         "--checkpoint-root", str(root),
         "--derived-transformer", str(derived),
         "--attempt-identifier", paths["attempt_identifier"],
+        "--video-size", str(selected_video_size),
         "--conditioning-artifact", paths["conditioning_artifact"],
         "--conditioning-receipt", paths["conditioning_receipt"],
         "--final-artifact", paths["final_artifact"],
@@ -7811,6 +8151,7 @@ def _parent_run(
         arrays=arrays,
         artifact_path=Path(paths["final_artifact"]),
         metadata_path=Path(paths["final_artifact_metadata"]),
+        geometry=core_geometry,
     )
     report["final_artifact"] = metadata
     event_summary = validate_event_stream(Path(paths["event_file"]))
@@ -7834,6 +8175,7 @@ def _parent_run(
             derived_worker_attempts=report["invocation"]["derived_worker_attempts"],
             expected_attempt_identifier=paths["attempt_identifier"],
             expected_checkpoint_identity=report["checkpoint_identity"],
+            expected_geometry=core_geometry,
         )
     except DecoderGateFailure as exc:
         gate = dict(exc.gate_receipt)
@@ -8029,6 +8371,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-root", required=True)
     run.add_argument("--prompt", required=True)
     run.add_argument("--seed", required=True, type=int)
+    run.add_argument("--video-size", type=int, choices=PROOF_VIDEO_SIZES, default=DEFAULT_VIDEO_SIZE)
     run.add_argument("--active-memory-tolerance-bytes", required=True, type=int)
     run.add_argument("--operator-declared-uncontended", action="store_true")
     run.add_argument("--verbose", action="store_true")
@@ -8085,7 +8428,11 @@ def validate_report(report: Mapping[str, Any]) -> None:
         validate_cache_attribution(report.get("cache_attribution", {}))
         if report.get("derived_worker", {}).get("cache_attribution") != report.get("cache_attribution"):
             raise ValueError("successful report cache attribution differs from the derived-worker receipt")
-        validate_final_artifact(report.get("final_artifact", {}))
+        report_geometry = report.get("geometry")
+        if not isinstance(report_geometry, Mapping):
+            raise ValueError("successful report is missing its explicit geometry contract")
+        validate_geometry_contract(report_geometry)
+        validate_final_artifact(report.get("final_artifact", {}), geometry=report_geometry)
         validate_worker_boundary(report.get("conditioning_worker", {}), identity="conditioning")
         validate_worker_boundary(report.get("derived_worker", {}), identity="derived")
         if report["conditioning_worker"].get("conditioning_release", {}).get("passed") is not True or report["derived_worker"].get("transformer_release", {}).get("passed") is not True:
@@ -8255,6 +8602,7 @@ def run_command(args: argparse.Namespace) -> int:
     try:
         validate_locked_prompt(args.prompt)
         validate_seed(args.seed)
+        validate_full_run_video_size(getattr(args, "video_size", DEFAULT_VIDEO_SIZE))
         if args.active_memory_tolerance_bytes < 0:
             raise ValueError("active-memory-tolerance-bytes must be nonnegative")
         paths = ensure_attempt_namespace(root)
