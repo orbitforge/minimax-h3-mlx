@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import ast
-from contextlib import redirect_stdout
 import importlib.util
-import io
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 import numpy as np
 
@@ -278,37 +275,9 @@ class Slice3B2GeometryContractTests(unittest.TestCase):
                 artifact, arrays=arrays, require_worker_termination=False, geometry=self.geometry_128
             )
 
-    def test_full_run_256_fails_before_attempt_namespace_or_parent(self):
-        args = probe.build_parser().parse_args(
-            [
-                "run-derived-full-schedule",
-                "--checkpoint-root",
-                "/nonexistent/checkpoint",
-                "--derived-transformer",
-                "/nonexistent/transformer",
-                "--output-root",
-                "/tmp/slice3b2-no-output",
-                "--prompt",
-                probe.LOCKED_PROMPT,
-                "--seed",
-                str(probe.CANONICAL_SEED),
-                "--video-size",
-                "256",
-                "--active-memory-tolerance-bytes",
-                "0",
-            ]
-        )
-        with mock.patch.object(probe, "ensure_attempt_namespace") as ensure_namespace, mock.patch.object(
-            probe, "_parent_run"
-        ) as parent_run, redirect_stdout(io.StringIO()) as output:
-            result = probe.run_command(args)
-        self.assertEqual(result, 1)
-        self.assertIn(probe.FULL_RUN_256_GATE_MESSAGE, output.getvalue())
-        ensure_namespace.assert_not_called()
-        parent_run.assert_not_called()
+    def test_full_run_256_selector_is_open_and_parser_default_is_128(self):
+        self.assertEqual(probe.validate_full_run_video_size(256), 256)
 
-    def test_full_run_128_gate_is_open_and_parser_default_is_128(self):
-        self.assertEqual(probe.validate_full_run_video_size(128), 128)
         args = probe.build_parser().parse_args(
             [
                 "run-derived-full-schedule",
@@ -327,6 +296,9 @@ class Slice3B2GeometryContractTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.video_size, 128)
+
+    def test_full_run_128_selector_is_open(self):
+        self.assertEqual(probe.validate_full_run_video_size(128), 128)
 
     def test_worker_parsers_carry_the_same_proof_only_selector(self):
         conditioning = probe._conditioning_worker_parser(

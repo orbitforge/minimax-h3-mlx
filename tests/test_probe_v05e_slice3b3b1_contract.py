@@ -287,9 +287,8 @@ class Slice3B3B1FramePublicationTests(unittest.TestCase):
             self.assertTrue(staged.is_dir())
             self.assertFalse(final.exists())
 
-    def test_256_full_run_gate_remains_closed(self):
-        with self.assertRaisesRegex(ValueError, "full-run"):
-            probe.validate_full_run_video_size(256)
+    def test_256_full_run_selector_is_valid_after_publication_contract(self):
+        self.assertEqual(probe.validate_full_run_video_size(256), 256)
         self.assertEqual(probe.validate_full_run_video_size(128), 128)
 
 

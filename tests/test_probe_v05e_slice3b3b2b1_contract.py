@@ -345,13 +345,13 @@ class Slice3B3B2B1FFprobeValidationTests(unittest.TestCase):
             paths = media_fixture(Path(directory), size=256)
             runner = FakeMuxRunner(ffprobe_json=valid_ffprobe_json(256))
             result = run_mux(paths, size=256, runner=runner)
-            self.assertEqual(result["status"], "validated")
-            self.assertEqual(result["selected_geometry"], geometry(256))
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["geometry"], geometry(256))
             self.assertEqual(result["video_width"], 256)
             self.assertEqual(result["video_height"], 256)
             self.assertEqual(result["video_codec"], "h264")
             self.assertEqual(result["pixel_format"], "yuv420p")
-            self.assertEqual(result["frame_rate"], 24.0)
+            self.assertEqual(result["fps"], 24)
             self.assertEqual(result["frame_count"], 30)
             self.assertEqual(result["audio_codec"], "aac")
             self.assertEqual(result["audio_channels"], 2)
@@ -366,10 +366,9 @@ class Slice3B3B2B1FFprobeValidationTests(unittest.TestCase):
             self.assertEqual(result["wav_manifest_identity"], probe.AUDIO_WAV_MANIFEST_IDENTITY)
             self.assertEqual(result["ffmpeg_staging_receipt"]["status"], "staged")
             self.assertEqual(result["invocation_counts"], {"ffmpeg": 1, "ffprobe": 1})
-            self.assertTrue(paths["mp4_partial"].is_file())
-            self.assertFalse(paths["mp4"].exists())
-            self.assertFalse(paths["mp4_manifest"].exists())
-            probe.validate_ffprobe_staging_receipt(result, expected_geometry=geometry(256))
+            self.assertFalse(paths["mp4_partial"].exists())
+            self.assertTrue(paths["mp4"].is_file())
+            self.assertTrue(paths["mp4_manifest"].is_file())
 
     def test_receipt_cross_size_and_field_tampering_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -407,10 +406,27 @@ class Slice3B3B2B1FFprobeValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 probe.validate_ffprobe_staging_receipt(tampered, expected_geometry=geometry(256))
 
-    def test_staged_mp4_identity_is_bound_and_publication_is_disabled(self):
+    def test_staged_mp4_identity_is_bound_before_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = media_fixture(Path(directory), size=256)
-            result = run_mux(paths, size=256, runner=FakeMuxRunner(ffprobe_json=valid_ffprobe_json(256)))
+            staging = probe.execute_ffmpeg_staging(
+                frames_directory=paths["frames"],
+                video_manifest_path=paths["video_frame_manifest"],
+                wav_path=paths["audio_wav"],
+                audio_manifest_path=paths["audio_manifest"],
+                mp4_partial_path=paths["mp4_partial"],
+                mp4_final_path=paths["mp4"],
+                mp4_manifest_path=paths["mp4_manifest"],
+                attempt_identifier=paths["attempt_identifier"],
+                launch_gate=paths["launch_gate"],
+                geometry=geometry(256),
+                subprocess_runner=FakeMuxRunner(),
+            )
+            result = probe.execute_ffprobe_validation(
+                staging,
+                geometry=geometry(256),
+                subprocess_runner=FakeMuxRunner(ffprobe_json=valid_ffprobe_json(256)),
+            )
             identity = result["staged_mp4_identity"]
             self.assertEqual(identity["path"], str(paths["mp4_partial"].resolve()))
             self.assertEqual(identity["size_bytes"], paths["mp4_partial"].stat().st_size)
@@ -430,23 +446,23 @@ class Slice3B3B2B1FFprobeValidationTests(unittest.TestCase):
             self.assertFalse(paths["mp4_partial"].exists())
             self.assertTrue(paths["mp4_manifest"].is_file())
 
-    def test_256_full_run_gate_remains_before_attempt_creation(self):
-        args = probe.build_parser().parse_args(
-            [
-                "run-derived-full-schedule",
-                "--checkpoint-root", "/nonexistent/checkpoint",
-                "--derived-transformer", "/nonexistent/transformer",
-                "--output-root", "/private/tmp/slice3b3b2b1-no-output",
-                "--prompt", probe.LOCKED_PROMPT,
-                "--seed", str(probe.CANONICAL_SEED),
-                "--video-size", "256",
-                "--active-memory-tolerance-bytes", "0",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "full-run"):
-            probe.validate_full_run_video_size(256)
-        self.assertEqual(probe.validate_full_run_video_size(128), 128)
-        self.assertEqual(probe.run_command(args), 1)
+    def test_256_full_run_selector_passes_size_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = probe.build_parser().parse_args(
+                [
+                    "run-derived-full-schedule",
+                    "--checkpoint-root", "/nonexistent/checkpoint",
+                    "--derived-transformer", "/nonexistent/transformer",
+                    "--output-root", str(Path(directory) / "output"),
+                    "--prompt", probe.LOCKED_PROMPT,
+                    "--seed", str(probe.CANONICAL_SEED),
+                    "--video-size", "256",
+                    "--active-memory-tolerance-bytes", "0",
+                ]
+            )
+            self.assertEqual(probe.validate_full_run_video_size(256), 256)
+            self.assertEqual(probe.validate_full_run_video_size(128), 128)
+            self.assertEqual(probe.run_command(args), 1)
 
     def test_ffprobe_command_is_deterministic_and_shell_free(self):
         command = probe.build_ffprobe_command(Path("/tmp/staged.mp4"))

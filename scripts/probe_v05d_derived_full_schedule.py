@@ -78,7 +78,6 @@ EXPECTED_TRANSFORMER_FORWARDS = 15
 # selected ProductionMultimodalGeometry.
 DEFAULT_VIDEO_SIZE = 128
 PROOF_VIDEO_SIZES = (128, 256)
-FULL_RUN_256_GATE_MESSAGE = "256x256 full-run media support is not enabled until Slice 3B3B"
 
 VIDEO_NATIVE_SHAPE = (1, 24, 9, 8, 8)
 AUDIO_NATIVE_SHAPE = (2, 32, 50)
@@ -318,7 +317,7 @@ MP4_MUX_LAUNCH_GATE_KEYS = frozenset(
     }
 )
 MP4_MANIFEST_IDENTITY = "minimax-h3-mlx-v05d-mp4-manifest"
-MP4_MANIFEST_SCHEMA_VERSION = 1
+MP4_MANIFEST_SCHEMA_VERSION = 2
 MP4_PARTIAL_FILENAME = "dodecahedron.partial.mp4"
 MP4_FINAL_FILENAME = "dodecahedron.mp4"
 MP4_MANIFEST_FILENAME = "mp4-manifest.json"
@@ -335,10 +334,32 @@ MP4_MANIFEST_KEYS = frozenset(
         "manifest_identity",
         "schema_version",
         "attempt_identifier",
+        "attempt_identity",
         "publication_state",
         "mp4_path",
         "size_bytes",
         "mp4_sha256",
+        "staged_mp4_path",
+        "staged_mp4_size_bytes",
+        "staged_mp4_sha256",
+        "staged_mp4_identity",
+        "geometry",
+        "geometry_identity",
+        "video_width",
+        "video_height",
+        "frame_count",
+        "fps",
+        "duration",
+        "duration_seconds",
+        "video_codec",
+        "pixel_format",
+        "audio_codec",
+        "audio_channels",
+        "audio_sample_rate",
+        "frame_manifest_identity",
+        "wav_manifest_identity",
+        "ffmpeg_receipt_identity",
+        "ffprobe_receipt_identity",
         "video_frame_manifest_path",
         "video_frame_manifest_sha256",
         "video_frame_manifest_file_sha256",
@@ -1576,11 +1597,8 @@ def validate_video_size(video_size: Any) -> int:
 
 
 def validate_full_run_video_size(video_size: Any) -> int:
-    """Fail closed before an output attempt or worker can be started for 256x256."""
-    size = validate_video_size(video_size)
-    if size == 256:
-        raise ValueError(FULL_RUN_256_GATE_MESSAGE)
-    return size
+    """Validate the proof selector before a full-run attempt is created."""
+    return validate_video_size(video_size)
 
 
 def _proof_video_config() -> SimpleNamespace:
@@ -5394,6 +5412,80 @@ def _stable_probe_json_sha256(probe_json: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def stable_mp4_receipt_sha256(receipt: Mapping[str, Any]) -> str:
+    """Create a deterministic identity for one successful ffmpeg/ffprobe receipt."""
+    if not isinstance(receipt, Mapping):
+        raise ValueError("MP4 subprocess receipt must be a mapping")
+    payload = json.dumps(_json_safe(dict(receipt)), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_mp4_subprocess_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    tool: str,
+    staged_path: Path,
+    probe_json: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require one successful receipt to point at the exact staged artifact."""
+    if not isinstance(receipt, Mapping):
+        raise ValueError(f"{tool} receipt is missing")
+    recorded_tool = receipt.get("tool")
+    if recorded_tool is not None and recorded_tool != tool:
+        raise ValueError(f"{tool} receipt tool identity is invalid")
+    if receipt.get("invoked") is not True or receipt.get("status") != "completed":
+        raise ValueError(f"{tool} receipt does not prove a successful invocation")
+    if receipt.get("returncode") != 0 or receipt.get("timed_out") is True:
+        raise ValueError(f"{tool} receipt does not prove exit code zero")
+    argv = receipt.get("argv")
+    if not isinstance(argv, list) or not argv or Path(str(argv[-1])).resolve() != Path(staged_path).resolve():
+        raise ValueError(f"{tool} receipt path is not the staged MP4")
+    if tool == "ffprobe" and probe_json is not None:
+        stdout = receipt.get("stdout")
+        try:
+            recorded_probe_json = json.loads(stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("ffprobe receipt does not preserve valid JSON") from exc
+        if (
+            not isinstance(recorded_probe_json, Mapping)
+            or _stable_probe_json_sha256(recorded_probe_json) != _stable_probe_json_sha256(probe_json)
+        ):
+            raise ValueError("ffprobe receipt JSON differs from manifest evidence")
+    return dict(receipt)
+
+
+def _require_staged_mp4_identity(
+    identity: Mapping[str, Any],
+    *,
+    artifact_path: Path,
+    label: str = "staged MP4",
+) -> dict[str, Any]:
+    """Require the exact nonzero regular-file identity used by every publication gate."""
+    if not isinstance(identity, Mapping):
+        raise ValueError(f"{label} identity is missing")
+    actual = _mp4_file_evidence(Path(artifact_path))
+    if actual.get("exists") is not True or actual.get("size_bytes", 0) <= 0 or not actual.get("sha256"):
+        raise ValueError(f"{label} is missing, non-regular, or empty")
+    if dict(identity) != actual:
+        raise ValueError(f"{label} identity is stale")
+    if identity.get("path") != actual["path"]:
+        raise ValueError(f"{label} path identity is stale")
+    if identity.get("size_bytes") != actual["size_bytes"]:
+        raise ValueError(f"{label} size identity is stale")
+    if identity.get("sha256") != actual["sha256"]:
+        raise ValueError(f"{label} SHA-256 identity is stale")
+    return actual
+
+
+def _staged_mp4_identity_fields(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the locked flat staged-artifact identity aliases."""
+    return {
+        "staged_mp4_path": identity.get("path"),
+        "staged_mp4_size_bytes": identity.get("size_bytes"),
+        "staged_mp4_sha256": identity.get("sha256"),
+    }
+
+
 def build_mp4_manifest(
     artifact_path: Path,
     *,
@@ -5403,8 +5495,12 @@ def build_mp4_manifest(
     audio_manifest: Mapping[str, Any],
     probe_metadata: Mapping[str, Any],
     probe_json: Mapping[str, Any],
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    staged_mp4_identity: Mapping[str, Any] | None = None,
+    ffmpeg_receipt: Mapping[str, Any] | None = None,
+    ffprobe_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the checksum-bound MP4 manifest before final publication."""
+    """Build the one geometry-bound MP4 manifest before final publication."""
     artifact = Path(artifact_path).resolve()
     if not artifact.is_file() or artifact.stat().st_size <= 0:
         raise ValueError("cannot manifest a missing or empty staged MP4")
@@ -5412,23 +5508,82 @@ def build_mp4_manifest(
         raise ValueError("MP4 manifest attempt identifier is required")
     if video_manifest.get("publication_state") != "published" or audio_manifest.get("publication_state") != "published":
         raise ValueError("MP4 manifest requires published PNG and WAV manifests")
+    if ffmpeg_receipt is None or ffprobe_receipt is None:
+        raise ValueError("MP4 manifest requires ffmpeg and ffprobe receipt identities")
+    selected_geometry = geometry
+    if selected_geometry is None and isinstance(video_manifest.get("geometry"), Mapping):
+        selected_geometry = video_manifest["geometry"]
+    core_geometry = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+    if isinstance(video_manifest.get("geometry"), Mapping):
+        validate_geometry_contract(video_manifest["geometry"], expected=core_geometry)
+    validated_probe_metadata = validate_ffprobe_json(
+        probe_json,
+        mp4_path=artifact,
+        expected_geometry=core_geometry,
+    )
+    if _json_safe(dict(probe_metadata)) != _json_safe(validated_probe_metadata):
+        raise ValueError("MP4 manifest probe metadata differs from ffprobe evidence")
+    _validate_mp4_subprocess_receipt(
+        ffmpeg_receipt,
+        tool="ffmpeg",
+        staged_path=artifact,
+    )
+    _validate_mp4_subprocess_receipt(
+        ffprobe_receipt,
+        tool="ffprobe",
+        staged_path=artifact,
+        probe_json=probe_json,
+    )
+    if staged_mp4_identity is None:
+        staged_mp4_identity = _mp4_file_evidence(artifact)
+    _require_staged_mp4_identity(
+        staged_mp4_identity,
+        artifact_path=artifact,
+        label="staged MP4 before manifest creation",
+    )
+    decoder_geometry = video_decoder_geometry_contract(core_geometry)
+    geometry_identity = _video_frame_geometry_identity(decoder_geometry)
+    probe_video = dict(probe_metadata["video"])
+    probe_audio = dict(probe_metadata["audio"])
+    probe_container = dict(probe_metadata["container"])
+    staged_fields = _staged_mp4_identity_fields(staged_mp4_identity)
     manifest = {
         "manifest_identity": MP4_MANIFEST_IDENTITY,
         "schema_version": MP4_MANIFEST_SCHEMA_VERSION,
         "attempt_identifier": attempt_identifier,
+        "attempt_identity": {"attempt_identifier": attempt_identifier},
         "publication_state": "published",
         "mp4_path": str(Path(published_path).resolve()),
         "size_bytes": artifact.stat().st_size,
         "mp4_sha256": sha256_file(artifact),
+        **staged_fields,
+        "staged_mp4_identity": dict(staged_mp4_identity),
+        "geometry": dict(core_geometry),
+        "geometry_identity": geometry_identity,
+        "video_width": int(core_geometry["video_width"]),
+        "video_height": int(core_geometry["video_height"]),
+        "frame_count": int(core_geometry["frames"]),
+        "fps": int(core_geometry["fps"]),
+        "duration": float(core_geometry["duration_seconds"]),
+        "duration_seconds": float(core_geometry["duration_seconds"]),
+        "video_codec": probe_video["codec_name"],
+        "pixel_format": probe_video["pixel_format"],
+        "audio_codec": probe_audio["codec_name"],
+        "audio_channels": int(probe_audio["channels"]),
+        "audio_sample_rate": int(probe_audio["sample_rate"]),
+        "frame_manifest_identity": video_manifest["manifest_identity"],
+        "wav_manifest_identity": audio_manifest["manifest_identity"],
+        "ffmpeg_receipt_identity": stable_mp4_receipt_sha256(ffmpeg_receipt),
+        "ffprobe_receipt_identity": stable_mp4_receipt_sha256(ffprobe_receipt),
         "video_frame_manifest_path": str(Path(video_manifest["manifest_path"]).resolve()),
         "video_frame_manifest_sha256": video_manifest["manifest_sha256"],
         "video_frame_manifest_file_sha256": sha256_file(Path(video_manifest["manifest_path"])),
         "audio_manifest_path": str(Path(audio_manifest["manifest_path"]).resolve()),
         "audio_manifest_sha256": audio_manifest["manifest_sha256"],
         "audio_manifest_file_sha256": sha256_file(Path(audio_manifest["manifest_path"])),
-        "video": dict(probe_metadata["video"]),
-        "audio": dict(probe_metadata["audio"]),
-        "container": dict(probe_metadata["container"]),
+        "video": probe_video,
+        "audio": probe_audio,
+        "container": probe_container,
         "ffprobe_json_sha256": _stable_probe_json_sha256(probe_json),
         "manifest_sha256": None,
     }
@@ -5444,8 +5599,12 @@ def validate_mp4_manifest(
     expected_published_path: Path | None = None,
     expected_video_manifest_path: Path | None = None,
     expected_audio_manifest_path: Path | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_staged_mp4_identity: Mapping[str, Any] | None = None,
+    expected_ffmpeg_receipt: Mapping[str, Any] | None = None,
+    expected_ffprobe_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate MP4 manifest schema, source-manifest linkage, and artifact checksum linkage."""
+    """Validate MP4 manifest schema, cross-size evidence, and artifact checksum linkage."""
     manifest_file = Path(manifest_path).resolve()
     manifest = _read_json_object(manifest_file, "MP4 manifest")
     if set(manifest) != MP4_MANIFEST_KEYS:
@@ -5459,6 +5618,8 @@ def validate_mp4_manifest(
         raise ValueError("MP4 manifest schema version mismatch")
     if manifest.get("attempt_identifier") != expected_attempt_identifier:
         raise ValueError("MP4 manifest attempt identifier mismatch")
+    if manifest.get("attempt_identity") != {"attempt_identifier": expected_attempt_identifier}:
+        raise ValueError("MP4 manifest attempt identity mismatch")
     if manifest.get("publication_state") != "published":
         raise ValueError("MP4 manifest publication state is not published")
     if manifest.get("manifest_sha256") != stable_mp4_manifest_sha256(manifest):
@@ -5472,6 +5633,86 @@ def validate_mp4_manifest(
     actual_sha = sha256_file(artifact)
     if manifest.get("size_bytes") != actual_size or manifest.get("mp4_sha256") != actual_sha:
         raise ValueError("MP4 manifest file checksum linkage is stale")
+
+    manifest_geometry = manifest.get("geometry")
+    if not isinstance(manifest_geometry, Mapping):
+        raise ValueError("MP4 manifest is missing selected geometry")
+    selected_geometry = (
+        canonical_geometry_contract(geometry=expected_geometry)
+        if expected_geometry is not None
+        else canonical_geometry_contract(geometry=manifest_geometry)
+    )
+    validate_geometry_contract(manifest_geometry, expected=selected_geometry)
+    expected_decoder_geometry = video_decoder_geometry_contract(selected_geometry)
+    expected_geometry_identity = _video_frame_geometry_identity(expected_decoder_geometry)
+    if manifest.get("geometry_identity") != expected_geometry_identity:
+        raise ValueError("MP4 manifest geometry identity is stale")
+    expected_top_level = {
+        "video_width": selected_geometry["video_width"],
+        "video_height": selected_geometry["video_height"],
+        "frame_count": selected_geometry["frames"],
+        "fps": selected_geometry["fps"],
+        "duration": selected_geometry["duration_seconds"],
+        "duration_seconds": selected_geometry["duration_seconds"],
+    }
+    for field, expected in expected_top_level.items():
+        actual = manifest.get(field)
+        if field in {"duration", "duration_seconds"}:
+            if not isinstance(actual, (int, float)) or isinstance(actual, bool) or not math.isclose(
+                float(actual), float(expected), rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(f"MP4 manifest {field} does not match selected geometry")
+        elif actual != expected:
+            raise ValueError(f"MP4 manifest {field} does not match selected geometry")
+
+    staged_path = manifest.get("staged_mp4_path")
+    staged_size = manifest.get("staged_mp4_size_bytes")
+    staged_sha = manifest.get("staged_mp4_sha256")
+    staged_identity = manifest.get("staged_mp4_identity")
+    if (
+        not isinstance(staged_path, str)
+        or not isinstance(staged_size, int)
+        or staged_size <= 0
+        or not isinstance(staged_sha, str)
+        or len(staged_sha) != 64
+        or not isinstance(staged_identity, Mapping)
+        or staged_identity.get("exists") is not True
+        or staged_identity.get("path") != staged_path
+        or staged_identity.get("size_bytes") != staged_size
+        or staged_identity.get("sha256") != staged_sha
+        or staged_size != manifest.get("size_bytes")
+        or staged_sha != manifest.get("mp4_sha256")
+    ):
+        raise ValueError("MP4 manifest staged MP4 identity is invalid")
+    if expected_staged_mp4_identity is not None:
+        for field, manifest_field in (
+            ("path", "staged_mp4_path"),
+            ("size_bytes", "staged_mp4_size_bytes"),
+            ("sha256", "staged_mp4_sha256"),
+        ):
+            if expected_staged_mp4_identity.get(field) != manifest.get(manifest_field):
+                raise ValueError("MP4 manifest staged MP4 identity differs from validated ffprobe evidence")
+    staged_artifact_path = Path(staged_path).resolve()
+    if expected_ffmpeg_receipt is not None:
+        _validate_mp4_subprocess_receipt(
+            expected_ffmpeg_receipt,
+            tool="ffmpeg",
+            staged_path=staged_artifact_path,
+        )
+    if expected_ffprobe_receipt is not None:
+        _validate_mp4_subprocess_receipt(
+            expected_ffprobe_receipt,
+            tool="ffprobe",
+            staged_path=staged_artifact_path,
+        )
+    for field in ("ffmpeg_receipt_identity", "ffprobe_receipt_identity"):
+        value = manifest.get(field)
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"MP4 manifest {field} is invalid")
+    if expected_ffmpeg_receipt is not None and manifest["ffmpeg_receipt_identity"] != stable_mp4_receipt_sha256(expected_ffmpeg_receipt):
+        raise ValueError("MP4 manifest ffmpeg receipt identity is stale")
+    if expected_ffprobe_receipt is not None and manifest["ffprobe_receipt_identity"] != stable_mp4_receipt_sha256(expected_ffprobe_receipt):
+        raise ValueError("MP4 manifest ffprobe receipt identity is stale")
 
     for path_key, checksum_key, file_checksum_key, expected_path in (
         ("video_frame_manifest_path", "video_frame_manifest_sha256", "video_frame_manifest_file_sha256", expected_video_manifest_path),
@@ -5488,6 +5729,20 @@ def validate_mp4_manifest(
         if sha256_file(linked_path) != manifest[file_checksum_key]:
             raise ValueError(f"MP4 manifest {checksum_key} linkage is stale")
 
+        if path_key == "video_frame_manifest_path":
+            if linked_manifest.get("manifest_identity") != VIDEO_FRAME_MANIFEST_IDENTITY:
+                raise ValueError("MP4 manifest frame manifest identity is invalid")
+            linked_geometry = linked_manifest.get("geometry")
+            if not isinstance(linked_geometry, Mapping):
+                raise ValueError("MP4 manifest video frame geometry linkage is missing")
+            validate_geometry_contract(linked_geometry, expected=selected_geometry)
+            if manifest.get("frame_manifest_identity") != linked_manifest.get("manifest_identity"):
+                raise ValueError("MP4 manifest frame manifest identity linkage is stale")
+        elif linked_manifest.get("manifest_identity") != AUDIO_WAV_MANIFEST_IDENTITY:
+            raise ValueError("MP4 manifest WAV manifest identity is invalid")
+        elif manifest.get("wav_manifest_identity") != linked_manifest.get("manifest_identity"):
+            raise ValueError("MP4 manifest WAV manifest identity linkage is stale")
+
     video = manifest.get("video")
     audio = manifest.get("audio")
     container = manifest.get("container")
@@ -5495,24 +5750,34 @@ def validate_mp4_manifest(
         raise ValueError("MP4 manifest media sections are incomplete")
     if (
         video.get("codec_family") != MP4_EXPECTED_VIDEO_CODEC
-        or video.get("width") != VIDEO_FRAME_WIDTH
-        or video.get("height") != VIDEO_FRAME_HEIGHT
-        or not math.isclose(float(video.get("frame_rate")), VIDEO_FRAME_FPS, rel_tol=0.0, abs_tol=1e-6)
+        or video.get("width") != selected_geometry["video_width"]
+        or video.get("height") != selected_geometry["video_height"]
+        or not math.isclose(float(video.get("frame_rate")), selected_geometry["fps"], rel_tol=0.0, abs_tol=1e-6)
         or video.get("pixel_format") != MP4_EXPECTED_PIXEL_FORMAT
-        or video.get("frame_count") != VIDEO_FRAME_COUNT
+        or video.get("frame_count") != selected_geometry["frames"]
+        or manifest.get("video_codec") != video.get("codec_name")
+        or manifest.get("pixel_format") != video.get("pixel_format")
     ):
         raise ValueError("MP4 manifest video properties are invalid")
     if (
         audio.get("codec_family") != MP4_EXPECTED_AUDIO_CODEC
+        or audio.get("channels") != manifest.get("audio_channels")
         or audio.get("channels") != 2
+        or audio.get("sample_rate") != manifest.get("audio_sample_rate")
         or audio.get("sample_rate") != AUDIO_SAMPLE_RATE
         or audio.get("bitrate_requested") != MP4_EXPECTED_AUDIO_BITRATE
+        or manifest.get("audio_codec") != audio.get("codec_name")
     ):
         raise ValueError("MP4 manifest audio properties are invalid")
     if not isinstance(manifest.get("ffprobe_json_sha256"), str) or len(manifest["ffprobe_json_sha256"]) != 64:
         raise ValueError("MP4 manifest ffprobe checksum is invalid")
     duration = _numeric_probe_value(container.get("duration_seconds"), "manifest.container.duration_seconds")
-    if not _duration_within_tolerance(duration) or container.get("size_bytes") != actual_size:
+    if (
+        not _duration_within_tolerance(duration)
+        or container.get("size_bytes") != actual_size
+        or not math.isclose(float(manifest.get("duration")), duration, rel_tol=0.0, abs_tol=1e-9)
+        or not math.isclose(float(manifest.get("duration_seconds")), duration, rel_tol=0.0, abs_tol=1e-9)
+    ):
         raise ValueError("MP4 manifest container linkage is invalid")
     return {
         "manifest_path": str(manifest_file),
@@ -5520,6 +5785,32 @@ def validate_mp4_manifest(
         "publication_state": manifest["publication_state"],
         "size_bytes": actual_size,
         "mp4_sha256": actual_sha,
+        "attempt_identifier": manifest["attempt_identifier"],
+        "attempt_identity": manifest["attempt_identity"],
+        "staged_mp4_path": manifest["staged_mp4_path"],
+        "staged_mp4_size_bytes": manifest["staged_mp4_size_bytes"],
+        "staged_mp4_sha256": manifest["staged_mp4_sha256"],
+        "staged_mp4_identity": dict(manifest["staged_mp4_identity"]),
+        "final_mp4_path": manifest["mp4_path"],
+        "final_mp4_size_bytes": actual_size,
+        "final_mp4_sha256": actual_sha,
+        "geometry": dict(manifest["geometry"]),
+        "geometry_identity": dict(manifest["geometry_identity"]),
+        "video_width": manifest["video_width"],
+        "video_height": manifest["video_height"],
+        "frame_count": manifest["frame_count"],
+        "fps": manifest["fps"],
+        "duration": manifest["duration"],
+        "duration_seconds": manifest["duration_seconds"],
+        "video_codec": manifest["video_codec"],
+        "pixel_format": manifest["pixel_format"],
+        "audio_codec": manifest["audio_codec"],
+        "audio_channels": manifest["audio_channels"],
+        "audio_sample_rate": manifest["audio_sample_rate"],
+        "frame_manifest_identity": manifest["frame_manifest_identity"],
+        "wav_manifest_identity": manifest["wav_manifest_identity"],
+        "ffmpeg_receipt_identity": manifest["ffmpeg_receipt_identity"],
+        "ffprobe_receipt_identity": manifest["ffprobe_receipt_identity"],
         "video_frame_manifest_path": manifest["video_frame_manifest_path"],
         "video_frame_manifest_sha256": manifest["video_frame_manifest_sha256"],
         "video_frame_manifest_file_sha256": manifest["video_frame_manifest_file_sha256"],
@@ -5543,6 +5834,10 @@ def publish_mp4_atomically(
     expected_attempt_identifier: str,
     expected_video_manifest_path: Path,
     expected_audio_manifest_path: Path,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_staged_mp4_identity: Mapping[str, Any] | None = None,
+    expected_ffmpeg_receipt: Mapping[str, Any] | None = None,
+    expected_ffprobe_receipt: Mapping[str, Any] | None = None,
     rename: Callable[[Path, Path], None] | None = None,
 ) -> dict[str, Any]:
     """Validate a staged MP4 manifest, then atomically rename without replacing a final file."""
@@ -5564,6 +5859,10 @@ def publish_mp4_atomically(
         expected_published_path=final,
         expected_video_manifest_path=expected_video_manifest_path,
         expected_audio_manifest_path=expected_audio_manifest_path,
+        expected_geometry=expected_geometry,
+        expected_staged_mp4_identity=expected_staged_mp4_identity,
+        expected_ffmpeg_receipt=expected_ffmpeg_receipt,
+        expected_ffprobe_receipt=expected_ffprobe_receipt,
     )
     if final.exists():
         raise FileExistsError(f"refusing existing final MP4: {final}")
@@ -5578,6 +5877,10 @@ def publish_mp4_atomically(
         expected_published_path=final,
         expected_video_manifest_path=expected_video_manifest_path,
         expected_audio_manifest_path=expected_audio_manifest_path,
+        expected_geometry=expected_geometry,
+        expected_staged_mp4_identity=expected_staged_mp4_identity,
+        expected_ffmpeg_receipt=expected_ffmpeg_receipt,
+        expected_ffprobe_receipt=expected_ffprobe_receipt,
     )
 
 
@@ -5882,6 +6185,8 @@ def _raise_mp4_mux_failure(
         "ffmpeg_argv": ffmpeg_receipt.get("argv"),
         "ffmpeg_exit_code": ffmpeg_receipt.get("returncode"),
         "staged_mp4_path": str(partial),
+        "staged_mp4_size_bytes": partial_before.get("size_bytes"),
+        "staged_mp4_sha256": partial_before.get("sha256"),
         "staged_mp4_nonzero": partial_before.get("size_bytes", 0) > 0,
         "final_mp4_published": False,
         "source_validation": _json_safe(dict(source_validation)),
@@ -5928,6 +6233,8 @@ def _ffmpeg_staging_receipt(
         "ffmpeg_argv": None,
         "ffmpeg_exit_code": None,
         "staged_mp4_path": str(partial),
+        "staged_mp4_size_bytes": None,
+        "staged_mp4_sha256": None,
         "staged_mp4_nonzero": False,
         "staged_mp4_identity": None,
         "final_mp4_path": str(final),
@@ -5984,6 +6291,7 @@ def _raise_ffmpeg_staging_failure(
         ),
         "elapsed_seconds": time.perf_counter() - started,
     }
+    failed_receipt.update(_staged_mp4_identity_fields(partial_before))
     raise MP4MuxFailure(primary, receipt=failed_receipt, cleanup_error=cleanup_error) from primary
 
 
@@ -6029,9 +6337,12 @@ def validate_ffmpeg_staging_receipt(
         or source_audio.get("manifest_sha256") != receipt.get("wav_manifest_sha256")
     ):
         raise ValueError("ffmpeg staging receipt WAV validation evidence is stale")
+    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
     argv = receipt.get("ffmpeg_argv")
     if not isinstance(argv, list) or not argv:
         raise ValueError("ffmpeg staging receipt is missing ffmpeg argv")
+    if Path(str(argv[-1])).resolve() != partial:
+        raise ValueError("ffmpeg staging receipt output path is not the staged MP4")
     if receipt.get("ffmpeg_exit_code") != 0:
         raise ValueError("ffmpeg staging receipt does not prove exit code zero")
     ffmpeg_receipt = receipt.get("ffmpeg")
@@ -6043,13 +6354,17 @@ def validate_ffmpeg_staging_receipt(
         raise ValueError("ffmpeg staging receipt does not prove an ffmpeg invocation")
     if ffmpeg_receipt.get("returncode") != 0:
         raise ValueError("ffmpeg staging receipt ffmpeg receipt does not prove exit code zero")
-    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
     if receipt.get("staged_mp4_nonzero") is not True or not partial.is_file() or partial.stat().st_size <= 0:
         raise ValueError("ffmpeg staging receipt does not prove a nonzero staged MP4")
     identity = receipt.get("staged_mp4_identity")
-    actual_identity = _mp4_file_evidence(partial)
-    if not isinstance(identity, Mapping) or dict(identity) != actual_identity:
-        raise ValueError("ffmpeg staging receipt staged MP4 identity is stale")
+    actual_identity = _require_staged_mp4_identity(identity, artifact_path=partial, label="ffmpeg staging receipt staged MP4")
+    for field, identity_field in (
+        ("staged_mp4_path", "path"),
+        ("staged_mp4_size_bytes", "size_bytes"),
+        ("staged_mp4_sha256", "sha256"),
+    ):
+        if receipt.get(field) != actual_identity.get(identity_field):
+            raise ValueError(f"ffmpeg staging receipt {field} is stale")
     if receipt.get("final_mp4_published") is not False:
         raise ValueError("ffmpeg staging receipt claims final MP4 publication")
     if receipt.get("ffprobe", {}).get("invoked") is not False:
@@ -6096,6 +6411,8 @@ def _ffprobe_staging_receipt(
         "ffprobe_json_sha256": None,
         "probe_metadata": None,
         "staged_mp4_path": str(partial),
+        "staged_mp4_size_bytes": staging_receipt.get("staged_mp4_size_bytes"),
+        "staged_mp4_sha256": staging_receipt.get("staged_mp4_sha256"),
         "staged_mp4_nonzero": False,
         "staged_mp4_identity": None,
         "final_mp4_path": str(final),
@@ -6141,6 +6458,8 @@ def validate_ffprobe_staging_receipt(
         "ffmpeg_argv",
         "ffmpeg_exit_code",
         "staged_mp4_path",
+        "staged_mp4_size_bytes",
+        "staged_mp4_sha256",
         "staged_mp4_nonzero",
         "frame_manifest_identity",
         "frame_manifest_sha256",
@@ -6159,23 +6478,30 @@ def validate_ffprobe_staging_receipt(
         raise ValueError("ffprobe staging receipt does not prove an ffprobe invocation")
     if ffprobe.get("returncode") != 0 or receipt.get("ffprobe_exit_code") != 0:
         raise ValueError("ffprobe staging receipt does not prove ffprobe exit code zero")
+    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
     ffprobe_argv = receipt.get("ffprobe_argv")
     if not isinstance(ffprobe_argv, list) or not ffprobe_argv:
         raise ValueError("ffprobe staging receipt is missing ffprobe argv")
     if ffprobe.get("argv") != ffprobe_argv:
         raise ValueError("ffprobe staging receipt ffprobe argv linkage is stale")
+    if Path(str(ffprobe_argv[-1])).resolve() != partial:
+        raise ValueError("ffprobe staging receipt input path is not the staged MP4")
     if receipt.get("invocation_counts") != {"ffmpeg": 1, "ffprobe": 1}:
         raise ValueError("ffprobe staging receipt does not prove exactly one ffprobe invocation")
     if receipt.get("retry_suppressed") is not True:
         raise ValueError("ffprobe staging receipt does not suppress retries")
 
-    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
     identity = receipt.get("staged_mp4_identity")
-    actual_identity = _mp4_file_evidence(partial)
+    actual_identity = _require_staged_mp4_identity(identity, artifact_path=partial, label="ffprobe staging receipt staged MP4")
     if receipt.get("staged_mp4_nonzero") is not True:
         raise ValueError("ffprobe staging receipt does not prove a nonzero staged MP4")
-    if not isinstance(identity, Mapping) or dict(identity) != actual_identity:
-        raise ValueError("ffprobe staging receipt staged MP4 identity is stale")
+    for field, identity_field in (
+        ("staged_mp4_path", "path"),
+        ("staged_mp4_size_bytes", "size_bytes"),
+        ("staged_mp4_sha256", "sha256"),
+    ):
+        if receipt.get(field) != actual_identity.get(identity_field):
+            raise ValueError(f"ffprobe staging receipt {field} is stale")
     if receipt.get("final_mp4_published") is not False:
         raise ValueError("ffprobe staging receipt claims final MP4 publication")
     if receipt.get("mp4_manifest_created") is not False:
@@ -6273,6 +6599,7 @@ def execute_ffmpeg_staging(
     subprocess_runner: Callable[..., Any] | None = None,
     ffmpeg_binary: str = "ffmpeg",
     timeout_seconds: float = 120.0,
+    require_geometry: bool = True,
 ) -> dict[str, Any]:
     """Stage one geometry-bound MP4 input with exactly one injected ffmpeg invocation.
 
@@ -6280,7 +6607,7 @@ def execute_ffmpeg_staging(
     an MP4 manifest, or renames the partial artifact to the final MP4 path.
     """
     core_geometry = canonical_geometry_contract(geometry=geometry)
-    validate_mux_launch_gate(launch_gate, expected_geometry=core_geometry, require_geometry=True)
+    validate_mux_launch_gate(launch_gate, expected_geometry=core_geometry, require_geometry=require_geometry)
     frames = Path(frames_directory).resolve()
     video_manifest_file = Path(video_manifest_path).resolve()
     wav = Path(wav_path).resolve()
@@ -6346,6 +6673,7 @@ def execute_ffmpeg_staging(
         if not staged_nonzero:
             raise ValueError("ffmpeg completed successfully without a nonzero staged MP4")
         receipt["staged_mp4_identity"] = _mp4_file_evidence(partial)
+        receipt.update(_staged_mp4_identity_fields(receipt["staged_mp4_identity"]))
         if final.exists():
             raise ValueError("ffmpeg staging unexpectedly exposed a final MP4")
         receipt.update(
@@ -6412,6 +6740,7 @@ def _raise_ffprobe_validation_failure(
         ),
         "elapsed_seconds": time.perf_counter() - started,
     }
+    failed_receipt.update(_staged_mp4_identity_fields(partial_before))
     raise MP4MuxFailure(primary, receipt=failed_receipt, cleanup_error=cleanup_error) from primary
 
 
@@ -6464,6 +6793,7 @@ def execute_ffprobe_validation(
     )
     receipt["staged_mp4_nonzero"] = True
     receipt["staged_mp4_identity"] = _mp4_file_evidence(partial)
+    receipt.update(_staged_mp4_identity_fields(receipt["staged_mp4_identity"]))
     ffprobe_argv = build_ffprobe_command(partial, ffprobe_binary=ffprobe_binary)
     receipt["ffprobe_argv"] = list(ffprobe_argv)
     try:
@@ -6545,7 +6875,7 @@ def execute_mp4_mux(
     rename: Callable[[Path, Path], None] | None = None,
     geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Mux validated standalone media once, inspect it once, and publish only after all gates pass."""
+    """Mux, inspect, manifest, and atomically publish one selected geometry exactly once."""
     selected_geometry = geometry
     if selected_geometry is None and isinstance(launch_gate.get("geometry"), Mapping):
         selected_geometry = launch_gate["geometry"]
@@ -6554,31 +6884,6 @@ def execute_mp4_mux(
         if selected_geometry is not None
         else canonical_geometry_contract()
     )
-    if selected_geometry is not None:
-        if selected_core_geometry["video_width"] == 256:
-            staging_receipt = execute_ffmpeg_staging(
-                frames_directory=frames_directory,
-                video_manifest_path=video_manifest_path,
-                wav_path=wav_path,
-                audio_manifest_path=audio_manifest_path,
-                mp4_partial_path=mp4_partial_path,
-                mp4_final_path=mp4_final_path,
-                mp4_manifest_path=mp4_manifest_path,
-                attempt_identifier=attempt_identifier,
-                launch_gate=launch_gate,
-                geometry=selected_core_geometry,
-                subprocess_runner=subprocess_runner,
-                ffmpeg_binary=ffmpeg_binary,
-                timeout_seconds=timeout_seconds,
-            )
-            return execute_ffprobe_validation(
-                staging_receipt,
-                geometry=selected_core_geometry,
-                subprocess_runner=subprocess_runner,
-                ffprobe_binary=ffprobe_binary,
-                timeout_seconds=timeout_seconds,
-            )
-    validate_mux_launch_gate(launch_gate)
     frames = Path(frames_directory).resolve()
     video_manifest_file = Path(video_manifest_path).resolve()
     wav = Path(wav_path).resolve()
@@ -6592,53 +6897,58 @@ def execute_mp4_mux(
         raise FileExistsError(f"refusing existing MP4 manifest: {manifest_file}")
     if partial.exists():
         raise FileExistsError(f"refusing existing staged MP4: {partial}")
-    runner = subprocess_runner or _default_mux_subprocess_runner
+    require_geometry = selected_geometry is not None
     started = time.perf_counter()
-    ffmpeg_receipt = _empty_mux_subprocess_receipt("ffmpeg")
-    ffprobe_receipt = _empty_mux_subprocess_receipt("ffprobe")
-    source_validation: dict[str, Any] = {}
+    staging_receipt = execute_ffmpeg_staging(
+        frames_directory=frames,
+        video_manifest_path=video_manifest_file,
+        wav_path=wav,
+        audio_manifest_path=audio_manifest_file,
+        mp4_partial_path=partial,
+        mp4_final_path=final,
+        mp4_manifest_path=manifest_file,
+        attempt_identifier=attempt_identifier,
+        launch_gate=launch_gate,
+        geometry=selected_core_geometry,
+        subprocess_runner=subprocess_runner,
+        ffmpeg_binary=ffmpeg_binary,
+        timeout_seconds=timeout_seconds,
+        require_geometry=require_geometry,
+    )
+    ffprobe_result = execute_ffprobe_validation(
+        staging_receipt,
+        geometry=selected_core_geometry,
+        subprocess_runner=subprocess_runner,
+        ffprobe_binary=ffprobe_binary,
+        timeout_seconds=timeout_seconds,
+    )
+    ffmpeg_receipt = dict(staging_receipt["ffmpeg"])
+    ffprobe_receipt = dict(ffprobe_result["ffprobe"])
+    source_validation = ffprobe_result.get("source_validation")
+    if not isinstance(source_validation, Mapping):
+        raise ValueError("validated ffprobe receipt is missing source validation evidence")
+    staged_mp4_identity = ffprobe_result.get("staged_mp4_identity")
+    if not isinstance(staged_mp4_identity, Mapping):
+        raise ValueError("validated ffprobe receipt is missing staged MP4 identity")
+    _require_staged_mp4_identity(
+        staged_mp4_identity,
+        artifact_path=partial,
+        label="staged MP4 after ffprobe validation",
+    )
     manifest_created = False
     try:
-        source_validation["video"] = validate_video_frame_manifest(
-            video_manifest_file,
-            frames,
-            expected_attempt_identifier=attempt_identifier,
-        )
-        source_validation["audio"] = validate_audio_wav_manifest(
-            audio_manifest_file,
-            wav,
-            expected_attempt_identifier=attempt_identifier,
-        )
-        ffmpeg_argv = build_ffmpeg_command(frames, wav, partial, ffmpeg_binary=ffmpeg_binary)
-        ffmpeg_receipt, runner_error = _run_mux_subprocess(
-            "ffmpeg",
-            ffmpeg_argv,
-            runner=runner,
-            timeout_seconds=timeout_seconds,
-        )
-        if runner_error is not None:
-            raise runner_error
-        if ffmpeg_receipt.get("returncode") != 0:
-            raise RuntimeError(f"ffmpeg exited with status {ffmpeg_receipt.get('returncode')}")
-        if not partial.is_file() or partial.stat().st_size <= 0:
-            raise ValueError("ffmpeg completed successfully without a nonzero staged MP4")
-
-        ffprobe_argv = build_ffprobe_command(partial, ffprobe_binary=ffprobe_binary)
-        ffprobe_receipt, runner_error = _run_mux_subprocess(
-            "ffprobe",
-            ffprobe_argv,
-            runner=runner,
-            timeout_seconds=timeout_seconds,
-        )
-        if runner_error is not None:
-            raise runner_error
-        if ffprobe_receipt.get("returncode") != 0:
-            raise RuntimeError(f"ffprobe exited with status {ffprobe_receipt.get('returncode')}")
+        probe_stdout = ffprobe_receipt.get("stdout", "")
         try:
-            probe_json = json.loads(ffprobe_receipt.get("stdout", ""))
+            probe_json = json.loads(probe_stdout)
         except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("ffprobe did not return valid JSON") from exc
-        probe_metadata = validate_ffprobe_json(probe_json, mp4_path=partial)
+            raise ValueError("validated ffprobe receipt did not preserve valid JSON") from exc
+        if not isinstance(probe_json, Mapping):
+            raise ValueError("validated ffprobe receipt JSON is not an object")
+        if _stable_probe_json_sha256(probe_json) != ffprobe_result.get("ffprobe_json_sha256"):
+            raise ValueError("validated ffprobe JSON identity changed before manifest creation")
+        probe_metadata = ffprobe_result.get("probe_metadata")
+        if not isinstance(probe_metadata, Mapping):
+            raise ValueError("validated ffprobe receipt is missing probe metadata")
         manifest = build_mp4_manifest(
             partial,
             published_path=final,
@@ -6647,6 +6957,10 @@ def execute_mp4_mux(
             audio_manifest=source_validation["audio"],
             probe_metadata=probe_metadata,
             probe_json=probe_json,
+            geometry=selected_core_geometry,
+            staged_mp4_identity=staged_mp4_identity,
+            ffmpeg_receipt=ffmpeg_receipt,
+            ffprobe_receipt=ffprobe_receipt,
         )
         _write_json(manifest_file, manifest)
         manifest_created = True
@@ -6657,6 +6971,10 @@ def execute_mp4_mux(
             expected_published_path=final,
             expected_video_manifest_path=video_manifest_file,
             expected_audio_manifest_path=audio_manifest_file,
+            expected_geometry=selected_core_geometry,
+            expected_staged_mp4_identity=staged_mp4_identity,
+            expected_ffmpeg_receipt=ffmpeg_receipt,
+            expected_ffprobe_receipt=ffprobe_receipt,
         )
         artifact = publish_mp4_atomically(
             partial,
@@ -6666,10 +6984,18 @@ def execute_mp4_mux(
             expected_attempt_identifier=attempt_identifier,
             expected_video_manifest_path=video_manifest_file,
             expected_audio_manifest_path=audio_manifest_file,
+            expected_geometry=selected_core_geometry,
+            expected_staged_mp4_identity=staged_mp4_identity,
+            expected_ffmpeg_receipt=ffmpeg_receipt,
+            expected_ffprobe_receipt=ffprobe_receipt,
             rename=rename,
         )
-        if sha256_file(final) != manifest["mp4_sha256"]:
-            raise ValueError("final MP4 checksum changed across atomic publication")
+        final_identity = _mp4_file_evidence(final)
+        if (
+            final_identity.get("size_bytes") != staged_mp4_identity.get("size_bytes")
+            or final_identity.get("sha256") != staged_mp4_identity.get("sha256")
+        ):
+            raise ValueError("final MP4 identity changed across atomic publication")
         return {
             "status": "completed",
             "invoked": True,
@@ -6682,17 +7008,37 @@ def execute_mp4_mux(
             "video_height": selected_core_geometry["video_height"],
             "frame_count": selected_core_geometry["frames"],
             "fps": selected_core_geometry["fps"],
+            "duration": selected_core_geometry["duration_seconds"],
+            "duration_seconds": selected_core_geometry["duration_seconds"],
+            "video_codec": artifact.get("video_codec"),
+            "pixel_format": artifact.get("pixel_format"),
+            "audio_codec": artifact.get("audio_codec"),
+            "audio_channels": artifact.get("audio_channels"),
+            "audio_sample_rate": artifact.get("audio_sample_rate"),
             "frame_manifest_identity": source_validation["video"].get("manifest_identity"),
             "frame_manifest_sha256": source_validation["video"].get("manifest_sha256"),
             "wav_manifest_identity": source_validation["audio"].get("manifest_identity"),
             "wav_manifest_sha256": source_validation["audio"].get("manifest_sha256"),
+            "ffmpeg_receipt_identity": artifact.get("ffmpeg_receipt_identity"),
+            "ffprobe_receipt_identity": artifact.get("ffprobe_receipt_identity"),
             "ffmpeg_argv": ffmpeg_receipt.get("argv"),
             "ffmpeg_exit_code": ffmpeg_receipt.get("returncode"),
+            "ffprobe_argv": ffprobe_receipt.get("argv"),
+            "ffprobe_exit_code": ffprobe_receipt.get("returncode"),
             "staged_mp4_path": str(partial),
-            "staged_mp4_nonzero": True,
+            "staged_mp4_size_bytes": staged_mp4_identity.get("size_bytes"),
+            "staged_mp4_sha256": staged_mp4_identity.get("sha256"),
+            "staged_mp4_identity": dict(staged_mp4_identity),
+            "staged_mp4_nonzero": staged_mp4_identity.get("size_bytes", 0) > 0,
+            "final_mp4_path": str(final),
+            "final_mp4_size_bytes": final_identity.get("size_bytes"),
+            "final_mp4_sha256": final_identity.get("sha256"),
             "final_mp4_published": True,
+            "mp4_manifest_created": True,
             "ffmpeg": dict(ffmpeg_receipt),
             "ffprobe": dict(ffprobe_receipt),
+            "ffmpeg_staging_receipt": dict(staging_receipt),
+            "ffprobe_validation_receipt": dict(ffprobe_result),
             "mp4_artifact": artifact,
             "mux_timing": {
                 "total_seconds": time.perf_counter() - started,
@@ -6702,6 +7048,10 @@ def execute_mp4_mux(
             },
             "retry_suppressed": True,
             "invocation_counts": {"ffmpeg": 1, "ffprobe": 1},
+            "ffmpeg_invocations": 1,
+            "ffprobe_invocations": 1,
+            "retry_count": 0,
+            "functional_success": True,
         }
     except MP4MuxFailure:
         raise
@@ -9756,7 +10106,39 @@ def validate_report(report: Mapping[str, Any]) -> None:
         launch_gate = mp4_mux.get("launch_gate")
         if not isinstance(launch_gate, Mapping):
             raise ValueError("successful report is missing the MP4 mux launch gate")
-        validate_mux_launch_gate(launch_gate)
+        validate_mux_launch_gate(
+            launch_gate,
+            expected_geometry=report_geometry,
+            require_geometry=report_geometry.get("video_width") != DEFAULT_VIDEO_SIZE,
+        )
+        if report_geometry.get("video_width") != DEFAULT_VIDEO_SIZE:
+            required_final_binding = {
+                "video_width": report_geometry["video_width"],
+                "video_height": report_geometry["video_height"],
+                "frame_count": report_geometry["frames"],
+                "fps": report_geometry["fps"],
+                "duration": report_geometry["duration_seconds"],
+                "final_mp4_path": mp4_mux.get("final_mp4_path"),
+                "final_mp4_size_bytes": mp4_mux.get("final_mp4_size_bytes"),
+                "final_mp4_sha256": mp4_mux.get("final_mp4_sha256"),
+                "ffmpeg_invocations": 1,
+                "ffprobe_invocations": 1,
+                "retry_count": 0,
+            }
+            for field, expected in required_final_binding.items():
+                actual = mp4_mux.get(field)
+                if field == "duration":
+                    if not isinstance(actual, (int, float)) or isinstance(actual, bool) or not math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=1e-9):
+                        raise ValueError(f"successful 256 report {field} is not geometry-bound")
+                elif field in {"final_mp4_size_bytes", "final_mp4_sha256"}:
+                    if field == "final_mp4_size_bytes" and (not isinstance(actual, int) or actual <= 0):
+                        raise ValueError("successful 256 report final MP4 size is invalid")
+                    if field == "final_mp4_sha256" and (not isinstance(actual, str) or len(actual) != 64):
+                        raise ValueError("successful 256 report final MP4 SHA-256 is invalid")
+                elif actual != expected:
+                    raise ValueError(f"successful 256 report {field} is not geometry-bound")
+            if mp4_mux.get("functional_success") is not True:
+                raise ValueError("successful 256 report MP4 binding is not functionally successful")
         mp4_artifact = report.get("mp4_artifact")
         if (
             not isinstance(mp4_artifact, Mapping)
@@ -9771,6 +10153,25 @@ def validate_report(report: Mapping[str, Any]) -> None:
             or mp4_artifact.get("size_bytes", 0) <= 0
         ):
             raise ValueError("successful report must prove the published MP4 artifact and manifest")
+        if report_geometry.get("video_width") != DEFAULT_VIDEO_SIZE:
+            for field in (
+                "geometry",
+                "geometry_identity",
+                "staged_mp4_path",
+                "staged_mp4_size_bytes",
+                "staged_mp4_sha256",
+                "frame_manifest_identity",
+                "wav_manifest_identity",
+                "ffmpeg_receipt_identity",
+                "ffprobe_receipt_identity",
+            ):
+                if field not in mp4_artifact:
+                    raise ValueError(f"successful 256 report MP4 artifact is missing {field}")
+            validate_geometry_contract(mp4_artifact["geometry"], expected=report_geometry)
+            if mp4_artifact["video_width"] != report_geometry["video_width"] or mp4_artifact["video_height"] != report_geometry["video_height"]:
+                raise ValueError("successful 256 report MP4 artifact geometry is inconsistent")
+            if mp4_artifact["final_mp4_sha256"] != mp4_artifact["mp4_sha256"] or mp4_artifact["final_mp4_size_bytes"] != mp4_artifact["size_bytes"]:
+                raise ValueError("successful 256 report MP4 final identity is inconsistent")
         if not isinstance(report.get("mux_timing"), Mapping) or report.get("mux_failure") is not None:
             raise ValueError("successful report must include mux timing and no mux failure")
         ffmpeg_receipt = mp4_mux.get("ffmpeg")
@@ -9811,10 +10212,10 @@ def validate_report(report: Mapping[str, Any]) -> None:
             not isinstance(video_artifacts, Mapping)
             or video_artifacts.get("publication_state") != "published"
             or video_artifacts.get("frame_count") != VIDEO_FRAME_COUNT
-            or video_artifacts.get("width") != VIDEO_FRAME_WIDTH
-            or video_artifacts.get("height") != VIDEO_FRAME_HEIGHT
-            or video_artifacts.get("fps") != VIDEO_FRAME_FPS
-            or video_artifacts.get("duration_seconds") != VIDEO_FRAME_DURATION_SECONDS
+            or video_artifacts.get("width") != report_geometry["video_width"]
+            or video_artifacts.get("height") != report_geometry["video_height"]
+            or video_artifacts.get("fps") != report_geometry["fps"]
+            or video_artifacts.get("duration_seconds") != report_geometry["duration_seconds"]
             or not isinstance(video_artifacts.get("manifest_sha256"), str)
         ):
             raise ValueError("successful report must prove the published 30-frame video manifest")
