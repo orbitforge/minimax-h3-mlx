@@ -13,7 +13,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import wave
 import weakref
 
@@ -754,6 +756,55 @@ def run_decoder_orchestrator(
     return result, events
 
 
+def derived_metadata_fixture(
+    root: Path,
+    *,
+    manifest_tensor_count: int = probe.EXPECTED_DERIVED_BASE_TENSOR_COUNT,
+    index_tensor_count: int = probe.EXPECTED_DERIVED_BASE_TENSOR_COUNT,
+) -> Path:
+    derived = root / "derived"
+    (derived / "base").mkdir(parents=True)
+    (derived / "adaln").mkdir()
+    (derived / "config.json").write_text("{}")
+    (derived / "quant_config.json").write_text("{}")
+    (derived / "conversion_manifest.json").write_text(
+        json.dumps(
+            {
+                "format_identifier": probe.DERIVED_FORMAT_IDENTIFIER,
+                "schema_version": probe.DERIVED_SCHEMA_VERSION,
+                "bounded": False,
+                "verification_status": "verified",
+                "selected_blocks": list(range(probe.EXPECTED_BLOCK_COUNT)),
+                "derived_base_tensor_count": manifest_tensor_count,
+            }
+        )
+    )
+    (derived / "base" / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 1},
+                "weight_map": {
+                    f"tensor.{index}": "model-00001-of-00001.safetensors"
+                    for index in range(index_tensor_count)
+                },
+            }
+        )
+    )
+    (derived / "adaln" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format_identifier": probe.DERIVED_FORMAT_IDENTIFIER,
+                "schema_version": probe.DERIVED_SCHEMA_VERSION,
+                "bounded": False,
+                "blocks": {str(index): {} for index in range(probe.EXPECTED_BLOCK_COUNT)},
+            }
+        )
+    )
+    for index in range(probe.EXPECTED_BLOCK_COUNT):
+        (derived / "adaln" / f"block-{index:03d}.safetensors").write_bytes(b"payload-must-not-be-opened")
+    return derived
+
+
 class ProbeV05DContractTests(unittest.TestCase):
     def test_numpy_and_existing_fake_typed_arrays_keep_their_copy_semantics(self):
         numpy_value = np.arange(4, dtype=np.float32)
@@ -1440,6 +1491,221 @@ class ProbeV05DContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stale"):
                 probe.validate_event_file_linkage(report, path)
 
+    def _parse_run_arguments(self, *extra):
+        return probe.build_parser().parse_args(
+            [
+                "run-derived-full-schedule",
+                "--checkpoint-root", "checkpoint",
+                "--derived-transformer", "derived",
+                "--output-root", "output",
+                "--prompt", probe.LOCKED_PROMPT,
+                "--seed", "0",
+                "--active-memory-tolerance-bytes", "0",
+                *extra,
+            ]
+        )
+
+    def test_operator_declaration_defaults_false(self):
+        self.assertFalse(self._parse_run_arguments().operator_declared_uncontended)
+
+    def test_explicit_operator_declaration_records_true(self):
+        parsed = self._parse_run_arguments("--operator-declared-uncontended")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = probe.ensure_attempt_namespace(Path(directory) / "attempt")
+            report = probe._base_report(parsed, paths)
+        self.assertTrue(report["host_contention"]["operator_declared_uncontended"])
+
+    def test_snapshot_success_is_recorded_from_injected_runner(self):
+        current_pid = 4100
+
+        def runner(_command, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{current_pid} 1 /usr/bin/python3 /usr/bin/python3 {probe.__file__} run-derived-full-schedule\n"
+                    "99 1 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder Finder\n"
+                ),
+                stderr="",
+            )
+
+        snapshot = probe.capture_host_process_snapshot(
+            runner=runner,
+            current_pid=current_pid,
+            capture_timestamp="2026-08-07T12:00:00Z",
+        )
+        self.assertTrue(snapshot["capture_success"])
+        self.assertEqual(snapshot["capture_timestamp"], "2026-08-07T12:00:00Z")
+        self.assertEqual(snapshot["command"], list(probe.HOST_PROCESS_SNAPSHOT_COMMAND))
+        self.assertEqual(snapshot["known_conflicting_processes"], [])
+        self.assertEqual(snapshot["process_count_scanned"], 2)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = probe.ensure_attempt_namespace(Path(directory) / "attempt")
+            report = probe._base_report(self._parse_run_arguments(), paths)
+            probe.apply_host_process_snapshot(report, snapshot)
+        self.assertTrue(report["host_contention"]["process_snapshot_captured"])
+        self.assertEqual(report["host_contention"]["process_snapshot"]["capture_timestamp"], "2026-08-07T12:00:00Z")
+
+    def test_snapshot_failure_is_recorded_without_functional_failure(self):
+        def denied(_command, **_kwargs):
+            raise PermissionError("process inspection denied")
+
+        snapshot = probe.capture_host_process_snapshot(runner=denied, current_pid=4100)
+        self.assertFalse(snapshot["capture_success"])
+        self.assertEqual(snapshot["failure"]["type"], "PermissionError")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = probe.ensure_attempt_namespace(Path(directory) / "attempt")
+            report = probe._base_report(self._parse_run_arguments("--operator-declared-uncontended"), paths)
+            report["functional_success"] = True
+            probe.apply_host_process_snapshot(report, snapshot)
+        self.assertTrue(report["functional_success"])
+        self.assertFalse(report["host_contention"]["process_snapshot_captured"])
+        self.assertFalse(report["host_contention"]["canonical_timing_eligible"])
+
+    def test_all_positive_gates_permit_canonical_timing_eligibility(self):
+        result = probe.canonical_timing_eligibility(
+            functional_success=True,
+            operator_declared_uncontended=True,
+            process_snapshot_captured=True,
+            known_conflicting_processes=[],
+        )
+        self.assertTrue(result["canonical_timing_eligible"])
+        self.assertEqual(result["canonical_timing_ineligibility_reasons"], [])
+
+    def test_missing_declaration_forces_ineligibility(self):
+        result = probe.canonical_timing_eligibility(
+            functional_success=True,
+            operator_declared_uncontended=False,
+            process_snapshot_captured=True,
+            known_conflicting_processes=[],
+        )
+        self.assertFalse(result["canonical_timing_eligible"])
+        self.assertIn("operator_declared_uncontended is not true", result["canonical_timing_ineligibility_reasons"])
+
+    def test_missing_snapshot_forces_ineligibility(self):
+        result = probe.canonical_timing_eligibility(
+            functional_success=True,
+            operator_declared_uncontended=True,
+            process_snapshot_captured=False,
+            known_conflicting_processes=[],
+        )
+        self.assertFalse(result["canonical_timing_eligible"])
+        self.assertIn("process_snapshot_captured is not true", result["canonical_timing_ineligibility_reasons"])
+
+    def test_one_classified_conflict_forces_ineligibility(self):
+        conflict = {"pid": 99, "classification_rule": "model-server"}
+        result = probe.canonical_timing_eligibility(
+            functional_success=True,
+            operator_declared_uncontended=True,
+            process_snapshot_captured=True,
+            known_conflicting_processes=[conflict],
+        )
+        self.assertFalse(result["canonical_timing_eligible"])
+        self.assertIn("known_conflicting_processes is not empty", result["canonical_timing_ineligibility_reasons"])
+
+    def test_ineligibility_reasons_identify_every_missing_gate(self):
+        result = probe.canonical_timing_eligibility(
+            functional_success=False,
+            operator_declared_uncontended=False,
+            process_snapshot_captured=False,
+            known_conflicting_processes=[{"pid": 99}],
+        )
+        self.assertEqual(
+            result["canonical_timing_ineligibility_reasons"],
+            [
+                "functional_success is not true",
+                "operator_declared_uncontended is not true",
+                "process_snapshot_captured is not true",
+                "known_conflicting_processes is not empty",
+            ],
+        )
+
+    def test_functional_success_remains_independent_of_timing_eligibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = probe.ensure_attempt_namespace(Path(directory) / "attempt")
+            report = probe._base_report(self._parse_run_arguments(), paths)
+            report["functional_success"] = True
+            probe.refresh_canonical_timing_eligibility(report)
+        self.assertTrue(report["functional_success"])
+        self.assertFalse(report["host_contention"]["canonical_timing_eligible"])
+
+    def test_expected_harness_processes_are_not_false_positive_conflicts(self):
+        current_pid = 4100
+        current = probe.classify_host_process(
+            {
+                "pid": current_pid,
+                "ppid": 1,
+                "process_name": "/usr/bin/python3",
+                "command": f"python3 {probe.__file__} run-derived-full-schedule",
+            },
+            current_pid=current_pid,
+        )
+        child = probe.classify_host_process(
+            {
+                "pid": 4101,
+                "ppid": current_pid,
+                "process_name": "/usr/bin/python3",
+                "command": f"python3 {probe.__file__} __derived-worker --derived-transformer mlx-derived",
+            },
+            current_pid=current_pid,
+        )
+        self.assertFalse(current["known_conflict"])
+        self.assertFalse(child["known_conflict"])
+        self.assertEqual(current["outcome"], "expected_harness_process")
+        self.assertEqual(child["outcome"], "expected_harness_process")
+
+    def test_narrow_classifier_flags_known_workload_but_not_desktop_compositing(self):
+        conflict = probe.classify_host_process(
+            {
+                "pid": 91,
+                "ppid": 1,
+                "process_name": "/usr/bin/python3",
+                "command": "python3 -m mlx_lm.generate --model local",
+            },
+            current_pid=4100,
+        )
+        desktop = probe.classify_host_process(
+            {
+                "pid": 92,
+                "ppid": 1,
+                "process_name": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+                "command": "WindowServer -daemon",
+            },
+            current_pid=4100,
+        )
+        self.assertTrue(conflict["known_conflict"])
+        self.assertFalse(desktop["known_conflict"])
+
+    def test_derived_base_tensor_count_is_emitted_from_validated_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            derived = derived_metadata_fixture(Path(directory))
+            receipt = probe.validate_derived_filesystem(derived)
+        self.assertEqual(receipt["derived_base_tensor_count"], 850)
+        self.assertFalse(receipt["payloads_opened"])
+
+    def test_incorrect_derived_base_tensor_count_fails_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            derived = derived_metadata_fixture(Path(directory), manifest_tensor_count=849)
+            with self.assertRaisesRegex(ValueError, "base tensor count"):
+                probe.validate_derived_filesystem(derived)
+        with tempfile.TemporaryDirectory() as directory:
+            derived = derived_metadata_fixture(Path(directory), index_tensor_count=849)
+            with self.assertRaisesRegex(ValueError, "base tensor index count"):
+                probe.validate_derived_filesystem(derived)
+
+    def test_base_tensor_count_validation_never_opens_tensor_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            derived = derived_metadata_fixture(Path(directory))
+            original_open = Path.open
+
+            def guarded_open(path, *args, **kwargs):
+                if path.suffix == ".safetensors":
+                    raise AssertionError(f"tensor payload opened: {path}")
+                return original_open(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", guarded_open):
+                receipt = probe.validate_derived_filesystem(derived)
+        self.assertEqual(receipt["derived_base_tensor_count"], 850)
+
     def test_host_contention_declaration_does_not_prove_eligibility(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = probe.ensure_attempt_namespace(Path(directory) / "attempt")
@@ -1459,6 +1725,21 @@ class ProbeV05DContractTests(unittest.TestCase):
         help_result = subprocess.run([sys.executable, str(ROOT / "scripts" / "probe_v05d_derived_full_schedule.py"), "--help"], cwd="/tmp", env=environment, capture_output=True, text=True, check=False)
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("run-derived-full-schedule", help_result.stdout)
+        command_help = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "probe_v05d_derived_full_schedule.py"),
+                "run-derived-full-schedule",
+                "--help",
+            ],
+            cwd="/tmp",
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(command_help.returncode, 0, command_help.stderr)
+        self.assertIn("--operator-declared-uncontended", command_help.stdout)
 
     def test_generation_exclusions_distinguish_implemented_mux_from_current_execution(self):
         self.assertEqual(probe.GENERATION_EXCLUSIONS, probe.EXPECTED_GENERATION_EXCLUSIONS)
@@ -2454,7 +2735,9 @@ class ProbeV05DContractTests(unittest.TestCase):
             report["event_file_sha256"] = "b" * 64
             report["status"] = "success"
             report["run_state"] = "successful"
+            report["functional_success"] = True
             report["failure"] = None
+            probe.refresh_canonical_timing_eligibility(report)
             report["latent_generation_status"] = "completed"
             report["video_status"] = "completed"
             report["audio_status"] = "completed"

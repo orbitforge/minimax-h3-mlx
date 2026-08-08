@@ -480,6 +480,16 @@ count; video and audio worker receipts do not split VAE load time from decode ti
 partial MP4 SHA was not retained; and host-process inspection was unavailable. None of these limits
 invalidate the functional proof.
 
+Future v0.5e attempts record `functional_success` independently from canonical timing eligibility.
+`--operator-declared-uncontended` defaults false and is never inferred. Before conditioning, the
+parent writes one bounded, read-only `ps` snapshot and classifies only narrow known MLX, model-server,
+generation, MPS, or Metal-compute workloads; ordinary desktop compositing is not a conflict and the
+scan does not claim absolute idleness. Eligibility is true exactly when functional success, the
+operator declaration, and successful snapshot capture are all true and
+`known_conflicting_processes` is empty. Process-inspection failure remains nonfatal but forces timing
+ineligibility. Derived preflight also requires the conversion manifest and base index to agree on
+exactly 850 base tensors without opening tensor payloads.
+
 Real MLX execution is currently constrained by the Codex/macOS Metal sandbox and must be launched
 from ordinary Terminal. Canonical benchmark timing therefore remains future work. Cache construction
 is the next identified optimization target.

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 import gc
 import hashlib
 import inspect
@@ -158,6 +159,20 @@ FINGERPRINT_METHOD = "sha256-logical-shape-dtype-plus-canonical-float32-values-v
 RNG_METHOD = "mlx.core.random.seed(0)+mlx.core.random.normal-float32-video-then-audio-v1"
 DERIVED_FORMAT_IDENTIFIER = "minimax-h3-mlx-streamed-adaln-v1"
 DERIVED_SCHEMA_VERSION = 1
+EXPECTED_DERIVED_BASE_TENSOR_COUNT = 850
+
+HOST_PROCESS_SNAPSHOT_COMMAND = ("ps", "-axo", "pid=,ppid=,comm=,args=")
+HOST_PROCESS_SNAPSHOT_TIMEOUT_SECONDS = 5.0
+HOST_PROCESS_SNAPSHOT_MAX_PROCESSES = 4096
+HOST_PROCESS_COMMAND_MAX_CHARACTERS = 4096
+EXPECTED_HARNESS_CHILD_MARKERS = frozenset(
+    {
+        "__conditioning-worker",
+        "__derived-worker",
+        "__video-worker",
+        "__audio-worker",
+    }
+)
 
 DECODER_PHASE_ORDER = (
     "derived-finalization",
@@ -339,6 +354,7 @@ REPORT_KEYS = frozenset(
     {
         "status",
         "run_state",
+        "functional_success",
         "schema_version",
         "probe_identity",
         "attempt",
@@ -4639,6 +4655,7 @@ def _mux_failure_report(
 ) -> dict[str, Any]:
     report["status"] = "failed"
     report["run_state"] = "failed"
+    report["functional_success"] = False
     report["mp4_mux_status"] = "failed"
     report["mp4_mux"] = {
         "status": "failed",
@@ -4687,6 +4704,7 @@ def _mux_failure_report(
         }
     )
     report["standalone_media"] = standalone
+    refresh_canonical_timing_eligibility(report)
     return report
 
 
@@ -4949,6 +4967,277 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def classify_host_process(
+    process: Mapping[str, Any],
+    *,
+    current_pid: int,
+) -> dict[str, Any]:
+    """Classify only explicit compute workloads; ordinary GPU-composited apps stay clear."""
+    pid = process.get("pid")
+    ppid = process.get("ppid")
+    process_name = str(process.get("process_name", ""))
+    command = str(process.get("command", ""))
+    searchable = f"{process_name} {command}".lower()
+    executable = Path(process_name).name.lower()
+
+    if pid == current_pid:
+        return {
+            "outcome": "expected_harness_process",
+            "known_conflict": False,
+            "rule": "current-harness-pid",
+            "reason": "current proof-harness process is not a pre-existing conflict",
+        }
+    if (
+        ppid == current_pid
+        and Path(__file__).name.lower() in searchable
+        and any(marker in command for marker in EXPECTED_HARNESS_CHILD_MARKERS)
+    ):
+        return {
+            "outcome": "expected_harness_process",
+            "known_conflict": False,
+            "rule": "expected-harness-child",
+            "reason": "expected proof-harness worker is not a pre-existing conflict",
+        }
+
+    model_server_markers = (
+        "llama-server",
+        "text-generation-launcher",
+        "vllm.entrypoints",
+        "mlx_lm.server",
+        "mlx-vlm.server",
+    )
+    if any(marker in searchable for marker in model_server_markers) or (
+        executable == "ollama" and any(marker in searchable for marker in (" serve", " runner"))
+    ):
+        return {
+            "outcome": "known_conflict",
+            "known_conflict": True,
+            "rule": "model-server",
+            "reason": "known model-server process may contend for unified memory or compute",
+        }
+
+    generation_markers = (
+        "comfyui",
+        "stable-diffusion-webui",
+        "automatic1111",
+        "invokeai",
+        "diffusionbee",
+        "drawthings",
+        "draw things",
+        "mlx_lm.generate",
+        "mlx-vlm.generate",
+        "mlx_audio.tts.generate",
+    )
+    if any(marker in searchable for marker in generation_markers):
+        return {
+            "outcome": "known_conflict",
+            "known_conflict": True,
+            "rule": "known-generation-workload",
+            "reason": "known image, video, audio, or language-model workload may be active",
+        }
+
+    python_process = executable.startswith("python") or " python" in searchable
+    workload_markers = ("generate", "generation", "train", "training", "infer", "inference", "probe", "worker")
+    if python_process and "mlx" in searchable and any(marker in searchable for marker in workload_markers):
+        return {
+            "outcome": "known_conflict",
+            "known_conflict": True,
+            "rule": "python-mlx-workload",
+            "reason": "Python command identifies an MLX generation, training, inference, probe, or worker workload",
+        }
+    if python_process and any(marker in searchable for marker in ("--device mps", "device=mps", "metal compute")) and any(
+        marker in searchable for marker in workload_markers
+    ):
+        return {
+            "outcome": "known_conflict",
+            "known_conflict": True,
+            "rule": "known-metal-compute-workload",
+            "reason": "Python command identifies an MPS or Metal compute workload",
+        }
+
+    return {
+        "outcome": "no_known_conflict",
+        "known_conflict": False,
+        "rule": None,
+        "reason": "no narrow known-conflict rule matched",
+    }
+
+
+def capture_host_process_snapshot(
+    *,
+    runner: Callable[..., Any] | None = None,
+    current_pid: int | None = None,
+    capture_timestamp: str | None = None,
+    timeout_seconds: float = HOST_PROCESS_SNAPSHOT_TIMEOUT_SECONDS,
+    max_processes: int = HOST_PROCESS_SNAPSHOT_MAX_PROCESSES,
+) -> dict[str, Any]:
+    """Capture one bounded, read-only process snapshot without turning failure into a run failure."""
+    run = runner or subprocess.run
+    harness_pid = os.getpid() if current_pid is None else current_pid
+    command = list(HOST_PROCESS_SNAPSHOT_COMMAND)
+    snapshot: dict[str, Any] = {
+        "capture_timestamp": capture_timestamp or _utc_timestamp(),
+        "tool": "ps",
+        "command": command,
+        "read_only": True,
+        "timeout_seconds": timeout_seconds,
+        "max_processes": max_processes,
+        "capture_success": False,
+        "failure": None,
+        "current_process_pid": harness_pid,
+        "process_count_scanned": 0,
+        "processes": [],
+        "known_conflicting_processes": [],
+        "truncated": False,
+        "automatic_scan_proves_absolute_idleness": False,
+    }
+    try:
+        completed = run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        snapshot["failure"] = error_receipt(exc)
+        return snapshot
+    if completed.returncode != 0:
+        snapshot["failure"] = {
+            "type": "ProcessSnapshotCommandError",
+            "message": f"ps exited with status {completed.returncode}: {str(completed.stderr).strip()}",
+            "traceback": "",
+        }
+        return snapshot
+
+    lines = [line for line in str(completed.stdout).splitlines() if line.strip()]
+    if len(lines) > max_processes:
+        snapshot["truncated"] = True
+        lines = lines[:max_processes]
+    malformed_lines = 0
+    current_process_present = False
+    processes: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    for line in lines:
+        columns = line.strip().split(None, 3)
+        if len(columns) < 3:
+            malformed_lines += 1
+            continue
+        try:
+            pid = int(columns[0])
+            ppid = int(columns[1])
+        except ValueError:
+            malformed_lines += 1
+            continue
+        process_name = columns[2]
+        full_command = columns[3] if len(columns) == 4 else process_name
+        command_truncated = len(full_command) > HOST_PROCESS_COMMAND_MAX_CHARACTERS
+        recorded_command = full_command[:HOST_PROCESS_COMMAND_MAX_CHARACTERS]
+        entry: dict[str, Any] = {
+            "pid": pid,
+            "ppid": ppid,
+            "process_name": process_name,
+            "command": recorded_command,
+            "command_truncated": command_truncated,
+        }
+        classification = classify_host_process(
+            {**entry, "command": full_command},
+            current_pid=harness_pid,
+        )
+        entry["classification"] = classification
+        processes.append(entry)
+        current_process_present = current_process_present or pid == harness_pid
+        if classification["known_conflict"] is True:
+            conflicts.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "process_name": process_name,
+                    "command": recorded_command,
+                    "command_truncated": command_truncated,
+                    "classification_rule": classification["rule"],
+                    "classification_reason": classification["reason"],
+                }
+            )
+    snapshot["process_count_scanned"] = len(processes)
+    snapshot["processes"] = processes
+    snapshot["known_conflicting_processes"] = conflicts
+    snapshot["malformed_line_count"] = malformed_lines
+    snapshot["current_process_present"] = current_process_present
+    if snapshot["truncated"]:
+        snapshot["failure"] = {
+            "type": "ProcessSnapshotTruncated",
+            "message": f"process snapshot exceeded the bound of {max_processes} processes",
+            "traceback": "",
+        }
+    elif malformed_lines:
+        snapshot["failure"] = {
+            "type": "ProcessSnapshotParseError",
+            "message": f"process snapshot contained {malformed_lines} malformed rows",
+            "traceback": "",
+        }
+    elif not current_process_present:
+        snapshot["failure"] = {
+            "type": "ProcessSnapshotIncomplete",
+            "message": "process snapshot did not contain the current harness PID",
+            "traceback": "",
+        }
+    else:
+        snapshot["capture_success"] = True
+    return snapshot
+
+
+def canonical_timing_eligibility(
+    *,
+    functional_success: bool,
+    operator_declared_uncontended: bool,
+    process_snapshot_captured: bool,
+    known_conflicting_processes: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Apply the exact four-gate canonical timing eligibility formula."""
+    reasons: list[str] = []
+    if functional_success is not True:
+        reasons.append("functional_success is not true")
+    if operator_declared_uncontended is not True:
+        reasons.append("operator_declared_uncontended is not true")
+    if process_snapshot_captured is not True:
+        reasons.append("process_snapshot_captured is not true")
+    if list(known_conflicting_processes):
+        reasons.append("known_conflicting_processes is not empty")
+    return {
+        "canonical_timing_eligible": not reasons,
+        "canonical_timing_ineligibility_reasons": reasons,
+    }
+
+
+def apply_host_process_snapshot(report: dict[str, Any], snapshot: Mapping[str, Any]) -> None:
+    """Attach snapshot evidence and refresh eligibility without changing functional status."""
+    host = report["host_contention"]
+    host["process_snapshot"] = _json_safe(dict(snapshot))
+    host["process_snapshot_captured"] = snapshot.get("capture_success") is True
+    conflicts = snapshot.get("known_conflicting_processes")
+    host["known_conflicting_processes"] = list(conflicts) if isinstance(conflicts, list) else []
+    refresh_canonical_timing_eligibility(report)
+
+
+def refresh_canonical_timing_eligibility(report: dict[str, Any]) -> None:
+    host = report.get("host_contention")
+    if not isinstance(host, dict):
+        return
+    host.update(
+        canonical_timing_eligibility(
+            functional_success=report.get("functional_success") is True,
+            operator_declared_uncontended=host.get("operator_declared_uncontended") is True,
+            process_snapshot_captured=host.get("process_snapshot_captured") is True,
+            known_conflicting_processes=host.get("known_conflicting_processes", []),
+        )
+    )
+
+
 def validate_derived_filesystem(derived_root: Path) -> dict[str, Any]:
     """Validate only small metadata and payload names; never opens a tensor payload."""
     root = derived_root.resolve()
@@ -4971,6 +5260,24 @@ def validate_derived_filesystem(derived_root: Path) -> dict[str, Any]:
         raise ValueError("derived checkpoint is not verified")
     if conversion.get("selected_blocks") != list(range(EXPECTED_BLOCK_COUNT)):
         raise ValueError("derived checkpoint does not contain all 50 selected blocks")
+    manifest_base_tensor_count = conversion.get("derived_base_tensor_count")
+    if manifest_base_tensor_count != EXPECTED_DERIVED_BASE_TENSOR_COUNT:
+        raise ValueError(
+            "derived conversion manifest base tensor count is "
+            f"{manifest_base_tensor_count!r}, expected {EXPECTED_DERIVED_BASE_TENSOR_COUNT}"
+        )
+    base_index = _read_json_object(root / "base" / "model.safetensors.index.json", "derived base tensor index")
+    weight_map = base_index.get("weight_map")
+    if not isinstance(weight_map, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in weight_map.items()):
+        raise ValueError("derived base tensor index weight_map is invalid")
+    index_base_tensor_count = len(weight_map)
+    if index_base_tensor_count != EXPECTED_DERIVED_BASE_TENSOR_COUNT:
+        raise ValueError(
+            "derived base tensor index count is "
+            f"{index_base_tensor_count}, expected {EXPECTED_DERIVED_BASE_TENSOR_COUNT}"
+        )
+    if manifest_base_tensor_count != index_base_tensor_count:
+        raise ValueError("derived base tensor count differs between conversion manifest and base index")
     sidecar_manifest = _read_json_object(root / "adaln" / "manifest.json", "AdaLN sidecar manifest")
     if sidecar_manifest.get("format_identifier") != DERIVED_FORMAT_IDENTIFIER or sidecar_manifest.get("schema_version") != DERIVED_SCHEMA_VERSION:
         raise ValueError("AdaLN sidecar manifest identity is invalid")
@@ -4994,6 +5301,7 @@ def validate_derived_filesystem(derived_root: Path) -> dict[str, Any]:
         "schema_version": DERIVED_SCHEMA_VERSION,
         "metadata_files": {str(path.relative_to(root)): sha256_file(path) for path in small_files},
         "selected_blocks": list(range(EXPECTED_BLOCK_COUNT)),
+        "derived_base_tensor_count": index_base_tensor_count,
         "payloads_opened": False,
     }
 
@@ -5036,6 +5344,7 @@ def ensure_attempt_namespace(root: Path, attempt_identifier: str | None = None) 
         "attempt_identifier": identifier,
         "namespace_newly_created": newly_created,
         "report": str(root / "derived-full-schedule-report.json"),
+        "process_snapshot": str(root / "host-process-snapshot.json"),
         "conditioning_artifact": str(root / "conditioning-artifact.npz"),
         "conditioning_receipt": str(root / "conditioning-worker-receipt.json"),
         "conditioning_log": str(root / "conditioning-worker.log"),
@@ -5061,9 +5370,13 @@ def ensure_attempt_namespace(root: Path, attempt_identifier: str | None = None) 
 
 
 def _base_report(args: argparse.Namespace, paths: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    operator_declared_uncontended = getattr(args, "operator_declared_uncontended", False)
+    if type(operator_declared_uncontended) is not bool:
+        raise TypeError("operator_declared_uncontended must be a literal boolean declaration")
+    report = {
         "status": "incomplete",
         "run_state": "incomplete",
+        "functional_success": False,
         "schema_version": SCHEMA_VERSION,
         "probe_identity": PROBE_FORMAT,
         "attempt": {
@@ -5165,16 +5478,21 @@ def _base_report(args: argparse.Namespace, paths: Mapping[str, Any]) -> dict[str
             "final_serialization_seconds": None,
         },
         "host_contention": {
-            "operator_declared_uncontended": bool(getattr(args, "operator_declared_uncontended", False)),
+            "operator_declared_uncontended": operator_declared_uncontended,
             "process_snapshot_captured": False,
+            "process_snapshot_path": paths["process_snapshot"],
+            "process_snapshot": None,
             "known_conflicting_processes": [],
             "canonical_timing_eligible": False,
+            "canonical_timing_ineligibility_reasons": [],
         },
         "phase_order": [],
         "output_paths": dict(paths),
         "generation_exclusions": dict(GENERATION_EXCLUSIONS),
         "failure": None,
     }
+    refresh_canonical_timing_eligibility(report)
+    return report
 
 
 def _worker_base(identity: str) -> dict[str, Any]:
@@ -6664,6 +6982,7 @@ def _failure_report(
 ) -> dict[str, Any]:
     report["status"] = "failed"
     report["run_state"] = "failed"
+    report["functional_success"] = False
     report["failure"] = {
         "active_phase": phase,
         "worker_identity": worker,
@@ -6753,6 +7072,7 @@ def _failure_report(
         "mp4_mux_status": report["mp4_mux_status"],
     }
     report["mp4_mux"] = {"status": "not_performed", "invoked": False, "output_path": None}
+    refresh_canonical_timing_eligibility(report)
     return report
 
 
@@ -6762,11 +7082,16 @@ def _parent_run(
     report: dict[str, Any],
     *,
     subprocess_runner: Callable[..., Any] | None = None,
+    process_snapshot_runner: Callable[..., Any] | None = None,
     mux_timeout_seconds: float = 120.0,
 ) -> dict[str, Any]:
     root = Path(args.checkpoint_root).expanduser().resolve()
     derived = Path(args.derived_transformer).expanduser().resolve()
     report["phase_order"].append("preflight")
+    snapshot = capture_host_process_snapshot(runner=process_snapshot_runner)
+    apply_host_process_snapshot(report, snapshot)
+    _write_json(Path(paths["process_snapshot"]), snapshot)
+    _write_json(Path(paths["report"]), report)
     preflight = validate_derived_filesystem(derived)
     report["git_identity"] = capture_git_identity()
     report["checkpoint_identity"] = _checkpoint_identity(root, derived, preflight)
@@ -7044,10 +7369,14 @@ def _parent_run(
         timeout_seconds=mux_timeout_seconds,
     )
     if report.get("status") == "failed":
+        report["functional_success"] = False
+        refresh_canonical_timing_eligibility(report)
         return report
     report["status"] = "success"
     report["run_state"] = "successful"
+    report["functional_success"] = True
     report["failure"] = None
+    refresh_canonical_timing_eligibility(report)
     return report
 
 
@@ -7072,6 +7401,34 @@ def validate_report(report: Mapping[str, Any]) -> None:
         raise ValueError(f"v0.5d report schema mismatch: missing={sorted(REPORT_KEYS - set(report))}, unexpected={sorted(set(report) - REPORT_KEYS)}")
     if report.get("schema_version") != SCHEMA_VERSION or report.get("probe_identity") != PROBE_FORMAT:
         raise ValueError("v0.5d report identity mismatch")
+    if type(report.get("functional_success")) is not bool:
+        raise ValueError("v0.5d report functional_success must be a literal boolean")
+    host = report.get("host_contention")
+    if not isinstance(host, Mapping):
+        raise ValueError("v0.5d report is missing host-contention evidence")
+    for key in ("operator_declared_uncontended", "process_snapshot_captured", "canonical_timing_eligible"):
+        if type(host.get(key)) is not bool:
+            raise ValueError(f"v0.5d host-contention field {key} must be a literal boolean")
+    conflicts = host.get("known_conflicting_processes")
+    if not isinstance(conflicts, list) or not all(isinstance(item, Mapping) for item in conflicts):
+        raise ValueError("v0.5d known_conflicting_processes must be a structured list")
+    snapshot = host.get("process_snapshot")
+    if host.get("process_snapshot_captured") is True and (
+        not isinstance(snapshot, Mapping) or snapshot.get("capture_success") is not True
+    ):
+        raise ValueError("v0.5d process snapshot capture claim is not backed by snapshot evidence")
+    if isinstance(snapshot, Mapping) and snapshot.get("known_conflicting_processes") != conflicts:
+        raise ValueError("v0.5d known conflict list differs from its process snapshot")
+    expected_eligibility = canonical_timing_eligibility(
+        functional_success=report.get("functional_success") is True,
+        operator_declared_uncontended=host.get("operator_declared_uncontended") is True,
+        process_snapshot_captured=host.get("process_snapshot_captured") is True,
+        known_conflicting_processes=conflicts,
+    )
+    if host.get("canonical_timing_eligible") is not expected_eligibility["canonical_timing_eligible"]:
+        raise ValueError("v0.5d canonical timing eligibility does not match the exact four-gate formula")
+    if host.get("canonical_timing_ineligibility_reasons") != expected_eligibility["canonical_timing_ineligibility_reasons"]:
+        raise ValueError("v0.5d canonical timing ineligibility reasons are stale")
     decoder_order = report.get("decoder_phase_order")
     if not isinstance(decoder_order, Mapping) or decoder_order.get("valid") is not True:
         raise ValueError("v0.5d report is missing a valid decoder phase order receipt")
@@ -7081,7 +7438,7 @@ def validate_report(report: Mapping[str, Any]) -> None:
         if not isinstance(section, Mapping) or section.get("status") not in DECODER_STATUSES:
             raise ValueError(f"v0.5d report has an invalid {identity} decoder status")
     if report.get("status") == "success":
-        if report.get("run_state") != "successful" or report.get("failure") is not None:
+        if report.get("run_state") != "successful" or report.get("functional_success") is not True or report.get("failure") is not None:
             raise ValueError("successful report must have run_state=successful and failure=null")
         validate_schedule_contract(report.get("schedule_contract", {}))
         validate_lifecycle_totals(report.get("streamed_adaln_lifecycle", {}))
@@ -7220,7 +7577,7 @@ def validate_report(report: Mapping[str, Any]) -> None:
         if report.get("generation_exclusions") != EXPECTED_GENERATION_EXCLUSIONS:
             raise ValueError("successful report generation exclusions do not match the exact standalone-media map")
     elif report.get("status") == "failed":
-        if report.get("run_state") != "failed" or not isinstance(report.get("failure"), Mapping):
+        if report.get("run_state") != "failed" or report.get("functional_success") is not False or not isinstance(report.get("failure"), Mapping):
             raise ValueError("failed report must preserve failed run state and failure evidence")
         required = {"primary_error_type", "primary_error_message", "primary_error_traceback", "cleanup_attempted", "cleanup_succeeded", "cleanup_error_type", "cleanup_error_message", "cleanup_error_traceback"}
         if not required.issubset(report["failure"]):
@@ -7239,7 +7596,7 @@ def validate_report(report: Mapping[str, Any]) -> None:
         if report.get("standalone_media_status") == "completed" and mp4_status not in {"failed", "suppressed"}:
             raise ValueError("failed report has inconsistent standalone-media and MP4 statuses")
     elif report.get("status") == "incomplete":
-        if report.get("run_state") != "incomplete":
+        if report.get("run_state") != "incomplete" or report.get("functional_success") is not False:
             raise ValueError("incomplete report has an invalid run state")
     else:
         raise ValueError("report status must be incomplete, failed, or success")
