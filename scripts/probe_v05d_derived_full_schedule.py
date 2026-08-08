@@ -73,8 +73,9 @@ EXPECTED_AUDIO_SIGMA_POINTS = 16
 EXPECTED_DENOISING_TRANSITIONS = 15
 EXPECTED_TRANSFORMER_FORWARDS = 15
 
-# Slice 3B2 exposes only these two square core geometries.  Media validators below intentionally
-# retain their frozen 128x128 constants until Slice 3B3B.
+# Slice 3B2 exposes only these two square core geometries.  The standalone MP4/report path below
+# retains its frozen 128x128 constants; proof-side PNG publication derives its dimensions from the
+# selected ProductionMultimodalGeometry.
 DEFAULT_VIDEO_SIZE = 128
 PROOF_VIDEO_SIZES = (128, 256)
 FULL_RUN_256_GATE_MESSAGE = "256x256 full-run media support is not enabled until Slice 3B3B"
@@ -249,6 +250,7 @@ VIDEO_FRAME_HEIGHT = 128
 VIDEO_FRAME_WIDTH = 128
 VIDEO_FRAME_FPS = 24
 VIDEO_FRAME_DURATION_SECONDS = 1.25
+VIDEO_FRAME_FILENAME_PATTERN = "frame_{index:05d}.png"
 VIDEO_RAW_SHAPE = (1, 3, VIDEO_FRAME_COUNT, VIDEO_FRAME_HEIGHT, VIDEO_FRAME_WIDTH)
 VIDEO_RGB_SHAPE = (VIDEO_FRAME_COUNT, VIDEO_FRAME_HEIGHT, VIDEO_FRAME_WIDTH, 3)
 VIDEO_FRAME_MANIFEST_KEYS = frozenset(
@@ -261,8 +263,14 @@ VIDEO_FRAME_MANIFEST_KEYS = frozenset(
         "frame_count",
         "width",
         "height",
+        "video_width",
+        "video_height",
         "fps",
         "duration_seconds",
+        "frame_filename_pattern",
+        "per_frame_sha256",
+        "geometry",
+        "geometry_identity",
         "frames",
         "manifest_sha256",
     }
@@ -1852,6 +1860,11 @@ def validate_video_decoder_receipt_geometry(
             or rgb_output.get("shape") != expected["video_rgb_shape"]
         ):
             raise ValueError("video decoder receipt RGB output shape differs from the selected geometry")
+    artifacts = receipt.get("video_artifacts")
+    if artifacts is not None:
+        if not isinstance(artifacts, Mapping):
+            raise ValueError("video decoder receipt frame manifest is invalid")
+        _validate_video_frame_manifest_geometry_metadata(artifacts, core)
     return expected
 
 
@@ -4084,13 +4097,109 @@ def validate_video_rgb_output(
     return {"shape": list(frames.shape), "dtype": str(frames.dtype)}
 
 
-def _inspect_video_frame_set(frames_directory: Path) -> dict[str, Any]:
-    """Validate every staged PNG, including signature, decoded mode, dimensions, and checksum."""
+def _resolve_frame_geometry_argument(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None,
+) -> ProductionMultimodalGeometry | Mapping[str, Any] | None:
+    if geometry is not None and expected_geometry is not None:
+        raise ValueError("provide only one of geometry or expected_geometry")
+    return expected_geometry if expected_geometry is not None else geometry
+
+
+def _selected_video_frame_geometry(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve frame facts from the selected production geometry, without a second geometry type."""
+    core = canonical_geometry_contract(geometry=geometry) if geometry is not None else canonical_geometry_contract()
+    return core, video_decoder_geometry_contract(core)
+
+
+def _video_frame_geometry_identity(decoder_geometry: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "resolution": [int(decoder_geometry["video_width"]), int(decoder_geometry["video_height"])],
+        "video_width": int(decoder_geometry["video_width"]),
+        "video_height": int(decoder_geometry["video_height"]),
+        "frame_count": int(decoder_geometry["frame_count"]),
+        "fps": int(decoder_geometry["fps"]),
+        "duration_seconds": decoder_geometry["duration_seconds"],
+        "video_native_shape": [int(value) for value in decoder_geometry["video_native_shape"]],
+        "video_raw_shape": [int(value) for value in decoder_geometry["video_raw_shape"]],
+        "video_rgb_shape": [int(value) for value in decoder_geometry["video_rgb_shape"]],
+    }
+
+
+def _expected_video_frame_names(frame_count: int) -> list[str]:
+    return [VIDEO_FRAME_FILENAME_PATTERN.format(index=index) for index in range(int(frame_count))]
+
+
+def _validate_decoded_rgb_geometry(
+    decoded_rgb_geometry: Any,
+    decoder_geometry: Mapping[str, Any],
+) -> None:
+    """Bind a decoder's decoded RGB receipt to the selected geometry before publication."""
+    if decoded_rgb_geometry is None:
+        return
+    if isinstance(decoded_rgb_geometry, Mapping):
+        shape = decoded_rgb_geometry.get("shape")
+        dtype = decoded_rgb_geometry.get("dtype")
+    else:
+        shape = getattr(decoded_rgb_geometry, "shape", decoded_rgb_geometry)
+        dtype = getattr(decoded_rgb_geometry, "dtype", None)
+    if shape is None:
+        raise ValueError("decoded RGB geometry is missing its shape")
+    try:
+        actual_shape = [int(value) for value in shape]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("decoded RGB geometry shape is invalid") from exc
+    expected_shape = [int(value) for value in decoder_geometry["video_rgb_shape"]]
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"decoded RGB geometry shape does not match the selected geometry: {actual_shape} != {expected_shape}"
+        )
+    if dtype is not None and _dtype_name(dtype) != "uint8":
+        raise ValueError(f"decoded RGB geometry dtype must be uint8, got {dtype}")
+
+
+def _validate_video_frame_manifest_geometry_metadata(
+    manifest: Mapping[str, Any],
+    core_geometry: ProductionMultimodalGeometry | Mapping[str, Any],
+) -> None:
+    """Validate manifest geometry fields without reading the frame files."""
+    core, decoder_geometry = _selected_video_frame_geometry(core_geometry)
+    if manifest.get("geometry") is None or not isinstance(manifest.get("geometry"), Mapping):
+        raise ValueError("video frame manifest is missing its geometry identity")
+    manifest_geometry = manifest["geometry"]
+    validate_geometry_contract(manifest_geometry, expected=core)
+    if _json_safe(manifest_geometry) != _json_safe(core):
+        raise ValueError("video frame manifest geometry does not match the selected geometry")
+    if manifest.get("geometry_identity") != _video_frame_geometry_identity(decoder_geometry):
+        raise ValueError("video frame manifest geometry identity is stale")
+    if (
+        manifest.get("frame_count") != decoder_geometry["frame_count"]
+        or manifest.get("width") != decoder_geometry["video_width"]
+        or manifest.get("height") != decoder_geometry["video_height"]
+        or manifest.get("video_width") != decoder_geometry["video_width"]
+        or manifest.get("video_height") != decoder_geometry["video_height"]
+        or manifest.get("fps") != decoder_geometry["fps"]
+        or manifest.get("duration_seconds") != decoder_geometry["duration_seconds"]
+    ):
+        raise ValueError("video frame manifest geometry does not match the selected geometry")
+    if manifest.get("frame_filename_pattern") != VIDEO_FRAME_FILENAME_PATTERN:
+        raise ValueError("video frame manifest filename pattern is not canonical")
+
+
+def _inspect_video_frame_set(
+    frames_directory: Path,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate every staged PNG, including signature, RGB mode, geometry, and checksum."""
+    core_geometry, decoder_geometry = _selected_video_frame_geometry(geometry)
     directory = Path(frames_directory).resolve()
     if not directory.is_dir():
         raise FileNotFoundError(f"video frame directory is missing: {directory}")
     entries = sorted(path for path in directory.iterdir() if path.is_file())
-    expected_names = [f"frame_{index:05d}.png" for index in range(VIDEO_FRAME_COUNT)]
+    expected_names = _expected_video_frame_names(decoder_geometry["frame_count"])
     actual_names = [path.name for path in entries]
     if actual_names != expected_names:
         raise ValueError(
@@ -4103,23 +4212,30 @@ def _inspect_video_frame_set(frames_directory: Path) -> dict[str, Any]:
     except ImportError as exc:
         raise RuntimeError("Pillow is required for PNG publication validation") from exc
     for index, path in enumerate(entries):
-        if path.read_bytes()[:8] != signature:
-            raise ValueError(f"video frame {path.name} has an invalid PNG signature")
         size_bytes = path.stat().st_size
         if size_bytes <= 0:
             raise ValueError(f"video frame {path.name} is empty")
+        if path.read_bytes()[:8] != signature:
+            raise ValueError(f"video frame {path.name} has an invalid PNG signature")
+        expected_index = int(path.stem.removeprefix("frame_"))
+        if expected_index != index:
+            raise ValueError(f"video frame {path.name} has an inconsistent index")
         try:
             with Image.open(path) as image:
                 image.load()
                 mode = image.mode
                 width, height = image.size
+                image_format = image.format
         except Exception as exc:
             raise ValueError(f"video frame {path.name} is not a readable PNG") from exc
+        if image_format != "PNG":
+            raise ValueError(f"video frame {path.name} is not a PNG image")
         if mode != "RGB":
             raise ValueError(f"video frame {path.name} mode is {mode}, expected RGB")
-        if (width, height) != (VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT):
+        if (width, height) != (decoder_geometry["video_width"], decoder_geometry["video_height"]):
             raise ValueError(
-                f"video frame {path.name} dimensions are {(width, height)}, expected {(VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT)}"
+                f"video frame {path.name} dimensions are {(width, height)}, expected "
+                f"{(decoder_geometry['video_width'], decoder_geometry['video_height'])}"
             )
         frame_records.append(
             {
@@ -4132,12 +4248,45 @@ def _inspect_video_frame_set(frames_directory: Path) -> dict[str, Any]:
                 "height": height,
             }
         )
+    per_frame_sha256 = {record["path"]: record["sha256"] for record in frame_records}
     return {
         "frame_count": len(frame_records),
-        "width": VIDEO_FRAME_WIDTH,
-        "height": VIDEO_FRAME_HEIGHT,
+        "width": decoder_geometry["video_width"],
+        "height": decoder_geometry["video_height"],
+        "video_width": decoder_geometry["video_width"],
+        "video_height": decoder_geometry["video_height"],
+        "fps": decoder_geometry["fps"],
+        "duration_seconds": decoder_geometry["duration_seconds"],
+        "frame_filename_pattern": VIDEO_FRAME_FILENAME_PATTERN,
+        "per_frame_sha256": per_frame_sha256,
+        "geometry": core_geometry,
+        "geometry_identity": _video_frame_geometry_identity(decoder_geometry),
         "frames": frame_records,
     }
+
+
+def stage_video_frames(
+    frames_partial: Path,
+    frames: np.ndarray,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    save_frames: Callable[[Path, np.ndarray], Any] | None = None,
+) -> dict[str, Any]:
+    """Stage exactly the selected geometry's complete PNG set and validate it before publication."""
+    core_geometry, decoder_geometry = _selected_video_frame_geometry(geometry)
+    validate_video_rgb_output(frames, geometry=core_geometry)
+    partial = Path(frames_partial).resolve()
+    if partial.exists():
+        raise FileExistsError(f"refusing existing staged video frames directory: {partial}")
+    if save_frames is None:
+        from minimax_h3_mlx.media import save_frames as save_frames_impl
+
+        save_frames = save_frames_impl
+    save_frames(partial, np.asarray(frames))
+    inspected = _inspect_video_frame_set(partial, geometry=core_geometry)
+    if inspected["frame_count"] != decoder_geometry["frame_count"]:
+        raise ValueError("staged video frame count does not match the selected geometry")
+    return inspected
 
 
 def stable_video_frame_manifest_sha256(manifest: Mapping[str, Any]) -> str:
@@ -4152,19 +4301,34 @@ def build_video_frame_manifest(
     attempt_identifier: str,
     worker_identity: str = VIDEO_WORKER_IDENTITY,
     publication_state: str = "published",
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    decoder_receipt: Mapping[str, Any] | None = None,
+    decoded_rgb_geometry: Any = None,
 ) -> dict[str, Any]:
-    inspected = _inspect_video_frame_set(Path(frames_directory))
+    selected_geometry = _resolve_frame_geometry_argument(geometry, expected_geometry)
+    core_geometry, decoder_geometry = _selected_video_frame_geometry(selected_geometry)
+    inspected = _inspect_video_frame_set(Path(frames_directory), geometry=core_geometry)
+    _validate_decoded_rgb_geometry(decoded_rgb_geometry, decoder_geometry)
+    if decoder_receipt is not None:
+        validate_video_decoder_receipt_geometry(decoder_receipt, expected_geometry=core_geometry)
     manifest = {
         "manifest_identity": VIDEO_FRAME_MANIFEST_IDENTITY,
         "schema_version": VIDEO_FRAME_MANIFEST_SCHEMA_VERSION,
         "attempt_identifier": attempt_identifier,
         "worker_identity": worker_identity,
         "publication_state": publication_state,
-        "frame_count": VIDEO_FRAME_COUNT,
-        "width": VIDEO_FRAME_WIDTH,
-        "height": VIDEO_FRAME_HEIGHT,
-        "fps": VIDEO_FRAME_FPS,
-        "duration_seconds": VIDEO_FRAME_DURATION_SECONDS,
+        "frame_count": decoder_geometry["frame_count"],
+        "width": decoder_geometry["video_width"],
+        "height": decoder_geometry["video_height"],
+        "video_width": decoder_geometry["video_width"],
+        "video_height": decoder_geometry["video_height"],
+        "fps": decoder_geometry["fps"],
+        "duration_seconds": decoder_geometry["duration_seconds"],
+        "frame_filename_pattern": VIDEO_FRAME_FILENAME_PATTERN,
+        "per_frame_sha256": inspected["per_frame_sha256"],
+        "geometry": core_geometry,
+        "geometry_identity": _video_frame_geometry_identity(decoder_geometry),
         "frames": inspected["frames"],
         "manifest_sha256": None,
     }
@@ -4178,9 +4342,20 @@ def validate_video_frame_manifest(
     *,
     expected_attempt_identifier: str,
     expected_worker_identity: str = VIDEO_WORKER_IDENTITY,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    decoder_receipt: Mapping[str, Any] | None = None,
+    decoded_rgb_geometry: Any = None,
 ) -> dict[str, Any]:
-    """Independently validate the published manifest and all 30 files it links."""
+    """Independently validate the published manifest and all 30 files it links.
+
+    The legacy 30 frames at 128x128 publication remains exact when the default geometry is selected.
+    """
     manifest = _read_json_object(Path(manifest_path).resolve(), "video frame manifest")
+    selected_geometry = _resolve_frame_geometry_argument(geometry, expected_geometry)
+    if selected_geometry is None and isinstance(manifest.get("geometry"), Mapping):
+        selected_geometry = manifest["geometry"]
+    core_geometry, decoder_geometry = _selected_video_frame_geometry(selected_geometry)
     if set(manifest) != VIDEO_FRAME_MANIFEST_KEYS:
         raise ValueError(
             f"video frame manifest schema mismatch: missing={sorted(VIDEO_FRAME_MANIFEST_KEYS - set(manifest))}, "
@@ -4196,25 +4371,35 @@ def validate_video_frame_manifest(
         raise ValueError("video frame manifest worker identity mismatch")
     if manifest.get("publication_state") != "published":
         raise ValueError("video frame manifest publication state is not published")
-    if manifest.get("frame_count") != VIDEO_FRAME_COUNT or manifest.get("width") != VIDEO_FRAME_WIDTH or manifest.get("height") != VIDEO_FRAME_HEIGHT:
-        raise ValueError("video frame manifest geometry is not 30 frames at 128x128")
-    if manifest.get("fps") != VIDEO_FRAME_FPS or manifest.get("duration_seconds") != VIDEO_FRAME_DURATION_SECONDS:
-        raise ValueError("video frame manifest timing metadata is invalid")
+    _validate_video_frame_manifest_geometry_metadata(manifest, core_geometry)
+    _validate_decoded_rgb_geometry(decoded_rgb_geometry, decoder_geometry)
+    if decoder_receipt is not None:
+        validate_video_decoder_receipt_geometry(decoder_receipt, expected_geometry=core_geometry)
     if manifest.get("manifest_sha256") != stable_video_frame_manifest_sha256(manifest):
         raise ValueError("video frame manifest checksum linkage is stale")
-    inspected = _inspect_video_frame_set(Path(frames_directory))
+    inspected = _inspect_video_frame_set(Path(frames_directory), geometry=core_geometry)
+    if manifest.get("per_frame_sha256") != inspected["per_frame_sha256"]:
+        raise ValueError("video frame manifest per-frame checksum linkage is stale")
     if manifest.get("frames") != inspected["frames"]:
         raise ValueError("video frame manifest frame checksum linkage is stale")
     return {
         "manifest_path": str(Path(manifest_path).resolve()),
         "frames_path": str(Path(frames_directory).resolve()),
         "publication_state": manifest["publication_state"],
+        "attempt_identifier": manifest["attempt_identifier"],
+        "worker_identity": manifest["worker_identity"],
         "manifest_sha256": manifest["manifest_sha256"],
         "frame_count": manifest["frame_count"],
         "width": manifest["width"],
         "height": manifest["height"],
+        "video_width": manifest["video_width"],
+        "video_height": manifest["video_height"],
         "fps": manifest["fps"],
         "duration_seconds": manifest["duration_seconds"],
+        "frame_filename_pattern": manifest["frame_filename_pattern"],
+        "per_frame_sha256": manifest["per_frame_sha256"],
+        "geometry": manifest["geometry"],
+        "geometry_identity": manifest["geometry_identity"],
         "frames": manifest["frames"],
     }
 
@@ -4227,11 +4412,17 @@ def publish_video_frames_atomically(
     attempt_identifier: str,
     worker_identity: str = VIDEO_WORKER_IDENTITY,
     rename: Callable[[Path, Path], None] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    decoder_receipt: Mapping[str, Any] | None = None,
+    decoded_rgb_geometry: Any = None,
 ) -> dict[str, Any]:
-    """Validate staged frames, then atomically rename the directory into its final name."""
+    """Validate all selected-geometry evidence, then atomically rename staged frames."""
     partial = Path(frames_partial).resolve()
     final = Path(frames_final).resolve()
     manifest_file = Path(manifest_path).resolve()
+    selected_geometry = _resolve_frame_geometry_argument(geometry, expected_geometry)
+    core_geometry, _decoder_geometry = _selected_video_frame_geometry(selected_geometry)
     if final.exists():
         raise FileExistsError(f"refusing existing final video frames directory: {final}")
     if not partial.is_dir():
@@ -4243,6 +4434,9 @@ def publish_video_frames_atomically(
         attempt_identifier=attempt_identifier,
         worker_identity=worker_identity,
         publication_state="published",
+        geometry=core_geometry,
+        decoder_receipt=decoder_receipt,
+        decoded_rgb_geometry=decoded_rgb_geometry,
     )
     _write_json(manifest_file, manifest)
     validate_video_frame_manifest(
@@ -4250,6 +4444,9 @@ def publish_video_frames_atomically(
         partial,
         expected_attempt_identifier=attempt_identifier,
         expected_worker_identity=worker_identity,
+        geometry=core_geometry,
+        decoder_receipt=decoder_receipt,
+        decoded_rgb_geometry=decoded_rgb_geometry,
     )
     if final.exists():
         raise FileExistsError(f"refusing existing final video frames directory: {final}")
@@ -4260,7 +4457,38 @@ def publish_video_frames_atomically(
         final,
         expected_attempt_identifier=attempt_identifier,
         expected_worker_identity=worker_identity,
+        geometry=core_geometry,
+        decoder_receipt=decoder_receipt,
+        decoded_rgb_geometry=decoded_rgb_geometry,
     )
+
+
+def _video_decoder_publication_receipt(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any],
+    raw_shape_dtype: Mapping[str, Any],
+    rgb_shape_dtype: Mapping[str, Any],
+    *,
+    base_receipt: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create the geometry receipt that must pass before staged frames can be published."""
+    core_geometry, decoder_geometry = _selected_video_frame_geometry(geometry)
+    receipt = dict(base_receipt or {})
+    receipt.setdefault("geometry", core_geometry)
+    receipt.setdefault("video_geometry", decoder_geometry)
+    receipt.setdefault("video_width", decoder_geometry["video_width"])
+    receipt.setdefault("video_height", decoder_geometry["video_height"])
+    receipt.setdefault("video_native_shape", decoder_geometry["video_native_shape"])
+    receipt.setdefault("video_raw_shape", decoder_geometry["video_raw_shape"])
+    receipt.setdefault("video_rgb_shape", decoder_geometry["video_rgb_shape"])
+    receipt.setdefault("frame_count", decoder_geometry["frame_count"])
+    receipt.setdefault(
+        "video_output",
+        {
+            "raw": dict(raw_shape_dtype),
+            "rgb": dict(rgb_shape_dtype),
+        },
+    )
+    return receipt
 
 
 def collect_video_frame_evidence(frames_directory: Path) -> list[dict[str, Any]]:
@@ -4294,6 +4522,7 @@ def execute_video_decode_once(
     memory_snapshot: Callable[[], Mapping[str, Any]] | None = None,
     references: dict[str, Any] | None = None,
     expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    decoder_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run exactly one injected video decode, with all MLX work supplied by the child."""
     refs = references if references is not None else {}
@@ -4348,16 +4577,29 @@ def execute_video_decode_once(
     frames, rgb_shape_dtype = convert_and_validate_video_rgb(raw_np, geometry=core_geometry)
     refs["frames"] = frames
     memory["peak"] = dict(snapshot())
-    if save_frames is None:
-        from minimax_h3_mlx.media import save_frames as save_frames_impl
-
-        save_frames = save_frames_impl
-    save_frames(partial, frames)
+    staged_frame_validation = stage_video_frames(
+        partial,
+        frames,
+        geometry=core_geometry,
+        save_frames=save_frames,
+    )
+    publication_receipt = _video_decoder_publication_receipt(
+        core_geometry,
+        raw_shape_dtype,
+        rgb_shape_dtype,
+        base_receipt=decoder_receipt,
+    )
+    if isinstance(decoder_receipt, dict):
+        for key, value in publication_receipt.items():
+            decoder_receipt.setdefault(key, value)
     manifest_validation = publish_video_frames_atomically(
         partial,
         final,
         manifest_file,
         attempt_identifier=expected_attempt_identifier,
+        geometry=core_geometry,
+        decoder_receipt=publication_receipt,
+        decoded_rgb_geometry=rgb_shape_dtype,
     )
     return {
         "input_artifact": {key: value for key, value in input_validation.items() if key not in {"arrays", "metadata"}},
@@ -4366,6 +4608,8 @@ def execute_video_decode_once(
         "logical_video_fingerprint": logical_fingerprint,
         "raw_shape_dtype": raw_shape_dtype,
         "rgb_shape_dtype": rgb_shape_dtype,
+        "staged_frame_validation": staged_frame_validation,
+        "decoder_receipt_geometry": publication_receipt,
         "frame_manifest": manifest_validation,
         "memory": memory,
         "references": refs,
@@ -7178,6 +7422,7 @@ def _video_worker_main(argv: Sequence[str]) -> int:
             memory_snapshot=lambda: _memory_snapshot(mx),
             references=references,
             expected_geometry=core_geometry,
+            decoder_receipt=receipt,
         )
         receipt["geometry"] = core_geometry
         receipt["video_geometry"] = result["video_geometry"]
