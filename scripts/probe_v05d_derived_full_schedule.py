@@ -4385,6 +4385,7 @@ def validate_video_frame_manifest(
     return {
         "manifest_path": str(Path(manifest_path).resolve()),
         "frames_path": str(Path(frames_directory).resolve()),
+        "manifest_identity": manifest["manifest_identity"],
         "publication_state": manifest["publication_state"],
         "attempt_identifier": manifest["attempt_identifier"],
         "worker_identity": manifest["worker_identity"],
@@ -4950,6 +4951,7 @@ def validate_audio_wav_manifest(
     return {
         "manifest_path": str(Path(manifest_path).resolve()),
         "wav_path": str(Path(wav_path).resolve()),
+        "manifest_identity": manifest["manifest_identity"],
         "publication_state": manifest["publication_state"],
         "manifest_sha256": manifest["manifest_sha256"],
         "wav_sha256": manifest["wav_sha256"],
@@ -5561,26 +5563,82 @@ def publish_mp4_atomically(
     )
 
 
+def _resolve_mux_geometry(
+    report: Mapping[str, Any] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if geometry is not None:
+        return canonical_geometry_contract(geometry=geometry)
+    if isinstance(report, Mapping) and isinstance(report.get("geometry"), Mapping):
+        return canonical_geometry_contract(geometry=report["geometry"])
+    return canonical_geometry_contract()
+
+
+def _optional_video_decoder_geometry_valid(
+    receipt: Mapping[str, Any],
+    expected_geometry: Mapping[str, Any],
+) -> bool | None:
+    geometry_fields = {
+        "geometry",
+        "video_geometry",
+        "video_width",
+        "video_height",
+        "video_native_shape",
+        "video_raw_shape",
+        "video_rgb_shape",
+        "frame_count",
+    }
+    if not any(field in receipt for field in geometry_fields):
+        return None
+    validate_video_decoder_receipt_geometry(receipt, expected_geometry=expected_geometry)
+    return True
+
+
 def build_mux_launch_gate(
     report: Mapping[str, Any],
     paths: Mapping[str, Any] | None = None,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the fail-closed gate that must pass before either mux subprocess can run."""
+    """Build the fail-closed gate that must pass before either mux subprocess can run.
+
+    The legacy 128 report fixture predates explicit decoder geometry and allocator fields.  It is
+    accepted only for the existing 128 mux path; a 256 staging attempt must carry the new evidence.
+    """
+    core_geometry = _resolve_mux_geometry(report, geometry)
+    decoder_geometry = video_decoder_geometry_contract(core_geometry)
     video_decoder = report.get("video_decoder") if isinstance(report.get("video_decoder"), Mapping) else {}
     audio_decoder = report.get("audio_decoder") if isinstance(report.get("audio_decoder"), Mapping) else {}
     video_receipt = video_decoder.get("worker_receipt") if isinstance(video_decoder.get("worker_receipt"), Mapping) else {}
     audio_receipt = audio_decoder.get("worker_receipt") if isinstance(audio_decoder.get("worker_receipt"), Mapping) else {}
     frame_manifest_valid = False
     wav_manifest_valid = False
+    geometry_valid = True
     errors: list[str] = []
+    decoder_receipt_has_geometry = any(
+        field in video_receipt
+        for field in (
+            "geometry",
+            "video_geometry",
+            "video_width",
+            "video_height",
+            "video_native_shape",
+            "video_raw_shape",
+            "video_rgb_shape",
+            "frame_count",
+        )
+    )
     path_map = paths or report.get("output_paths") or {}
     attempt_identifier = report.get("attempt", {}).get("attempt_identifier") if isinstance(report.get("attempt"), Mapping) else None
+    explicit_report_geometry = isinstance(report.get("geometry"), Mapping) or geometry is not None
     try:
         if isinstance(path_map, Mapping) and all(key in path_map for key in ("video_frame_manifest", "frames")):
             validate_video_frame_manifest(
                 Path(path_map["video_frame_manifest"]),
                 Path(path_map["frames"]),
                 expected_attempt_identifier=str(attempt_identifier),
+                geometry=core_geometry,
+                decoder_receipt=video_receipt if decoder_receipt_has_geometry else None,
             )
             frame_manifest_valid = True
         else:
@@ -5589,6 +5647,12 @@ def build_mux_launch_gate(
                 and report["video_artifacts"].get("publication_state") == "published"
                 and isinstance(report["video_artifacts"].get("manifest_sha256"), str)
             )
+            if frame_manifest_valid and isinstance(report.get("video_artifacts"), Mapping):
+                artifact_geometry = report["video_artifacts"].get("geometry")
+                if isinstance(artifact_geometry, Mapping):
+                    validate_geometry_contract(artifact_geometry, expected=core_geometry)
+                elif core_geometry["video_width"] != VIDEO_FRAME_WIDTH:
+                    raise ValueError("published video artifact is missing selected 256 geometry evidence")
     except BaseException as exc:
         errors.append(f"frame manifest: {exc}")
     try:
@@ -5607,13 +5671,46 @@ def build_mux_launch_gate(
             )
     except BaseException as exc:
         errors.append(f"WAV manifest: {exc}")
+
+    if explicit_report_geometry:
+        try:
+            validate_geometry_contract(core_geometry)
+            report_geometry = report.get("geometry")
+            if isinstance(report_geometry, Mapping):
+                validate_geometry_contract(report_geometry, expected=core_geometry)
+        except BaseException as exc:
+            geometry_valid = False
+            errors.append(f"selected geometry: {exc}")
+    elif core_geometry["video_width"] != VIDEO_FRAME_WIDTH:
+        geometry_valid = False
+        errors.append("selected 256 geometry is not present in the mux report")
+
+    try:
+        decoder_geometry_valid = _optional_video_decoder_geometry_valid(video_receipt, core_geometry)
+    except BaseException as exc:
+        decoder_geometry_valid = False
+        errors.append(f"video decoder geometry: {exc}")
+    if decoder_geometry_valid is None:
+        decoder_geometry_valid = not explicit_report_geometry and core_geometry["video_width"] == VIDEO_FRAME_WIDTH
+
+    video_release_gate_passed = video_decoder.get("release_gate_passed") is True
+    audio_release_gate_passed = audio_decoder.get("release_gate_passed") is True
+    video_allocator = video_decoder.get("allocator_cache_zero")
+    if video_allocator is None:
+        video_allocator = video_receipt.get("allocator_cache_zero")
+    audio_allocator = audio_decoder.get("allocator_cache_zero")
+    if audio_allocator is None:
+        audio_allocator = audio_receipt.get("allocator_cache_zero")
+    legacy_128 = not explicit_report_geometry and core_geometry["video_width"] == VIDEO_FRAME_WIDTH
+    video_allocator_cache_zero = video_allocator is True if video_allocator is not None else legacy_128 and video_release_gate_passed
+    audio_allocator_cache_zero = audio_allocator is True if audio_allocator is not None else legacy_128 and audio_release_gate_passed
     gate = {
         "derived_phase_status": report.get("latent_generation_status"),
         "video_status": report.get("video_status"),
         "audio_status": report.get("audio_status"),
         "standalone_media_status": report.get("standalone_media_status"),
-        "video_release_gate_passed": video_decoder.get("release_gate_passed") is True,
-        "audio_release_gate_passed": audio_decoder.get("release_gate_passed") is True,
+        "video_release_gate_passed": video_release_gate_passed,
+        "audio_release_gate_passed": audio_release_gate_passed,
         "video_worker_termination_confirmed": (
             video_decoder.get("worker_termination_confirmed") is True
             or video_receipt.get("worker_termination_confirmed") is True
@@ -5622,8 +5719,16 @@ def build_mux_launch_gate(
             audio_decoder.get("worker_termination_confirmed") is True
             or audio_receipt.get("worker_termination_confirmed") is True
         ),
+        "video_allocator_cache_zero": video_allocator_cache_zero,
+        "audio_allocator_cache_zero": audio_allocator_cache_zero,
+        "allocator_cache_zero": video_allocator_cache_zero and audio_allocator_cache_zero,
         "frame_manifest_valid": frame_manifest_valid,
         "wav_manifest_valid": wav_manifest_valid,
+        "geometry": core_geometry,
+        "geometry_valid": geometry_valid,
+        "video_decoder_geometry": decoder_geometry,
+        "video_decoder_geometry_valid": decoder_geometry_valid,
+        "video_decoder_receipt": _json_safe(dict(video_receipt)) if decoder_receipt_has_geometry else None,
         "passed": False,
     }
     gate["passed"] = (
@@ -5632,13 +5737,21 @@ def build_mux_launch_gate(
         and gate["audio_status"] == "completed"
         and gate["standalone_media_status"] == "completed"
         and all(gate[key] is True for key in MP4_MUX_LAUNCH_GATE_KEYS - {"passed", "derived_phase_status", "video_status", "audio_status", "standalone_media_status"})
+        and gate["allocator_cache_zero"] is True
+        and gate["geometry_valid"] is True
+        and gate["video_decoder_geometry_valid"] is True
     )
     if errors:
         gate["errors"] = errors
     return gate
 
 
-def validate_mux_launch_gate(gate: Mapping[str, Any]) -> None:
+def validate_mux_launch_gate(
+    gate: Mapping[str, Any],
+    *,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+    require_geometry: bool = False,
+) -> None:
     """Fail closed on any missing, false, or uncertain upstream mux gate."""
     missing = sorted(MP4_MUX_LAUNCH_GATE_KEYS - set(gate))
     if missing:
@@ -5660,6 +5773,36 @@ def validate_mux_launch_gate(gate: Mapping[str, Any]) -> None:
             raise ValueError(f"MP4 mux launch gate {key} did not pass")
     if gate.get("passed") is not True:
         raise ValueError("MP4 mux launch gate did not pass")
+    if expected_geometry is not None:
+        core_geometry = canonical_geometry_contract(geometry=expected_geometry)
+        selected = gate.get("geometry")
+        if not isinstance(selected, Mapping):
+            if require_geometry:
+                raise ValueError("MP4 mux launch gate is missing selected geometry evidence")
+        else:
+            validate_geometry_contract(selected, expected=core_geometry)
+        for field, expected in (
+            ("video_width", core_geometry["video_width"]),
+            ("video_height", core_geometry["video_height"]),
+            ("frame_count", core_geometry["frames"]),
+            ("fps", core_geometry["fps"]),
+        ):
+            if field in gate and gate[field] != expected:
+                raise ValueError(f"MP4 mux launch gate {field} does not match selected geometry")
+        decoder_geometry = gate.get("video_decoder_geometry")
+        if isinstance(decoder_geometry, Mapping):
+            for field, expected in (
+                ("video_width", core_geometry["video_width"]),
+                ("video_height", core_geometry["video_height"]),
+                ("frame_count", core_geometry["frames"]),
+                ("fps", core_geometry["fps"]),
+            ):
+                if decoder_geometry.get(field) != expected:
+                    raise ValueError(f"MP4 mux launch gate decoder {field} does not match selected geometry")
+        if require_geometry:
+            for key in ("geometry_valid", "video_decoder_geometry_valid", "allocator_cache_zero"):
+                if gate.get(key) is not True:
+                    raise ValueError(f"MP4 mux launch gate {key} did not pass")
 
 
 def _mp4_file_evidence(path: Path) -> dict[str, Any]:
@@ -5684,6 +5827,7 @@ def _raise_mp4_mux_failure(
     ffmpeg_receipt: Mapping[str, Any],
     ffprobe_receipt: Mapping[str, Any],
     source_validation: Mapping[str, Any],
+    geometry: Mapping[str, Any] | None,
     started: float,
 ) -> NoReturn:
     partial_before = _mp4_file_evidence(partial)
@@ -5708,6 +5852,20 @@ def _raise_mp4_mux_failure(
         "manifest_created": manifest_created,
         "ffmpeg": dict(ffmpeg_receipt),
         "ffprobe": dict(ffprobe_receipt),
+        "geometry": dict(geometry) if isinstance(geometry, Mapping) else None,
+        "video_width": geometry.get("video_width") if isinstance(geometry, Mapping) else None,
+        "video_height": geometry.get("video_height") if isinstance(geometry, Mapping) else None,
+        "frame_count": geometry.get("frames") if isinstance(geometry, Mapping) else None,
+        "fps": geometry.get("fps") if isinstance(geometry, Mapping) else None,
+        "frame_manifest_identity": source_validation.get("video", {}).get("manifest_identity"),
+        "frame_manifest_sha256": source_validation.get("video", {}).get("manifest_sha256"),
+        "wav_manifest_identity": source_validation.get("audio", {}).get("manifest_identity"),
+        "wav_manifest_sha256": source_validation.get("audio", {}).get("manifest_sha256"),
+        "ffmpeg_argv": ffmpeg_receipt.get("argv"),
+        "ffmpeg_exit_code": ffmpeg_receipt.get("returncode"),
+        "staged_mp4_path": str(partial),
+        "staged_mp4_nonzero": partial_before.get("size_bytes", 0) > 0,
+        "final_mp4_published": False,
         "source_validation": _json_safe(dict(source_validation)),
         "launch_gate": dict(gate),
         "frames_preserved": Path(frames_directory).is_dir(),
@@ -5730,6 +5888,245 @@ def _raise_mp4_mux_failure(
     raise MP4MuxFailure(primary, receipt=receipt, cleanup_error=cleanup_error) from primary
 
 
+def _ffmpeg_staging_receipt(
+    *,
+    geometry: Mapping[str, Any],
+    partial: Path,
+    final: Path,
+    manifest_file: Path,
+) -> dict[str, Any]:
+    decoder_geometry = video_decoder_geometry_contract(geometry)
+    return {
+        "status": "not_performed",
+        "geometry": dict(geometry),
+        "video_width": int(decoder_geometry["video_width"]),
+        "video_height": int(decoder_geometry["video_height"]),
+        "frame_count": int(decoder_geometry["frame_count"]),
+        "fps": int(decoder_geometry["fps"]),
+        "frame_manifest_identity": None,
+        "frame_manifest_sha256": None,
+        "wav_manifest_identity": None,
+        "wav_manifest_sha256": None,
+        "ffmpeg_argv": None,
+        "ffmpeg_exit_code": None,
+        "staged_mp4_path": str(partial),
+        "staged_mp4_nonzero": False,
+        "final_mp4_path": str(final),
+        "final_mp4_published": False,
+        "mp4_manifest_path": str(manifest_file),
+        "mp4_manifest_created": False,
+        "ffmpeg": _empty_mux_subprocess_receipt("ffmpeg"),
+        "ffprobe": _empty_mux_subprocess_receipt("ffprobe"),
+        "source_validation": {},
+        "launch_gate": {},
+        "retry_suppressed": True,
+        "invocation_counts": {"ffmpeg": 0, "ffprobe": 0},
+    }
+
+
+def _raise_ffmpeg_staging_failure(
+    primary: BaseException,
+    *,
+    receipt: Mapping[str, Any],
+    partial: Path,
+    frames_directory: Path,
+    wav_path: Path,
+    started: float,
+) -> NoReturn:
+    partial_before = _mp4_file_evidence(partial)
+    cleanup_error: BaseException | None = None
+    try:
+        if partial.exists():
+            if not partial.is_file():
+                raise IsADirectoryError(f"staged MP4 path is not a file: {partial}")
+            partial.unlink()
+    except BaseException as exc:
+        cleanup_error = exc
+    failed_receipt = {
+        **dict(receipt),
+        "status": "failed",
+        "partial_cleanup_policy": "delete_partial_mp4_after_failure",
+        "partial_before_cleanup": partial_before,
+        "partial_after_cleanup": _mp4_file_evidence(partial),
+        "frames_preserved": Path(frames_directory).is_dir(),
+        "wav_preserved": Path(wav_path).is_file(),
+        "retry_suppressed": True,
+        "invocation_counts": {
+            "ffmpeg": 1 if receipt.get("ffmpeg", {}).get("invoked") is True else 0,
+            "ffprobe": 0,
+        },
+        "primary_error": error_receipt(primary),
+        "cleanup_error": error_receipt(cleanup_error),
+        **failure_fields(
+            primary,
+            cleanup_error,
+            cleanup_attempted=True,
+            cleanup_succeeded=cleanup_error is None,
+        ),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    raise MP4MuxFailure(primary, receipt=failed_receipt, cleanup_error=cleanup_error) from primary
+
+
+def validate_ffmpeg_staging_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a successful pre-ffprobe staging receipt and its nonzero partial artifact."""
+    if receipt.get("status") != "staged":
+        raise ValueError("ffmpeg staging receipt is not successful")
+    geometry = receipt.get("geometry")
+    if not isinstance(geometry, Mapping):
+        raise ValueError("ffmpeg staging receipt is missing selected geometry")
+    selected = canonical_geometry_contract(geometry=expected_geometry) if expected_geometry is not None else canonical_geometry_contract(geometry=geometry)
+    validate_geometry_contract(geometry, expected=selected)
+    for field, expected in (
+        ("video_width", selected["video_width"]),
+        ("video_height", selected["video_height"]),
+        ("frame_count", selected["frames"]),
+        ("fps", selected["fps"]),
+    ):
+        if receipt.get(field) != expected:
+            raise ValueError(f"ffmpeg staging receipt {field} does not match selected geometry")
+    if receipt.get("frame_manifest_identity") != VIDEO_FRAME_MANIFEST_IDENTITY:
+        raise ValueError("ffmpeg staging receipt frame manifest identity is invalid")
+    if receipt.get("wav_manifest_identity") != AUDIO_WAV_MANIFEST_IDENTITY:
+        raise ValueError("ffmpeg staging receipt WAV manifest identity is invalid")
+    argv = receipt.get("ffmpeg_argv")
+    if not isinstance(argv, list) or not argv:
+        raise ValueError("ffmpeg staging receipt is missing ffmpeg argv")
+    if receipt.get("ffmpeg_exit_code") != 0:
+        raise ValueError("ffmpeg staging receipt does not prove exit code zero")
+    partial = Path(str(receipt.get("staged_mp4_path", ""))).resolve()
+    if receipt.get("staged_mp4_nonzero") is not True or not partial.is_file() or partial.stat().st_size <= 0:
+        raise ValueError("ffmpeg staging receipt does not prove a nonzero staged MP4")
+    if receipt.get("final_mp4_published") is not False:
+        raise ValueError("ffmpeg staging receipt claims final MP4 publication")
+    if receipt.get("ffprobe", {}).get("invoked") is not False:
+        raise ValueError("ffmpeg staging receipt must not invoke ffprobe")
+    if receipt.get("invocation_counts") != {"ffmpeg": 1, "ffprobe": 0}:
+        raise ValueError("ffmpeg staging receipt does not prove exactly one ffmpeg invocation")
+    return dict(receipt)
+
+
+def execute_ffmpeg_staging(
+    *,
+    frames_directory: Path,
+    video_manifest_path: Path,
+    wav_path: Path,
+    audio_manifest_path: Path,
+    mp4_partial_path: Path,
+    mp4_final_path: Path,
+    mp4_manifest_path: Path,
+    attempt_identifier: str,
+    launch_gate: Mapping[str, Any],
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any],
+    video_decoder_receipt: Mapping[str, Any] | None = None,
+    subprocess_runner: Callable[..., Any] | None = None,
+    ffmpeg_binary: str = "ffmpeg",
+    timeout_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Stage one geometry-bound MP4 input with exactly one injected ffmpeg invocation.
+
+    This is deliberately the pre-ffprobe boundary.  It never validates a container stream, writes
+    an MP4 manifest, or renames the partial artifact to the final MP4 path.
+    """
+    core_geometry = canonical_geometry_contract(geometry=geometry)
+    validate_mux_launch_gate(launch_gate, expected_geometry=core_geometry, require_geometry=True)
+    frames = Path(frames_directory).resolve()
+    video_manifest_file = Path(video_manifest_path).resolve()
+    wav = Path(wav_path).resolve()
+    audio_manifest_file = Path(audio_manifest_path).resolve()
+    partial = Path(mp4_partial_path).resolve()
+    final = Path(mp4_final_path).resolve()
+    manifest_file = Path(mp4_manifest_path).resolve()
+    if final.exists():
+        raise FileExistsError(f"refusing existing final MP4: {final}")
+    if manifest_file.exists():
+        raise FileExistsError(f"refusing existing MP4 manifest: {manifest_file}")
+    if partial.exists():
+        raise FileExistsError(f"refusing existing staged MP4: {partial}")
+    runner = subprocess_runner or _default_mux_subprocess_runner
+    started = time.perf_counter()
+    receipt = _ffmpeg_staging_receipt(
+        geometry=core_geometry,
+        partial=partial,
+        final=final,
+        manifest_file=manifest_file,
+    )
+    receipt["launch_gate"] = dict(launch_gate)
+    decoder_receipt = video_decoder_receipt
+    if decoder_receipt is None and isinstance(launch_gate.get("video_decoder_receipt"), Mapping):
+        decoder_receipt = launch_gate["video_decoder_receipt"]
+    try:
+        source_validation = {
+            "video": validate_video_frame_manifest(
+                video_manifest_file,
+                frames,
+                expected_attempt_identifier=attempt_identifier,
+                geometry=core_geometry,
+                decoder_receipt=decoder_receipt,
+            ),
+            "audio": validate_audio_wav_manifest(
+                audio_manifest_file,
+                wav,
+                expected_attempt_identifier=attempt_identifier,
+            ),
+        }
+        receipt["source_validation"] = _json_safe(source_validation)
+        receipt["frame_manifest_identity"] = source_validation["video"]["manifest_identity"]
+        receipt["frame_manifest_sha256"] = source_validation["video"]["manifest_sha256"]
+        receipt["wav_manifest_identity"] = source_validation["audio"]["manifest_identity"]
+        receipt["wav_manifest_sha256"] = source_validation["audio"]["manifest_sha256"]
+        ffmpeg_argv = build_ffmpeg_command(frames, wav, partial, ffmpeg_binary=ffmpeg_binary)
+        receipt["ffmpeg_argv"] = list(ffmpeg_argv)
+        ffmpeg_receipt, runner_error = _run_mux_subprocess(
+            "ffmpeg",
+            ffmpeg_argv,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+        receipt["ffmpeg"] = dict(ffmpeg_receipt)
+        receipt["ffmpeg_exit_code"] = ffmpeg_receipt.get("returncode")
+        receipt["invocation_counts"] = {"ffmpeg": 1, "ffprobe": 0}
+        if runner_error is not None:
+            raise runner_error
+        if ffmpeg_receipt.get("returncode") != 0:
+            raise RuntimeError(f"ffmpeg exited with status {ffmpeg_receipt.get('returncode')}")
+        staged_nonzero = partial.is_file() and partial.stat().st_size > 0
+        receipt["staged_mp4_nonzero"] = staged_nonzero
+        if not staged_nonzero:
+            raise ValueError("ffmpeg completed successfully without a nonzero staged MP4")
+        if final.exists():
+            raise ValueError("ffmpeg staging unexpectedly exposed a final MP4")
+        receipt.update(
+            {
+                "status": "staged",
+                "final_mp4_published": False,
+                "mp4_manifest_created": False,
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+        )
+        return validate_ffmpeg_staging_receipt(receipt, expected_geometry=core_geometry)
+    except MP4MuxFailure:
+        raise
+    except BaseException as exc:
+        _raise_ffmpeg_staging_failure(
+            exc,
+            receipt=receipt,
+            partial=partial,
+            frames_directory=frames,
+            wav_path=wav,
+            started=started,
+        )
+    raise AssertionError("unreachable ffmpeg staging path")
+
+
+# Name the pre-ffprobe seam explicitly for callers that do not need the legacy 128 publication path.
+execute_mp4_staging = execute_ffmpeg_staging
+
+
 def execute_mp4_mux(
     *,
     frames_directory: Path,
@@ -5746,8 +6143,34 @@ def execute_mp4_mux(
     ffprobe_binary: str = "ffprobe",
     timeout_seconds: float = 120.0,
     rename: Callable[[Path, Path], None] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Mux validated standalone media once, inspect it once, and publish only after all gates pass."""
+    selected_geometry = geometry
+    if selected_geometry is None and isinstance(launch_gate.get("geometry"), Mapping):
+        selected_geometry = launch_gate["geometry"]
+    selected_core_geometry = (
+        canonical_geometry_contract(geometry=selected_geometry)
+        if selected_geometry is not None
+        else canonical_geometry_contract()
+    )
+    if selected_geometry is not None:
+        if selected_core_geometry["video_width"] == 256:
+            return execute_ffmpeg_staging(
+                frames_directory=frames_directory,
+                video_manifest_path=video_manifest_path,
+                wav_path=wav_path,
+                audio_manifest_path=audio_manifest_path,
+                mp4_partial_path=mp4_partial_path,
+                mp4_final_path=mp4_final_path,
+                mp4_manifest_path=mp4_manifest_path,
+                attempt_identifier=attempt_identifier,
+                launch_gate=launch_gate,
+                geometry=selected_core_geometry,
+                subprocess_runner=subprocess_runner,
+                ffmpeg_binary=ffmpeg_binary,
+                timeout_seconds=timeout_seconds,
+            )
     validate_mux_launch_gate(launch_gate)
     frames = Path(frames_directory).resolve()
     video_manifest_file = Path(video_manifest_path).resolve()
@@ -5847,6 +6270,20 @@ def execute_mp4_mux(
             "partial_path": str(partial),
             "output_path": str(final),
             "manifest_path": str(manifest_file),
+            "geometry": dict(selected_core_geometry),
+            "video_width": selected_core_geometry["video_width"],
+            "video_height": selected_core_geometry["video_height"],
+            "frame_count": selected_core_geometry["frames"],
+            "fps": selected_core_geometry["fps"],
+            "frame_manifest_identity": source_validation["video"].get("manifest_identity"),
+            "frame_manifest_sha256": source_validation["video"].get("manifest_sha256"),
+            "wav_manifest_identity": source_validation["audio"].get("manifest_identity"),
+            "wav_manifest_sha256": source_validation["audio"].get("manifest_sha256"),
+            "ffmpeg_argv": ffmpeg_receipt.get("argv"),
+            "ffmpeg_exit_code": ffmpeg_receipt.get("returncode"),
+            "staged_mp4_path": str(partial),
+            "staged_mp4_nonzero": True,
+            "final_mp4_published": True,
             "ffmpeg": dict(ffmpeg_receipt),
             "ffprobe": dict(ffprobe_receipt),
             "mp4_artifact": artifact,
@@ -5873,6 +6310,7 @@ def execute_mp4_mux(
             ffmpeg_receipt=ffmpeg_receipt,
             ffprobe_receipt=ffprobe_receipt,
             source_validation=source_validation,
+            geometry=selected_core_geometry,
             started=started,
         )
     raise AssertionError("unreachable MP4 mux path")
@@ -5951,10 +6389,14 @@ def apply_mp4_mux_report(
     ffprobe_binary: str = "ffprobe",
     timeout_seconds: float = 120.0,
     rename: Callable[[Path, Path], None] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply one mux attempt to a report, preserving standalone evidence on every failure."""
     started = time.perf_counter()
-    gate = build_mux_launch_gate(report, paths)
+    selected_geometry = geometry if geometry is not None else (
+        report.get("geometry") if isinstance(report.get("geometry"), Mapping) else None
+    )
+    gate = build_mux_launch_gate(report, paths, geometry=selected_geometry)
     report["mp4_mux"] = {
         "status": "suppressed",
         "invoked": False,
@@ -6022,6 +6464,7 @@ def apply_mp4_mux_report(
             ffprobe_binary=ffprobe_binary,
             timeout_seconds=timeout_seconds,
             rename=rename,
+            geometry=selected_geometry,
         )
     except MP4MuxFailure as exc:
         timing = {
@@ -6062,6 +6505,22 @@ def apply_mp4_mux_report(
             receipt=receipt,
             timing={"total_seconds": time.perf_counter() - started, "executed": False},
         )
+
+    if result.get("status") == "staged":
+        report["mp4_mux_status"] = "staged"
+        report["mp4_mux"] = dict(result)
+        report["mp4_artifact"] = None
+        report["mux_failure"] = None
+        report["mux_timing"] = {
+            "total_seconds": result.get("elapsed_seconds", time.perf_counter() - started),
+            "ffmpeg_seconds": result.get("ffmpeg", {}).get("elapsed_seconds"),
+            "ffprobe_seconds": None,
+            "executed": True,
+        }
+        standalone = dict(report.get("standalone_media") or {})
+        standalone["mp4_mux_status"] = "staged"
+        report["standalone_media"] = standalone
+        return report
 
     report["mp4_mux_status"] = "completed"
     report["mp4_mux"] = dict(result)
