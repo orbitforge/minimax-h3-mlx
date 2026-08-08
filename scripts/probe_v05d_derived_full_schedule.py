@@ -152,8 +152,24 @@ EXPECTED_LIFECYCLE_TOTALS = {
     "audio_scheduler_updates": EXPECTED_DENOISING_TRANSITIONS,
 }
 
-PROBE_FORMAT = "minimax-h3-mlx-v05d-derived-full-schedule"
-SCHEMA_VERSION = 1
+PROBE_FORMAT = "minimax-h3-mlx-v05e-derived-full-schedule"
+SCHEMA_VERSION = 2
+ATTRIBUTION_SCHEMA_VERSION = 1
+ATTRIBUTION_COMPONENT_FIELDS = (
+    "sidecar_io_and_reconstruction_seconds",
+    "projection_compute_seconds",
+    "materialization_evaluation_seconds",
+    "cache_entry_assembly_bookkeeping_seconds",
+    "release_purge_seconds",
+)
+ATTRIBUTION_SESSION_OVERHEAD_FIELDS = (
+    "shared_timestep_embedding_seconds",
+    "cache_finalize_materialization_seconds",
+)
+ATTRIBUTION_REPORT_CATEGORY_FIELDS = (*ATTRIBUTION_COMPONENT_FIELDS, *ATTRIBUTION_SESSION_OVERHEAD_FIELDS)
+ATTRIBUTION_TOTAL_FIELD = "total_block_cache_construction_seconds"
+ATTRIBUTION_BLOCK_EVENT = "cache_block_timing"
+ATTRIBUTION_SESSION_EVENT = "cache_attribution"
 FINAL_ARTIFACT_SCHEMA_VERSION = 1
 FINGERPRINT_METHOD = "sha256-logical-shape-dtype-plus-canonical-float32-values-v1"
 RNG_METHOD = "mlx.core.random.seed(0)+mlx.core.random.normal-float32-video-then-audio-v1"
@@ -369,6 +385,7 @@ REPORT_KEYS = frozenset(
         "derived_worker",
         "denoising",
         "streamed_adaln_lifecycle",
+        "cache_attribution",
         "final_artifact",
         "event_file_path",
         "event_file_record_count",
@@ -1836,6 +1853,7 @@ class FullScheduleResult:
         video_scheduler_updates: int,
         audio_scheduler_updates: int,
         lifecycle: dict[str, Any],
+        cache_attribution: dict[str, Any],
         memory_telemetry: dict[str, Any],
         timing_telemetry: dict[str, Any],
     ) -> None:
@@ -1848,6 +1866,7 @@ class FullScheduleResult:
         self.video_scheduler_updates = video_scheduler_updates
         self.audio_scheduler_updates = audio_scheduler_updates
         self.lifecycle = lifecycle
+        self.cache_attribution = cache_attribution
         self.memory_telemetry = memory_telemetry
         self.timing_telemetry = timing_telemetry
 
@@ -1861,6 +1880,7 @@ class FullScheduleResult:
             },
             "transitions": list(self.transitions),
             "streamed_adaln_lifecycle": dict(self.lifecycle),
+            "cache_attribution": dict(self.cache_attribution),
             "memory_telemetry": dict(self.memory_telemetry),
             "timing_telemetry": dict(self.timing_telemetry),
             "final_packed_video_fingerprint": array_fingerprint(self.final_video_latent, logical_dtype="bfloat16"),
@@ -1982,6 +2002,15 @@ def _provider_lifecycle(provider: Any, transformer_forwards: int, video_updates:
     return result
 
 
+def _provider_cache_attribution(provider: Any) -> dict[str, Any]:
+    if provider is None:
+        return build_cache_attribution_aggregate([])
+    method = getattr(provider, "cache_attribution", None)
+    if not callable(method):
+        raise ValueError("streamed cache provider must expose cache_attribution()")
+    return dict(method())
+
+
 def _state_for_failure(
     transitions: list[dict[str, Any]],
     *,
@@ -2002,6 +2031,7 @@ def _state_for_failure(
         "scheduler_update_counts": {"video": video_updates, "audio": audio_updates},
         "transitions": list(transitions),
         "streamed_adaln_lifecycle": _provider_lifecycle(provider, transformer_forwards, video_updates, audio_updates),
+        "cache_attribution": _provider_cache_attribution(provider),
         "memory_telemetry": dict(memory),
         "timing_telemetry": dict(timings),
         "failure": failure_fields(
@@ -2110,7 +2140,13 @@ def run_full_schedule(
             if cache_provider is not None:
                 cache = _cache_for_transition(cache_provider, step_index, timestep, transition)
                 cache_acquired = True
-            record["timings"]["streamed_cache_construction_seconds"] = time.perf_counter() - cache_started
+            cache_wall_seconds = time.perf_counter() - cache_started
+            record["timings"]["streamed_cache_construction_seconds"] = cache_wall_seconds
+            if cache_provider is not None:
+                note_wall = getattr(cache_provider, "note_cache_construction_wall", None)
+                if not callable(note_wall):
+                    raise ValueError("streamed cache provider must expose note_cache_construction_wall()")
+                note_wall(step_index, cache_wall_seconds)
             record["memory"]["after_cache"] = _snapshot(memory_snapshot)
 
             def forward_adapter(
@@ -2342,6 +2378,8 @@ def run_full_schedule(
         )
     lifecycle = _provider_lifecycle(cache_provider, transformer_forwards, video_updates, audio_updates)
     validate_lifecycle_totals(lifecycle)
+    cache_attribution = _provider_cache_attribution(cache_provider)
+    validate_cache_attribution(cache_attribution)
     final_native_video, final_native_audio = native(video_latent, audio_latent)
     memory["derived_worker"]["after_denoising"] = _snapshot(memory_snapshot)
     return FullScheduleResult(
@@ -2354,6 +2392,7 @@ def run_full_schedule(
         video_updates,
         audio_updates,
         lifecycle,
+        cache_attribution,
         memory,
         timings,
     )
@@ -2388,6 +2427,8 @@ class JsonlEventWriter:
             "cache_session_count": summary["cache_session_count"],
             "sidecar_open_event_count": summary["sidecar_open_event_count"],
             "sidecar_release_event_count": summary["sidecar_release_event_count"],
+            "attribution_block_event_count": summary["attribution_block_event_count"],
+            "attribution_session_event_count": summary["attribution_session_event_count"],
             "validated_block_pairs": summary["validated_block_pairs"],
         }
 
@@ -2418,6 +2459,429 @@ def _bounded_release_cache(cache: Any) -> str:
     return "tables-cleared"
 
 
+def _timing_seconds(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"cache attribution timing {label} is not numeric")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"cache attribution timing {label} is not finite and nonnegative")
+    return result
+
+
+def _nearest_rank_percentile(values: Sequence[float], percentile: float) -> float | None:
+    """Return a conservative nearest-rank percentile; omit p95 for fewer than five samples."""
+    if not values or (percentile == 0.95 and len(values) < 5):
+        return None
+    ordered = sorted(float(value) for value in values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[rank - 1]
+
+
+def _timing_statistics(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {"sample_count": 0, "mean_seconds": None, "median_seconds": None, "p95_seconds": None}
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        median_value = ordered[midpoint]
+    else:
+        median_value = (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+    return {
+        "sample_count": len(ordered),
+        "mean_seconds": math.fsum(ordered) / len(ordered),
+        "median_seconds": median_value,
+        "p95_seconds": _nearest_rank_percentile(ordered, 0.95),
+    }
+
+
+def calculate_unattributed_remainder(wall_total_seconds: float, measured_component_seconds: float) -> dict[str, Any]:
+    """Preserve the raw wall-minus-components remainder, including negative timer noise."""
+    wall = _timing_seconds(wall_total_seconds, "wall_total_seconds")
+    components = _timing_seconds(measured_component_seconds, "measured_component_seconds")
+    remainder = wall - components
+    if remainder < 0.0:
+        status = "negative-timer-noise-or-overlapping-boundaries"
+        warning = (
+            "measured components exceed wall time; the negative remainder is retained for review "
+            "and is not clamped"
+        )
+    else:
+        status = "nonnegative"
+        warning = None
+    return {
+        "wall_total_seconds": wall,
+        "measured_component_seconds": components,
+        "unattributed_remainder_seconds": remainder,
+        "unattributed_remainder_status": status,
+        "unattributed_remainder_warning": warning,
+    }
+
+
+def _raw_attribution_block(raw: Mapping[str, Any], expected_index: int) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"cache attribution block {expected_index} is not an object")
+    if "timings" in raw:
+        timing_source = raw.get("timings")
+        if not isinstance(timing_source, Mapping):
+            raise ValueError(f"cache attribution block {expected_index} timings are not an object")
+    else:
+        timing_source = raw
+    block_index = raw.get("block_index")
+    if type(block_index) is not int or block_index != expected_index:
+        raise ValueError(f"cache attribution block ordering is not exactly 0..49 at {expected_index}")
+    path = raw.get("path")
+    filename = raw.get("sidecar_filename") or (Path(str(path)).name if path is not None else None)
+    expected_filename = f"block-{expected_index:03d}.safetensors"
+    if filename is not None and Path(str(filename)).name != expected_filename:
+        raise ValueError(f"cache attribution block {expected_index} sidecar identity is invalid")
+
+    def direct_or_alias(field: str, *aliases: str) -> float | None:
+        if field in timing_source:
+            return _timing_seconds(timing_source[field], f"block-{expected_index}.{field}")
+        for alias in aliases:
+            if alias in timing_source:
+                return _timing_seconds(timing_source[alias], f"block-{expected_index}.{alias}")
+        return None
+
+    sidecar_io = direct_or_alias(
+        "sidecar_io_and_reconstruction_seconds",
+        "elapsed_sidecar_io_and_reconstruction_seconds",
+    )
+    projection_compute = direct_or_alias(
+        "projection_compute_seconds",
+        "elapsed_projection_compute_seconds",
+    )
+    sidecar_materialization = direct_or_alias(
+        "sidecar_materialization_seconds",
+        "elapsed_sidecar_materialization_seconds",
+    )
+    projection_materialization = direct_or_alias(
+        "projection_materialization_seconds",
+        "elapsed_projection_materialization_seconds",
+    )
+    modulation_materialization = direct_or_alias(
+        "modulation_materialization_seconds",
+        "elapsed_modulation_materialization_seconds",
+    )
+    materialization = direct_or_alias("materialization_evaluation_seconds")
+    if materialization is None:
+        materialization_parts = (
+            sidecar_materialization,
+            projection_materialization,
+            modulation_materialization,
+        )
+        if any(part is None for part in materialization_parts):
+            raise ValueError(f"cache attribution block {expected_index} is missing materialization boundaries")
+        materialization = math.fsum(part for part in materialization_parts if part is not None)
+    if sidecar_io is None or projection_compute is None:
+        raise ValueError(f"cache attribution block {expected_index} is missing sidecar or projection timing")
+    assembly = direct_or_alias(
+        "cache_entry_assembly_bookkeeping_seconds",
+        "elapsed_cache_entry_assembly_bookkeeping_seconds",
+    )
+    release = direct_or_alias("release_purge_seconds", "elapsed_release_purge_seconds")
+    total = direct_or_alias(
+        ATTRIBUTION_TOTAL_FIELD,
+        "elapsed_seconds",
+    )
+    if assembly is None or release is None or total is None:
+        raise ValueError(f"cache attribution block {expected_index} is missing assembly, release, or total timing")
+    return {
+        "block_index": expected_index,
+        "sidecar_filename": expected_filename,
+        "sidecar_io_and_reconstruction_seconds": sidecar_io,
+        "projection_compute_seconds": projection_compute,
+        "materialization_evaluation_seconds": materialization,
+        "cache_entry_assembly_bookkeeping_seconds": assembly,
+        "release_purge_seconds": release,
+        ATTRIBUTION_TOTAL_FIELD: total,
+    }
+
+
+def build_cache_session_attribution(
+    stats: Any,
+    *,
+    session_index: int,
+    wall_clock_seconds: float | None = None,
+    sidecar_opens: int = EXPECTED_BLOCK_COUNT,
+    sidecar_releases: int = EXPECTED_BLOCK_COUNT,
+    block_events: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normalize one builder receipt into the v0.5e per-session attribution contract."""
+    if type(session_index) is not int or session_index < 0:
+        raise ValueError("cache attribution session index must be a nonnegative integer")
+    normalized_stats = _json_safe(stats)
+    if not isinstance(normalized_stats, Mapping):
+        raise ValueError("cache attribution builder statistics are not an object")
+    raw_blocks = normalized_stats.get("per_block")
+    if not isinstance(raw_blocks, list) or len(raw_blocks) != EXPECTED_BLOCK_COUNT:
+        raise ValueError("cache attribution requires exactly 50 per-block timing records")
+    blocks = [_raw_attribution_block(item, index) for index, item in enumerate(raw_blocks)]
+
+    if block_events is not None:
+        if len(block_events) != EXPECTED_BLOCK_COUNT:
+            raise ValueError("cache attribution event evidence does not contain exactly 50 blocks")
+        for index, event in enumerate(block_events):
+            observed = _raw_attribution_block(event, index)
+            expected = blocks[index]
+            if observed["sidecar_filename"] != expected["sidecar_filename"]:
+                raise ValueError(f"cache attribution event sidecar identity differs at block {index}")
+            for field in (*ATTRIBUTION_COMPONENT_FIELDS, ATTRIBUTION_TOTAL_FIELD):
+                if not math.isclose(observed[field], expected[field], rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(f"cache attribution event timing differs from stats at block {index}: {field}")
+
+    if type(sidecar_opens) is not int or sidecar_opens != EXPECTED_BLOCK_COUNT:
+        raise ValueError("cache attribution sidecar open count is not 50")
+    if type(sidecar_releases) is not int or sidecar_releases != EXPECTED_BLOCK_COUNT:
+        raise ValueError("cache attribution sidecar release count is not 50")
+    component_totals = {
+        field: math.fsum(block[field] for block in blocks)
+        for field in ATTRIBUTION_COMPONENT_FIELDS
+    }
+    raw_overhead = {
+        "shared_timestep_embedding_seconds": normalized_stats.get("elapsed_shared_timestep_embedding_seconds"),
+        "cache_finalize_materialization_seconds": normalized_stats.get("elapsed_cache_finalize_materialization_seconds"),
+    }
+    overhead_totals = {
+        field: _timing_seconds(value, f"session.{field}")
+        for field, value in raw_overhead.items()
+    }
+    measured_components = math.fsum((*component_totals.values(), *overhead_totals.values()))
+    if wall_clock_seconds is None:
+        wall_clock_seconds = normalized_stats.get("elapsed_total_seconds")
+    if wall_clock_seconds is None:
+        raise ValueError("cache attribution wall-clock cache-session timing is unavailable")
+    remainder = calculate_unattributed_remainder(wall_clock_seconds, measured_components)
+    return {
+        "attribution_schema_version": ATTRIBUTION_SCHEMA_VERSION,
+        "session_index": session_index,
+        "blocks_completed": len(blocks),
+        "sidecar_opens": sidecar_opens,
+        "sidecar_releases": sidecar_releases,
+        "sidecar_io_measurement": "combined-with-deserialize-reconstruction",
+        "sidecar_io_seconds": None,
+        "deserialize_reconstruction_seconds": None,
+        "sum_sidecar_io_seconds": None,
+        "sum_deserialize_reconstruction_seconds": None,
+        "blocks": blocks,
+        "component_totals_seconds": component_totals,
+        "session_overhead_seconds": overhead_totals,
+        "sum_sidecar_io_and_reconstruction_seconds": component_totals["sidecar_io_and_reconstruction_seconds"],
+        "sum_sidecar_io_and_deserialize_reconstruction_seconds": component_totals["sidecar_io_and_reconstruction_seconds"],
+        "sum_projection_compute_seconds": component_totals["projection_compute_seconds"],
+        "sum_materialization_evaluation_seconds": component_totals["materialization_evaluation_seconds"],
+        "sum_cache_entry_assembly_bookkeeping_seconds": component_totals["cache_entry_assembly_bookkeeping_seconds"],
+        "sum_bookkeeping_seconds": component_totals["cache_entry_assembly_bookkeeping_seconds"],
+        "sum_release_purge_seconds": component_totals["release_purge_seconds"],
+        "wall_clock_cache_session_total_seconds": remainder["wall_total_seconds"],
+        "measured_component_sum_seconds": remainder["measured_component_seconds"],
+        "unattributed_remainder_seconds": remainder["unattributed_remainder_seconds"],
+        "unattributed_remainder_status": remainder["unattributed_remainder_status"],
+        "unattributed_remainder_warning": remainder["unattributed_remainder_warning"],
+        "category_percentages_of_cache_wall_time": {
+            field: (
+                (component_totals if field in component_totals else overhead_totals)[field]
+                / remainder["wall_total_seconds"] * 100.0
+                if remainder["wall_total_seconds"] > 0.0 else None
+            )
+            for field in ATTRIBUTION_REPORT_CATEGORY_FIELDS
+        },
+        "builder_elapsed_total_seconds": normalized_stats.get("elapsed_total_seconds"),
+        "shared_timestep_embedding_seconds": normalized_stats.get("elapsed_shared_timestep_embedding_seconds"),
+        "cache_finalize_materialization_seconds": normalized_stats.get("elapsed_cache_finalize_materialization_seconds"),
+        "measurement_notes": {
+            "sidecar_io_and_reconstruction_seconds": "loader and tensor validation are one combined boundary; no fabricated open/read split",
+            "projection_compute_seconds": "projection graph/executor boundary before explicit projected-output evaluation",
+            "materialization_evaluation_seconds": "existing per-block MLX evaluations for payload, projection, and modulation tables",
+            "cache_entry_assembly_bookkeeping_seconds": "reshape, table slicing, validation, append, and retained-byte accounting",
+            "release_purge_seconds": "existing per-block reference release and allocator-purge boundary",
+            "shared_timestep_embedding_seconds": "existing shared timestep embedding evaluation before block iteration",
+            "cache_finalize_materialization_seconds": "existing final ModulationCache construction/materialization boundary after block iteration",
+            ATTRIBUTION_TOTAL_FIELD: "block start through existing release/purge completion; telemetry emission is outside the total",
+        },
+    }
+
+
+def build_cache_attribution_aggregate(session_attributions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate ordered session attributions without clamping or inventing missing percentiles."""
+    sessions = [dict(item) for item in session_attributions]
+    if not sessions:
+        return {
+            "attribution_schema_version": ATTRIBUTION_SCHEMA_VERSION,
+            "session_count": 0,
+            "block_count": 0,
+            "sessions": [],
+            "component_totals_seconds": {field: 0.0 for field in ATTRIBUTION_COMPONENT_FIELDS},
+            "session_overhead_seconds": {field: 0.0 for field in ATTRIBUTION_SESSION_OVERHEAD_FIELDS},
+            "cache_wall_total_seconds": 0.0,
+            "unattributed_remainder_seconds": 0.0,
+            "unattributed_remainder_status": "nonnegative",
+            "unattributed_remainder_warning": None,
+        }
+    for index, session in enumerate(sessions):
+        if session.get("session_index") != index:
+            raise ValueError(f"cache attribution session ordering is not exactly 0..{len(sessions) - 1}")
+        if session.get("attribution_schema_version") != ATTRIBUTION_SCHEMA_VERSION:
+            raise ValueError(f"cache attribution session {index} schema version is invalid")
+        if session.get("blocks_completed") != EXPECTED_BLOCK_COUNT:
+            raise ValueError(f"cache attribution session {index} does not contain 50 blocks")
+        if session.get("sidecar_opens") != EXPECTED_BLOCK_COUNT or session.get("sidecar_releases") != EXPECTED_BLOCK_COUNT:
+            raise ValueError(f"cache attribution session {index} sidecar counters changed")
+        if not isinstance(session.get("blocks"), list) or len(session["blocks"]) != EXPECTED_BLOCK_COUNT:
+            raise ValueError(f"cache attribution session {index} block list is incomplete")
+
+    component_totals = {
+        field: math.fsum(float(session["component_totals_seconds"][field]) for session in sessions)
+        for field in ATTRIBUTION_COMPONENT_FIELDS
+    }
+    overhead_totals = {
+        field: math.fsum(float(session["session_overhead_seconds"][field]) for session in sessions)
+        for field in ATTRIBUTION_SESSION_OVERHEAD_FIELDS
+    }
+    cache_wall_total = math.fsum(float(session["wall_clock_cache_session_total_seconds"]) for session in sessions)
+    measured_components = math.fsum((*component_totals.values(), *overhead_totals.values()))
+    remainder = calculate_unattributed_remainder(cache_wall_total, measured_components)
+    all_blocks = [
+        {**block, "session_index": session["session_index"]}
+        for session in sessions
+        for block in session["blocks"]
+    ]
+    if [int(block["block_index"]) for block in all_blocks] != list(range(EXPECTED_BLOCK_COUNT)) * len(sessions):
+        raise ValueError("cache attribution per-block ordering was not retained")
+    per_block_statistics: dict[str, Any] = {}
+    for block_index in range(EXPECTED_BLOCK_COUNT):
+        observations = [block for block in all_blocks if block["block_index"] == block_index]
+        per_block_statistics[str(block_index)] = {
+            "block_index": block_index,
+            "sample_count": len(observations),
+            "total_block_cache_construction": _timing_statistics(
+                [block[ATTRIBUTION_TOTAL_FIELD] for block in observations]
+            ),
+            "category_statistics": {
+                field: _timing_statistics([block[field] for block in observations])
+                for field in ATTRIBUTION_COMPONENT_FIELDS
+            },
+        }
+    session_wall_values = [float(session["wall_clock_cache_session_total_seconds"]) for session in sessions]
+    warm_values = session_wall_values[1:]
+    first_vs_warm = {
+        "first_session_seconds": session_wall_values[0],
+        "warm_session_indices": list(range(1, len(sessions))),
+        "warm_session_count": len(warm_values),
+        "warm_sessions_1_14_mean_seconds": math.fsum(warm_values) / len(warm_values) if warm_values else None,
+        "warm_sessions_1_14_total_seconds": math.fsum(warm_values),
+        "delta_first_minus_warm_mean_seconds": (
+            session_wall_values[0] - math.fsum(warm_values) / len(warm_values) if warm_values else None
+        ),
+    }
+
+    def block_identity(block: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "session_index": block["session_index"],
+            "block_index": block["block_index"],
+            "sidecar_filename": block["sidecar_filename"],
+            "seconds": block[ATTRIBUTION_TOTAL_FIELD],
+        }
+
+    slowest = max(all_blocks, key=lambda item: item[ATTRIBUTION_TOTAL_FIELD])
+    fastest = min(all_blocks, key=lambda item: item[ATTRIBUTION_TOTAL_FIELD])
+    slowest_category = max(ATTRIBUTION_COMPONENT_FIELDS, key=lambda field: slowest[field])
+    fastest_category = min(ATTRIBUTION_COMPONENT_FIELDS, key=lambda field: fastest[field])
+    return {
+        "attribution_schema_version": ATTRIBUTION_SCHEMA_VERSION,
+        "session_count": len(sessions),
+        "block_count": len(all_blocks),
+        "sessions": sessions,
+        "component_totals_seconds": component_totals,
+        "session_overhead_seconds": overhead_totals,
+        "cache_wall_total_seconds": cache_wall_total,
+        "total_cache_wall_time_seconds": cache_wall_total,
+        "category_totals_seconds": {**component_totals, **overhead_totals},
+        "total_block_cache_construction_seconds": math.fsum(block[ATTRIBUTION_TOTAL_FIELD] for block in all_blocks),
+        "category_percentages_of_cache_wall_time": {
+            field: (component_totals if field in component_totals else overhead_totals)[field] / cache_wall_total * 100.0
+            if cache_wall_total > 0.0 else None
+            for field in ATTRIBUTION_REPORT_CATEGORY_FIELDS
+        },
+        "per_block_statistics": per_block_statistics,
+        "per_session_mean_seconds": math.fsum(session_wall_values) / len(session_wall_values),
+        "per_session_wall_clock_statistics": _timing_statistics(session_wall_values),
+        "first_session_vs_sessions_1_14": first_vs_warm,
+        "slowest_block": block_identity(slowest),
+        "slowest_block_category": {"session_index": slowest["session_index"], "block_index": slowest["block_index"], "category": slowest_category, "seconds": slowest[slowest_category]},
+        "fastest_block": block_identity(fastest),
+        "fastest_block_category": {"session_index": fastest["session_index"], "block_index": fastest["block_index"], "category": fastest_category, "seconds": fastest[fastest_category]},
+        "sidecar_opens": sum(int(session["sidecar_opens"]) for session in sessions),
+        "sidecar_releases": sum(int(session["sidecar_releases"]) for session in sessions),
+        "unattributed_remainder_seconds": remainder["unattributed_remainder_seconds"],
+        "unattributed_remainder_status": remainder["unattributed_remainder_status"],
+        "unattributed_remainder_warning": remainder["unattributed_remainder_warning"],
+        "measurement_notes": sessions[0].get("measurement_notes", {}),
+    }
+
+
+def validate_cache_attribution(observed: Mapping[str, Any], *, require_full_schedule: bool = True) -> None:
+    if observed.get("attribution_schema_version") != ATTRIBUTION_SCHEMA_VERSION:
+        raise ValueError("cache attribution schema version is invalid")
+    session_count = observed.get("session_count")
+    block_count = observed.get("block_count")
+    expected_sessions = EXPECTED_DENOISING_TRANSITIONS if require_full_schedule else session_count
+    if require_full_schedule and session_count != expected_sessions:
+        raise ValueError("cache attribution requires exactly 15 sessions")
+    if require_full_schedule and block_count != expected_sessions * EXPECTED_BLOCK_COUNT:
+        raise ValueError("cache attribution requires exactly 750 blocks")
+    sessions = observed.get("sessions")
+    if not isinstance(sessions, list) or len(sessions) != session_count:
+        raise ValueError("cache attribution session list does not match its count")
+    expected_component_totals = {field: 0.0 for field in ATTRIBUTION_COMPONENT_FIELDS}
+    expected_overhead_totals = {field: 0.0 for field in ATTRIBUTION_SESSION_OVERHEAD_FIELDS}
+    expected_wall_total = 0.0
+    for index, session in enumerate(sessions):
+        if session.get("session_index") != index:
+            raise ValueError(f"cache attribution session ordering is invalid at {index}")
+        blocks = session.get("blocks")
+        if not isinstance(blocks, list) or len(blocks) != EXPECTED_BLOCK_COUNT:
+            raise ValueError(f"cache attribution session {index} does not retain 50 ordered blocks")
+        for block_index, block in enumerate(blocks):
+            _raw_attribution_block(block, block_index)
+        for field in ATTRIBUTION_COMPONENT_FIELDS:
+            expected = math.fsum(float(block[field]) for block in blocks)
+            actual = float(session["component_totals_seconds"][field])
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(f"cache attribution session {index} component sum changed for {field}")
+            expected_component_totals[field] += actual
+        for field in ATTRIBUTION_SESSION_OVERHEAD_FIELDS:
+            overhead = _timing_seconds(session.get("session_overhead_seconds", {}).get(field), f"session.{field}")
+            expected_overhead_totals[field] += overhead
+        expected_wall_total += float(session["wall_clock_cache_session_total_seconds"])
+        expected_measured = math.fsum((
+            *session["component_totals_seconds"].values(),
+            *session["session_overhead_seconds"].values(),
+        ))
+        if not math.isclose(session["measured_component_sum_seconds"], expected_measured, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"cache attribution session {index} measured component sum changed")
+        remainder = calculate_unattributed_remainder(
+            session["wall_clock_cache_session_total_seconds"],
+            expected_measured,
+        )
+        if not math.isclose(session["unattributed_remainder_seconds"], remainder["unattributed_remainder_seconds"], rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"cache attribution session {index} hides its unattributed remainder")
+    for field, expected in expected_component_totals.items():
+        if not math.isclose(observed["component_totals_seconds"][field], expected, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"cache attribution aggregate sum changed for {field}")
+    for field, expected in expected_overhead_totals.items():
+        if not math.isclose(observed["session_overhead_seconds"][field], expected, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"cache attribution aggregate overhead sum changed for {field}")
+    if not math.isclose(observed["cache_wall_total_seconds"], expected_wall_total, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("cache attribution aggregate wall-clock total changed")
+    aggregate_remainder = calculate_unattributed_remainder(
+        observed["cache_wall_total_seconds"],
+        math.fsum((*expected_component_totals.values(), *expected_overhead_totals.values())),
+    )
+    if not math.isclose(observed["unattributed_remainder_seconds"], aggregate_remainder["unattributed_remainder_seconds"], rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("cache attribution aggregate hides its unattributed remainder")
+
+
 class StreamedCacheSessionProvider:
     """One cache session per transition with observed sidecar lifecycle accounting."""
 
@@ -2441,10 +2905,18 @@ class StreamedCacheSessionProvider:
         self._overlap_violations = 0
         self._active_cache: Any = None
         self._last_released_record: dict[str, Any] | None = None
+        self.telemetry_failures: list[dict[str, Any]] = []
 
     def _emit(self, event: str, details: Mapping[str, Any]) -> None:
         if self.event_sink is not None:
-            self.event_sink(event, details)
+            try:
+                self.event_sink(event, details)
+            except BaseException as exc:
+                failure = {"event": event, "error": error_receipt(exc)}
+                if self.active_record is not None:
+                    self.active_record.setdefault("telemetry_failures", []).append(failure)
+                self.telemetry_failures.append(failure)
+                raise
 
     def _violation(self, record: dict[str, Any], message: str, details: Mapping[str, Any] | None = None) -> None:
         record.setdefault("violations", []).append(message)
@@ -2506,6 +2978,22 @@ class StreamedCacheSessionProvider:
             summary = self._stats_summary(stats)
             record["stats"] = summary
             payload["stats"] = summary
+            payload["attribution_schema_version"] = ATTRIBUTION_SCHEMA_VERSION
+        elif event == ATTRIBUTION_BLOCK_EVENT:
+            block_index = details.get("block_index")
+            if block_index != record["next_attribution_block_index"]:
+                self._violation(
+                    record,
+                    f"cache attribution block ordering violation: got {block_index}, expected {record['next_attribution_block_index']}",
+                    payload,
+                )
+            if record.get("active_sidecar") is not None:
+                self._violation(record, "cache attribution was emitted before sidecar release", payload)
+            normalized = _raw_attribution_block(payload, record["next_attribution_block_index"])
+            record["attribution_blocks"].append(normalized)
+            record["next_attribution_block_index"] += 1
+            payload["attribution_schema_version"] = ATTRIBUTION_SCHEMA_VERSION
+            payload["timings"] = {field: normalized[field] for field in (*ATTRIBUTION_COMPONENT_FIELDS, ATTRIBUTION_TOTAL_FIELD)}
         self._emit(event, payload)
 
     @staticmethod
@@ -2539,6 +3027,8 @@ class StreamedCacheSessionProvider:
             raise ValueError("streamed AdaLN session did not open blocks exactly 0..49")
         if record.get("released_blocks") != list(range(EXPECTED_BLOCK_COUNT)):
             raise ValueError("streamed AdaLN session did not release blocks exactly 0..49")
+        if record.get("attribution_blocks") is None or len(record["attribution_blocks"]) != EXPECTED_BLOCK_COUNT:
+            raise ValueError("streamed AdaLN session did not emit exactly 50 attribution blocks")
         if record.get("sidecar_opens") != EXPECTED_BLOCK_COUNT or record.get("sidecar_releases") != EXPECTED_BLOCK_COUNT:
             raise ValueError("streamed AdaLN session sidecar event totals are not exactly 50")
         return dict(summary)
@@ -2572,9 +3062,12 @@ class StreamedCacheSessionProvider:
             "memory_after_reference_release": None,
             "state_machine_valid": True,
             "next_block_index": 0,
+            "next_attribution_block_index": 0,
             "active_sidecar": None,
             "opened_blocks": [],
             "released_blocks": [],
+            "attribution_blocks": [],
+            "telemetry_failures": [],
             "violations": [],
             "bounded_release_invocations": 0,
             "events": [],
@@ -2584,9 +3077,10 @@ class StreamedCacheSessionProvider:
         self.active_record = record
         self._active_cache = None
         self.last_session_token = token
-        record["events"].append({"event": "session-acquire-start", "step_index": step_index, "cache_session_id": token})
-        self._emit("session-acquire-start", {"step_index": step_index, "cache_session_id": token})
         try:
+            record["events"].append({"event": "session-acquire-start", "step_index": step_index, "cache_session_id": token})
+            self._emit("session-acquire-start", {"step_index": step_index, "cache_session_id": token})
+            cache_started = time.perf_counter()
             value = self.cache_builder(
                 step_index,
                 timestep,
@@ -2596,6 +3090,14 @@ class StreamedCacheSessionProvider:
             self._active_cache = cache
             record["stats"] = self._validate_stats(record, stats)
             record.update({field: record["stats"][field] for field in SESSION_STAT_FIELDS})
+            record["cache_attribution"] = build_cache_session_attribution(
+                record["stats"],
+                session_index=step_index,
+                wall_clock_seconds=time.perf_counter() - cache_started,
+                sidecar_opens=record["sidecar_opens"],
+                sidecar_releases=record["sidecar_releases"],
+                block_events=record["attribution_blocks"],
+            )
             record["dense_temporary_reconstructions"] = int(record["dense_temporary_projection_created"])
             record["status"] = "acquired"
             record["events"].append({"event": "session-acquire-complete", "step_index": step_index, "cache_session_id": token})
@@ -2621,15 +3123,18 @@ class StreamedCacheSessionProvider:
             self.active_record = None
             self._active_cache = None
             self._mark_exception(exc, cleanup_error=cleanup_error, attempted=True)
-            self._emit(
-                "session-failure",
-                {
-                    "step_index": step_index,
-                    "cache_session_id": token,
-                    "failure": error_receipt(exc),
-                    "cleanup_error": error_receipt(cleanup_error),
-                },
-            )
+            try:
+                self._emit(
+                    "session-failure",
+                    {
+                        "step_index": step_index,
+                        "cache_session_id": token,
+                        "failure": error_receipt(exc),
+                        "cleanup_error": error_receipt(cleanup_error),
+                    },
+                )
+            except BaseException:
+                pass
             raise
 
     def release_step(self, step_index: int, cache: Any, *, forward_materialized: bool = True) -> None:
@@ -2728,6 +3233,52 @@ class StreamedCacheSessionProvider:
         record["memory_after_reference_release"] = dict(memory) if isinstance(memory, Mapping) else memory
         record["forward_materialized_before_release"] = bool(forward_materialized)
 
+    def note_cache_construction_wall(self, step_index: int, wall_clock_seconds: float) -> None:
+        record = self.active_record
+        if not self.active or record is None or record.get("step_index") != step_index:
+            raise RuntimeError("cache attribution wall time was not associated with the active session")
+        attribution = record.get("cache_attribution")
+        if not isinstance(attribution, Mapping):
+            raise RuntimeError("cache attribution was unavailable at the cache boundary")
+        updated = build_cache_session_attribution(
+            record["stats"],
+            session_index=step_index,
+            wall_clock_seconds=wall_clock_seconds,
+            sidecar_opens=record["sidecar_opens"],
+            sidecar_releases=record["sidecar_releases"],
+            block_events=record["attribution_blocks"],
+        )
+        record["cache_attribution"] = updated
+        record["events"].append(
+            {
+                "event": ATTRIBUTION_SESSION_EVENT,
+                "step_index": step_index,
+                "cache_session_id": record["cache_session_id"],
+            }
+        )
+        self._emit(
+            ATTRIBUTION_SESSION_EVENT,
+            {
+                "step_index": step_index,
+                "cache_session_id": record["cache_session_id"],
+                "attribution_schema_version": ATTRIBUTION_SCHEMA_VERSION,
+                "wall_clock_cache_session_total_seconds": updated["wall_clock_cache_session_total_seconds"],
+                "component_totals_seconds": updated["component_totals_seconds"],
+                "session_overhead_seconds": updated["session_overhead_seconds"],
+                "measured_component_sum_seconds": updated["measured_component_sum_seconds"],
+                "unattributed_remainder_seconds": updated["unattributed_remainder_seconds"],
+                "unattributed_remainder_status": updated["unattributed_remainder_status"],
+            },
+        )
+
+    def cache_attribution(self) -> dict[str, Any]:
+        sessions = [
+            record["cache_attribution"]
+            for record in self.records
+            if isinstance(record.get("cache_attribution"), Mapping)
+        ]
+        return build_cache_attribution_aggregate(sessions)
+
     def aggregate(self) -> dict[str, Any]:
         return {
             "cache_sessions": len(self.records),
@@ -2754,6 +3305,8 @@ class StreamedCacheSessionProvider:
             "overlap_violations": self._overlap_violations,
             "dense_temporary_reconstructions": sum(record.get("dense_temporary_reconstructions", 0) for record in self.records),
             "open_sidecars_after_cleanup": self._open_sidecars,
+            "telemetry_failure_count": sum(len(record.get("telemetry_failures", [])) for record in self.records),
+            "telemetry_failures": [failure for record in self.records for failure in record.get("telemetry_failures", [])],
             "transformer_forwards": 0,
             "video_scheduler_updates": 0,
             "audio_scheduler_updates": 0,
@@ -2827,6 +3380,8 @@ def validate_lifecycle_totals(observed: Mapping[str, Any]) -> None:
     for key, expected in EXPECTED_LIFECYCLE_TOTALS.items():
         if int(observed.get(key, -1)) != expected:
             raise ValueError(f"streamed AdaLN lifecycle total {key}={observed.get(key)!r}, expected {expected}")
+    if int(observed.get("telemetry_failure_count", 0)) != 0:
+        raise ValueError("streamed AdaLN telemetry failure evidence is present")
 
 
 def _memory_snapshot(mx: Any) -> dict[str, int | None]:
@@ -5423,6 +5978,7 @@ def _base_report(args: argparse.Namespace, paths: Mapping[str, Any]) -> dict[str
         "derived_worker": {},
         "denoising": {},
         "streamed_adaln_lifecycle": {},
+        "cache_attribution": {},
         "final_artifact": {},
         "decoder_phase": {
             "status": "not_started",
@@ -5801,6 +6357,7 @@ def _native_from_packed(video: Any, audio: Any, *, config: Any) -> tuple[Any, An
 def _derived_worker_main(argv: Sequence[str]) -> int:
     args = _derived_worker_parser(argv)
     receipt = _worker_base("derived")
+    receipt["cache_attribution"] = {}
     receipt_path = Path(args.receipt).resolve()
     final_artifact_path = Path(args.final_artifact).resolve()
     final_metadata_path = Path(args.final_artifact_metadata).resolve()
@@ -5933,6 +6490,7 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
         receipt["schedule_contract"] = schedule.receipt()
         receipt["denoising"] = result.receipt()
         receipt["streamed_adaln_lifecycle"] = result.lifecycle
+        receipt["cache_attribution"] = result.cache_attribution
         receipt["memory_telemetry"].update(result.memory_telemetry)
         receipt["timing_telemetry"].update(result.timing_telemetry)
         receipt["completed_stages"].extend(["full-fifteen-transition-denoising-complete", "all-cache-sessions-released"])
@@ -5990,12 +6548,14 @@ def _derived_worker_main(argv: Sequence[str]) -> int:
         cleanup = exc.cleanup_error if isinstance(exc.cleanup_error, BaseException) else None
         receipt["denoising"] = exc.state
         receipt["streamed_adaln_lifecycle"] = exc.state.get("streamed_adaln_lifecycle", {})
+        receipt["cache_attribution"] = exc.state.get("cache_attribution", {})
         receipt["memory_telemetry"].update(exc.state.get("memory_telemetry", {}))
         receipt["timing_telemetry"].update(exc.state.get("timing_telemetry", {}))
     except BaseException as exc:
         primary = exc
         if provider is not None:
             receipt["streamed_adaln_lifecycle"] = provider.aggregate()
+            receipt["cache_attribution"] = provider.cache_attribution()
     finally:
         if mx is not None:
             # Capture evidence and sever the exception graph before the release gate measures
@@ -6778,6 +7338,8 @@ def event_file_summary(path: Path) -> dict[str, Any]:
             "cache_session_count": 0,
             "sidecar_open_event_count": 0,
             "sidecar_release_event_count": 0,
+            "attribution_block_event_count": 0,
+            "attribution_session_event_count": 0,
             "validated_block_pairs": 0,
             "event_file_sha256": None,
         }
@@ -6799,6 +7361,8 @@ def event_file_summary(path: Path) -> dict[str, Any]:
         "cache_session_count": len({record.get("cache_session_id") for record in records if record.get("event") == "session-acquire-start"}),
         "sidecar_open_event_count": sum(record.get("event") == "sidecar_opening" for record in records),
         "sidecar_release_event_count": sum(record.get("event") == "sidecar_released" for record in records),
+        "attribution_block_event_count": sum(record.get("event") == ATTRIBUTION_BLOCK_EVENT for record in records),
+        "attribution_session_event_count": sum(record.get("event") == ATTRIBUTION_SESSION_EVENT for record in records),
         "validated_block_pairs": 0,
         "event_file_sha256": sha256_file(path),
     }
@@ -6821,6 +7385,7 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
         records.append(value)
     sessions: dict[str, dict[str, Any]] = {}
     sidecar_opens = sidecar_releases = validated_pairs = 0
+    attribution_block_events = attribution_session_events = 0
     for record in records:
         event = record["event"]
         session_id = record.get("cache_session_id")
@@ -6841,6 +7406,10 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
                 "opens": 0,
                 "releases": 0,
                 "acquire_complete": False,
+                "next_attribution_block": 0,
+                "attribution_blocks": 0,
+                "attribution_component_totals": {field: 0.0 for field in ATTRIBUTION_COMPONENT_FIELDS},
+                "attribution_complete": False,
                 "release_start": False,
                 "release_complete": False,
             }
@@ -6866,6 +7435,70 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
                 state["release_complete"] = True
             else:
                 raise ValueError("event stream contains a failed cache-session release")
+            continue
+        if event == ATTRIBUTION_BLOCK_EVENT:
+            if not isinstance(session_id, str) or session_id not in sessions:
+                raise ValueError("cache attribution event refers to an unknown cache session")
+            state = sessions[session_id]
+            if record.get("transition_index") != state["transition_index"]:
+                raise ValueError("cache attribution event transition identity does not match its cache session")
+            if state["acquire_complete"] or state["release_start"] or state["active"] is not None:
+                raise ValueError("cache attribution event is outside the cache-acquire interval")
+            if record.get("attribution_schema_version") != ATTRIBUTION_SCHEMA_VERSION:
+                raise ValueError("cache attribution event schema version is invalid")
+            normalized = _raw_attribution_block(record, state["next_attribution_block"])
+            state["next_attribution_block"] += 1
+            state["attribution_blocks"] += 1
+            for field in ATTRIBUTION_COMPONENT_FIELDS:
+                state["attribution_component_totals"][field] += normalized[field]
+            attribution_block_events += 1
+            continue
+        if event == ATTRIBUTION_SESSION_EVENT:
+            if not isinstance(session_id, str) or session_id not in sessions:
+                raise ValueError("cache attribution session event refers to an unknown cache session")
+            state = sessions[session_id]
+            if record.get("transition_index") != state["transition_index"]:
+                raise ValueError("cache attribution session transition identity does not match its cache session")
+            if not state["acquire_complete"] or state["release_start"] or state["attribution_complete"]:
+                raise ValueError("cache attribution session event is out of order or duplicated")
+            if state["attribution_blocks"] != EXPECTED_BLOCK_COUNT:
+                raise ValueError("cache attribution session event is missing block timing evidence")
+            if record.get("attribution_schema_version") != ATTRIBUTION_SCHEMA_VERSION:
+                raise ValueError("cache attribution session schema version is invalid")
+            totals = record.get("component_totals_seconds")
+            if not isinstance(totals, Mapping) or set(totals) != set(ATTRIBUTION_COMPONENT_FIELDS):
+                raise ValueError("cache attribution session component totals are incomplete")
+            for field in ATTRIBUTION_COMPONENT_FIELDS:
+                observed_total = _timing_seconds(totals.get(field), f"session.{field}")
+                if not math.isclose(observed_total, state["attribution_component_totals"][field], rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(f"cache attribution session total differs from block events for {field}")
+            overhead = record.get("session_overhead_seconds")
+            if not isinstance(overhead, Mapping) or set(overhead) != set(ATTRIBUTION_SESSION_OVERHEAD_FIELDS):
+                raise ValueError("cache attribution session overhead totals are incomplete")
+            overhead_total = math.fsum(
+                _timing_seconds(overhead.get(field), f"session.{field}")
+                for field in ATTRIBUTION_SESSION_OVERHEAD_FIELDS
+            )
+            wall = _timing_seconds(record.get("wall_clock_cache_session_total_seconds"), "session.wall_total")
+            measured = _timing_seconds(record.get("measured_component_sum_seconds"), "session.measured_components")
+            expected_measured = math.fsum((*state["attribution_component_totals"].values(), overhead_total))
+            if not math.isclose(measured, expected_measured, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("cache attribution measured component sum differs from block events")
+            remainder = calculate_unattributed_remainder(wall, measured)
+            observed_remainder = record.get("unattributed_remainder_seconds")
+            if isinstance(observed_remainder, bool) or not isinstance(observed_remainder, (int, float)) or not math.isfinite(float(observed_remainder)):
+                raise ValueError("cache attribution session remainder is not finite")
+            if not math.isclose(
+                float(observed_remainder),
+                remainder["unattributed_remainder_seconds"],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("cache attribution session unattributed remainder is stale")
+            if record.get("unattributed_remainder_status") != remainder["unattributed_remainder_status"]:
+                raise ValueError("cache attribution session remainder status is stale")
+            state["attribution_complete"] = True
+            attribution_session_events += 1
             continue
         if event not in {"sidecar_opening", "sidecar_released"}:
             continue
@@ -6911,7 +7544,9 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
             raise ValueError("event stream contains an incomplete sidecar session")
         if state["opens"] != EXPECTED_BLOCK_COUNT or state["releases"] != EXPECTED_BLOCK_COUNT:
             raise ValueError("event stream session does not contain exactly 50 open/release pairs")
-        if not state["acquire_complete"] or not state["release_start"] or not state["release_complete"]:
+        if state["attribution_blocks"] != EXPECTED_BLOCK_COUNT or state["next_attribution_block"] != EXPECTED_BLOCK_COUNT:
+            raise ValueError("event stream session does not contain exactly 50 attribution blocks")
+        if not state["acquire_complete"] or not state["attribution_complete"] or not state["release_start"] or not state["release_complete"]:
             raise ValueError("event stream session lifecycle boundaries are incomplete")
     summary = event_file_summary(path)
     summary.update(
@@ -6919,6 +7554,8 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
             "cache_session_count": len(sessions),
             "sidecar_open_event_count": sidecar_opens,
             "sidecar_release_event_count": sidecar_releases,
+            "attribution_block_event_count": attribution_block_events,
+            "attribution_session_event_count": attribution_session_events,
             "validated_block_pairs": validated_pairs,
         }
     )
@@ -6927,6 +7564,8 @@ def validate_event_stream(path: Path) -> dict[str, Any]:
         or sidecar_opens != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
         or sidecar_releases != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
         or validated_pairs != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
+        or attribution_block_events != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
+        or attribution_session_events != EXPECTED_DENOISING_TRANSITIONS
     ):
         raise ValueError("event stream does not contain exactly 15 sessions and 750 validated block pairs")
     return summary
@@ -7155,6 +7794,7 @@ def _parent_run(
     report["timing_telemetry"]["derived"] = derived_receipt.get("timing_telemetry", {})
     report["denoising"] = derived_receipt.get("denoising", {})
     report["streamed_adaln_lifecycle"] = derived_receipt.get("streamed_adaln_lifecycle", {})
+    report["cache_attribution"] = derived_receipt.get("cache_attribution", {})
     if not derived_receipt.get("worker_receipt_valid"):
         raise PhaseFailure("derived-worker", derived_receipt.get("primary_error") or "derived worker boundary failed", cleanup=derived_receipt.get("cleanup_error"), details={"child": derived_receipt}, cleanup_attempted=True)
     validate_worker_boundary(derived_receipt, identity="derived")
@@ -7398,27 +8038,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_report(report: Mapping[str, Any]) -> None:
     if set(report) != REPORT_KEYS:
-        raise ValueError(f"v0.5d report schema mismatch: missing={sorted(REPORT_KEYS - set(report))}, unexpected={sorted(set(report) - REPORT_KEYS)}")
+        raise ValueError(f"v0.5e report schema mismatch: missing={sorted(REPORT_KEYS - set(report))}, unexpected={sorted(set(report) - REPORT_KEYS)}")
     if report.get("schema_version") != SCHEMA_VERSION or report.get("probe_identity") != PROBE_FORMAT:
-        raise ValueError("v0.5d report identity mismatch")
+        raise ValueError("v0.5e report identity mismatch")
     if type(report.get("functional_success")) is not bool:
-        raise ValueError("v0.5d report functional_success must be a literal boolean")
+        raise ValueError("v0.5e report functional_success must be a literal boolean")
     host = report.get("host_contention")
     if not isinstance(host, Mapping):
-        raise ValueError("v0.5d report is missing host-contention evidence")
+        raise ValueError("v0.5e report is missing host-contention evidence")
     for key in ("operator_declared_uncontended", "process_snapshot_captured", "canonical_timing_eligible"):
         if type(host.get(key)) is not bool:
-            raise ValueError(f"v0.5d host-contention field {key} must be a literal boolean")
+            raise ValueError(f"v0.5e host-contention field {key} must be a literal boolean")
     conflicts = host.get("known_conflicting_processes")
     if not isinstance(conflicts, list) or not all(isinstance(item, Mapping) for item in conflicts):
-        raise ValueError("v0.5d known_conflicting_processes must be a structured list")
+        raise ValueError("v0.5e known_conflicting_processes must be a structured list")
     snapshot = host.get("process_snapshot")
     if host.get("process_snapshot_captured") is True and (
         not isinstance(snapshot, Mapping) or snapshot.get("capture_success") is not True
     ):
-        raise ValueError("v0.5d process snapshot capture claim is not backed by snapshot evidence")
+        raise ValueError("v0.5e process snapshot capture claim is not backed by snapshot evidence")
     if isinstance(snapshot, Mapping) and snapshot.get("known_conflicting_processes") != conflicts:
-        raise ValueError("v0.5d known conflict list differs from its process snapshot")
+        raise ValueError("v0.5e known conflict list differs from its process snapshot")
     expected_eligibility = canonical_timing_eligibility(
         functional_success=report.get("functional_success") is True,
         operator_declared_uncontended=host.get("operator_declared_uncontended") is True,
@@ -7426,22 +8066,25 @@ def validate_report(report: Mapping[str, Any]) -> None:
         known_conflicting_processes=conflicts,
     )
     if host.get("canonical_timing_eligible") is not expected_eligibility["canonical_timing_eligible"]:
-        raise ValueError("v0.5d canonical timing eligibility does not match the exact four-gate formula")
+        raise ValueError("v0.5e canonical timing eligibility does not match the exact four-gate formula")
     if host.get("canonical_timing_ineligibility_reasons") != expected_eligibility["canonical_timing_ineligibility_reasons"]:
-        raise ValueError("v0.5d canonical timing ineligibility reasons are stale")
+        raise ValueError("v0.5e canonical timing ineligibility reasons are stale")
     decoder_order = report.get("decoder_phase_order")
     if not isinstance(decoder_order, Mapping) or decoder_order.get("valid") is not True:
-        raise ValueError("v0.5d report is missing a valid decoder phase order receipt")
+        raise ValueError("v0.5e report is missing a valid decoder phase order receipt")
     validate_decoder_phase_order(decoder_order)
     for identity in ("video", "audio"):
         section = report.get(f"{identity}_decoder")
         if not isinstance(section, Mapping) or section.get("status") not in DECODER_STATUSES:
-            raise ValueError(f"v0.5d report has an invalid {identity} decoder status")
+            raise ValueError(f"v0.5e report has an invalid {identity} decoder status")
     if report.get("status") == "success":
         if report.get("run_state") != "successful" or report.get("functional_success") is not True or report.get("failure") is not None:
             raise ValueError("successful report must have run_state=successful and failure=null")
         validate_schedule_contract(report.get("schedule_contract", {}))
         validate_lifecycle_totals(report.get("streamed_adaln_lifecycle", {}))
+        validate_cache_attribution(report.get("cache_attribution", {}))
+        if report.get("derived_worker", {}).get("cache_attribution") != report.get("cache_attribution"):
+            raise ValueError("successful report cache attribution differs from the derived-worker receipt")
         validate_final_artifact(report.get("final_artifact", {}))
         validate_worker_boundary(report.get("conditioning_worker", {}), identity="conditioning")
         validate_worker_boundary(report.get("derived_worker", {}), identity="derived")
@@ -7570,6 +8213,8 @@ def validate_report(report: Mapping[str, Any]) -> None:
             or report.get("cache_session_count") != EXPECTED_DENOISING_TRANSITIONS
             or report.get("sidecar_open_event_count") != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
             or report.get("sidecar_release_event_count") != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
+            or report.get("streamed_adaln_lifecycle", {}).get("attribution_block_event_count") != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
+            or report.get("streamed_adaln_lifecycle", {}).get("attribution_session_event_count") != EXPECTED_DENOISING_TRANSITIONS
             or report.get("validated_block_pairs") != EXPECTED_DENOISING_TRANSITIONS * EXPECTED_BLOCK_COUNT
             or not report.get("event_file_sha256")
         ):

@@ -90,6 +90,13 @@ class StreamedAdaLNBlockStats:
     cumulative_retained_cache_bytes: int
     active_after_release_and_purge: int | None
     allocator_cache_after_release_and_purge: int | None
+    elapsed_sidecar_io_and_reconstruction_seconds: float
+    elapsed_sidecar_materialization_seconds: float
+    elapsed_projection_compute_seconds: float
+    elapsed_projection_materialization_seconds: float
+    elapsed_modulation_materialization_seconds: float
+    elapsed_cache_entry_assembly_bookkeeping_seconds: float
+    elapsed_release_purge_seconds: float
     elapsed_seconds: float
 
 
@@ -112,9 +119,16 @@ class StreamedAdaLNBuildStats:
     elapsed_total_seconds: float
     elapsed_shared_timestep_embedding_seconds: float
     elapsed_sidecar_load_seconds: float
+    elapsed_sidecar_io_and_reconstruction_seconds: float
+    elapsed_sidecar_materialization_seconds: float
     elapsed_projection_seconds: float
+    elapsed_projection_compute_seconds: float
+    elapsed_projection_materialization_seconds: float
     elapsed_materialization_seconds: float
+    elapsed_modulation_materialization_seconds: float
+    elapsed_cache_entry_assembly_bookkeeping_seconds: float
     elapsed_release_purge_seconds: float
+    elapsed_cache_finalize_materialization_seconds: float
     successful_payload_opens: int
     completed_payload_releases: int
     sidecar_overlap_observed: bool
@@ -404,6 +418,13 @@ def build_streamed_modulation_cache(
     opened: list[str] = []
     sidecar_bytes = 0
     load_elapsed = projection_elapsed = materialization_elapsed = release_elapsed = 0.0
+    sidecar_io_and_reconstruction_elapsed = 0.0
+    sidecar_materialization_elapsed = 0.0
+    projection_compute_elapsed = 0.0
+    projection_materialization_elapsed = 0.0
+    modulation_materialization_elapsed = 0.0
+    assembly_bookkeeping_elapsed = 0.0
+    cache_finalize_materialization_elapsed = 0.0
     purge_available = allocator_purge is not None or callable(getattr(mx, "clear_cache", None))
     lifecycle = _SidecarLifecycle()
     current_block_index: int | None = None
@@ -444,6 +465,13 @@ def build_streamed_modulation_cache(
             table = None
             after_modulation = None
             block_failed = False
+            block_sidecar_io_and_reconstruction_elapsed = 0.0
+            block_sidecar_materialization_elapsed = 0.0
+            block_projection_compute_elapsed = 0.0
+            block_projection_materialization_elapsed = 0.0
+            block_modulation_materialization_elapsed = 0.0
+            block_assembly_bookkeeping_elapsed = 0.0
+            block_release_purge_elapsed = 0.0
             try:
                 load_started = time.perf_counter()
                 loaded = loader(str(path))
@@ -454,13 +482,22 @@ def build_streamed_modulation_cache(
                 packed_weight, scales, quantization_biases, learned_bias = _validate_sidecar_payload(
                     block_index, path, payload, tensor_manifest, projection
                 )
+                block_sidecar_io_and_reconstruction_elapsed = time.perf_counter() - load_started
+                sidecar_io_and_reconstruction_elapsed += block_sidecar_io_and_reconstruction_elapsed
+
+                sidecar_materialization_started = time.perf_counter()
                 mx.eval(packed_weight, scales, quantization_biases, learned_bias)
-                load_elapsed += time.perf_counter() - load_started
+                block_sidecar_materialization_elapsed = time.perf_counter() - sidecar_materialization_started
+                sidecar_materialization_elapsed += block_sidecar_materialization_elapsed
+                load_elapsed += (
+                    block_sidecar_io_and_reconstruction_elapsed
+                    + block_sidecar_materialization_elapsed
+                )
                 after_sidecar = _snapshot()
                 _emit("sidecar_materialized", {"block_index": block_index, "path": str(path), "memory": after_sidecar})
                 sidecar_bytes += sum(int(tensor.nbytes) for tensor in payload.values())
 
-                projection_started = time.perf_counter()
+                projection_compute_started = time.perf_counter()
                 activation = adaln_activation.astype(scales.dtype)
                 projected = executor(activation, packed_weight, scales, quantization_biases, learned_bias)
                 expected_projected_shape = (len(values), int(dit.config.adaln_out_features))
@@ -468,10 +505,19 @@ def build_streamed_modulation_cache(
                     raise ValueError(
                         f"projection returned shape {projected.shape}; expected {expected_projected_shape}"
                     )
-                mx.eval(projected)
-                projection_elapsed += time.perf_counter() - projection_started
+                block_projection_compute_elapsed = time.perf_counter() - projection_compute_started
+                projection_compute_elapsed += block_projection_compute_elapsed
 
-                materialization_started = time.perf_counter()
+                projection_materialization_started = time.perf_counter()
+                mx.eval(projected)
+                block_projection_materialization_elapsed = time.perf_counter() - projection_materialization_started
+                projection_materialization_elapsed += block_projection_materialization_elapsed
+                projection_elapsed += (
+                    block_projection_compute_elapsed
+                    + block_projection_materialization_elapsed
+                )
+
+                assembly_started = time.perf_counter()
                 reshaped = projected.reshape(len(values) * MODALITY_NUM, 6 * int(dit.config.hidden_size))
                 table = tuple(
                     reshaped[..., offset * int(dit.config.hidden_size):(offset + 1) * int(dit.config.hidden_size)].astype(dtype)
@@ -482,14 +528,25 @@ def build_streamed_modulation_cache(
                     raise ValueError(f"block {block_index} produced an invalid six-array modulation table")
                 if any(array.dtype not in {mx.float16, mx.bfloat16, mx.float32} for array in table):
                     raise ValueError(f"block {block_index} produced a non-floating modulation table")
+                assembly_before_materialization_elapsed = time.perf_counter() - assembly_started
+
+                modulation_materialization_started = time.perf_counter()
                 mx.eval(*table)
                 for array in table:
                     _materialize_finite(array)
+                block_modulation_materialization_elapsed = time.perf_counter() - modulation_materialization_started
+                modulation_materialization_elapsed += block_modulation_materialization_elapsed
+                materialization_elapsed += block_modulation_materialization_elapsed
                 after_modulation = _snapshot()
-                materialization_elapsed += time.perf_counter() - materialization_started
+                tables_started = time.perf_counter()
                 tables.append(table)
                 table = None
                 cumulative_bytes = sum(int(array.nbytes) for prior in tables for array in prior)
+                block_assembly_bookkeeping_elapsed = (
+                    assembly_before_materialization_elapsed
+                    + time.perf_counter() - tables_started
+                )
+                assembly_bookkeeping_elapsed += block_assembly_bookkeeping_elapsed
             except Exception as exc:
                 block_failed = True
                 raise ValueError(f"block {block_index} sidecar {path}: {exc}") from exc
@@ -517,7 +574,8 @@ def build_streamed_modulation_cache(
                     release_started = time.perf_counter()
                     gc.collect()
                     purge_succeeded = purge_cache()
-                    release_elapsed += time.perf_counter() - release_started
+                    block_release_purge_elapsed = time.perf_counter() - release_started
+                    release_elapsed += block_release_purge_elapsed
                     after_release = _snapshot()
                     _emit("sidecar_released", {
                         "block_index": block_index,
@@ -530,6 +588,22 @@ def build_streamed_modulation_cache(
                         "completed_payload_releases": lifecycle.completed_payload_releases,
                     })
             _require(after_modulation is not None, f"block {block_index} modulation materialization did not complete")
+            block_elapsed = time.perf_counter() - block_started
+            _emit("cache_block_timing", {
+                "block_index": block_index,
+                "path": str(path),
+                "attribution_schema_version": 1,
+                "timings": {
+                    "sidecar_io_and_reconstruction_seconds": block_sidecar_io_and_reconstruction_elapsed,
+                    "sidecar_materialization_seconds": block_sidecar_materialization_elapsed,
+                    "projection_compute_seconds": block_projection_compute_elapsed,
+                    "projection_materialization_seconds": block_projection_materialization_elapsed,
+                    "modulation_materialization_seconds": block_modulation_materialization_elapsed,
+                    "cache_entry_assembly_bookkeeping_seconds": block_assembly_bookkeeping_elapsed,
+                    "release_purge_seconds": block_release_purge_elapsed,
+                    "total_block_cache_construction_seconds": block_elapsed,
+                },
+            })
             per_block.append(StreamedAdaLNBlockStats(
                 block_index=block_index,
                 sidecar_filename=path.name,
@@ -547,14 +621,23 @@ def build_streamed_modulation_cache(
                 cumulative_retained_cache_bytes=cumulative_bytes,
                 active_after_release_and_purge=after_release.active,
                 allocator_cache_after_release_and_purge=after_release.allocator_cache,
-                elapsed_seconds=time.perf_counter() - block_started,
+                elapsed_sidecar_io_and_reconstruction_seconds=block_sidecar_io_and_reconstruction_elapsed,
+                elapsed_sidecar_materialization_seconds=block_sidecar_materialization_elapsed,
+                elapsed_projection_compute_seconds=block_projection_compute_elapsed,
+                elapsed_projection_materialization_seconds=block_projection_materialization_elapsed,
+                elapsed_modulation_materialization_seconds=block_modulation_materialization_elapsed,
+                elapsed_cache_entry_assembly_bookkeeping_seconds=block_assembly_bookkeeping_elapsed,
+                elapsed_release_purge_seconds=block_release_purge_elapsed,
+                elapsed_seconds=block_elapsed,
             ))
             current_block_index = None
             current_sidecar_path = None
 
+        cache_finalize_started = time.perf_counter()
         cache = ModulationCache(tables, timesteps)
         cache.materialize()
         final_cache_bytes = cache.nbytes()
+        cache_finalize_materialization_elapsed = time.perf_counter() - cache_finalize_started
         _require(len(tables) == block_count, f"streamed AdaLN cache completed {len(tables)} of {block_count} blocks")
         increases = [
             max(0, block.active_after_modulation_materialization - block.active_before_load)
@@ -572,9 +655,16 @@ def build_streamed_modulation_cache(
             elapsed_total_seconds=time.perf_counter() - started,
             elapsed_shared_timestep_embedding_seconds=shared_elapsed,
             elapsed_sidecar_load_seconds=load_elapsed,
+            elapsed_sidecar_io_and_reconstruction_seconds=sidecar_io_and_reconstruction_elapsed,
+            elapsed_sidecar_materialization_seconds=sidecar_materialization_elapsed,
             elapsed_projection_seconds=projection_elapsed,
+            elapsed_projection_compute_seconds=projection_compute_elapsed,
+            elapsed_projection_materialization_seconds=projection_materialization_elapsed,
             elapsed_materialization_seconds=materialization_elapsed,
+            elapsed_modulation_materialization_seconds=modulation_materialization_elapsed,
+            elapsed_cache_entry_assembly_bookkeeping_seconds=assembly_bookkeeping_elapsed,
             elapsed_release_purge_seconds=release_elapsed,
+            elapsed_cache_finalize_materialization_seconds=cache_finalize_materialization_elapsed,
             successful_payload_opens=lifecycle.successful_payload_opens,
             completed_payload_releases=lifecycle.completed_payload_releases,
             sidecar_overlap_observed=lifecycle.overlap_observed,
@@ -607,7 +697,7 @@ def build_streamed_modulation_cache(
             ),
             dense_temporary_projection_created=(False if projection_executor is None else None),
         )
-        _emit("cache_completed", {"stats": stats, "memory": _snapshot()})
+        _emit("cache_completed", {"stats": stats, "attribution_schema_version": 1, "memory": _snapshot()})
         return cache, stats
     except Exception as exc:
         failure_block = current_block_index

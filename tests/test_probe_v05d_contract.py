@@ -448,17 +448,20 @@ class FakeCacheProvider(probe.StreamedCacheSessionProvider):
                 path = f"block-{block_index:03d}.safetensors"
                 telemetry("sidecar_opening", {"block_index": block_index, "path": path})
                 telemetry("sidecar_released", {"block_index": block_index, "path": path})
-            return FakeCache(), {
-                "blocks_completed": probe.EXPECTED_BLOCK_COUNT,
-                "sidecar_files_opened": probe.EXPECTED_BLOCK_COUNT,
-                "unique_sidecar_files_opened": probe.EXPECTED_BLOCK_COUNT,
-                "successful_payload_opens": probe.EXPECTED_BLOCK_COUNT,
-                "completed_payload_releases": probe.EXPECTED_BLOCK_COUNT,
-                "every_sidecar_released_before_next_opened": True,
-                "sidecar_overlap_observed": False,
-                "next_sidecar_opened_before_previous_release": False,
-                "dense_temporary_projection_created": False,
-            }
+                timing = fake_attribution_block(block_index)
+                telemetry(
+                    probe.ATTRIBUTION_BLOCK_EVENT,
+                    {
+                        "block_index": block_index,
+                        "path": path,
+                        "attribution_schema_version": probe.ATTRIBUTION_SCHEMA_VERSION,
+                        "timings": {
+                            field: timing[field]
+                            for field in (*probe.ATTRIBUTION_COMPONENT_FIELDS, probe.ATTRIBUTION_TOTAL_FIELD)
+                        },
+                    },
+                )
+            return FakeCache(), full_builder_stats()
 
         def cleanup(step_index, _cache):
             self.test_events.append(("cache-release", step_index))
@@ -582,8 +585,40 @@ def valid_final_artifact():
     return artifact, {"final_video_native": video, "final_audio_native": audio}
 
 
+def fake_attribution_block(index: int, *, total_seconds: float = 0.02):
+    return {
+        "block_index": index,
+        "sidecar_filename": f"block-{index:03d}.safetensors",
+        "sidecar_io_and_reconstruction_seconds": 0.001,
+        "sidecar_materialization_seconds": 0.001,
+        "projection_compute_seconds": 0.002,
+        "projection_materialization_seconds": 0.001,
+        "modulation_materialization_seconds": 0.001,
+        "materialization_evaluation_seconds": 0.003,
+        "cache_entry_assembly_bookkeeping_seconds": 0.003,
+        "release_purge_seconds": 0.002,
+        "total_block_cache_construction_seconds": total_seconds,
+        "elapsed_sidecar_io_and_reconstruction_seconds": 0.001,
+        "elapsed_sidecar_materialization_seconds": 0.001,
+        "elapsed_projection_compute_seconds": 0.002,
+        "elapsed_projection_materialization_seconds": 0.001,
+        "elapsed_modulation_materialization_seconds": 0.001,
+        "elapsed_cache_entry_assembly_bookkeeping_seconds": 0.003,
+        "elapsed_release_purge_seconds": 0.002,
+        "elapsed_seconds": total_seconds,
+    }
+
+
 def full_builder_stats(**overrides):
     stats = {**probe.SESSION_STAT_FIELDS}
+    stats.update(
+        {
+            "per_block": [fake_attribution_block(index) for index in range(probe.EXPECTED_BLOCK_COUNT)],
+            "elapsed_total_seconds": 1.0,
+            "elapsed_shared_timestep_embedding_seconds": 0.01,
+            "elapsed_cache_finalize_materialization_seconds": 0.01,
+        }
+    )
     stats.update(overrides)
     return stats
 
@@ -591,7 +626,19 @@ def full_builder_stats(**overrides):
 def provider_for_sidecar_events(events, *, stats=None, cleanup_hook=True):
     def builder(step_index, _timestep, telemetry):
         for event, block_index, path in events:
-            telemetry(event, {"block_index": block_index, "path": path})
+            details = {"block_index": block_index, "path": path}
+            if event == probe.ATTRIBUTION_BLOCK_EVENT:
+                timing = fake_attribution_block(block_index)
+                details.update(
+                    {
+                        "attribution_schema_version": probe.ATTRIBUTION_SCHEMA_VERSION,
+                        "timings": {
+                            field: timing[field]
+                            for field in (*probe.ATTRIBUTION_COMPONENT_FIELDS, probe.ATTRIBUTION_TOTAL_FIELD)
+                        },
+                    }
+                )
+            telemetry(event, details)
         return FakeCache(), stats or full_builder_stats()
 
     hook = (lambda _step, _cache: None) if cleanup_hook else None
@@ -602,7 +649,13 @@ def valid_sidecar_events():
     events = []
     for index in range(probe.EXPECTED_BLOCK_COUNT):
         path = f"block-{index:03d}.safetensors"
-        events.extend([("sidecar_opening", index, path), ("sidecar_released", index, path)])
+        events.extend(
+            [
+                ("sidecar_opening", index, path),
+                ("sidecar_released", index, path),
+                (probe.ATTRIBUTION_BLOCK_EVENT, index, path),
+            ]
+        )
     return events
 
 
@@ -616,7 +669,37 @@ def write_valid_event_stream(path: Path):
             sidecar = {**details, "block_index": block_index, "path": f"block-{block_index:03d}.safetensors"}
             writer("sidecar_opening", sidecar)
             writer("sidecar_released", sidecar)
+            timing = fake_attribution_block(block_index)
+            writer(
+                probe.ATTRIBUTION_BLOCK_EVENT,
+                {
+                    **sidecar,
+                    "attribution_schema_version": probe.ATTRIBUTION_SCHEMA_VERSION,
+                    "timings": {
+                        field: timing[field]
+                        for field in (*probe.ATTRIBUTION_COMPONENT_FIELDS, probe.ATTRIBUTION_TOTAL_FIELD)
+                    },
+                },
+            )
         writer("session-acquire-complete", details)
+        attribution = probe.build_cache_session_attribution(
+            full_builder_stats(),
+            session_index=transition_index,
+            wall_clock_seconds=1.0,
+        )
+        writer(
+            probe.ATTRIBUTION_SESSION_EVENT,
+            {
+                **details,
+                "attribution_schema_version": probe.ATTRIBUTION_SCHEMA_VERSION,
+                "wall_clock_cache_session_total_seconds": attribution["wall_clock_cache_session_total_seconds"],
+                "component_totals_seconds": attribution["component_totals_seconds"],
+                "session_overhead_seconds": attribution["session_overhead_seconds"],
+                "measured_component_sum_seconds": attribution["measured_component_sum_seconds"],
+                "unattributed_remainder_seconds": attribution["unattributed_remainder_seconds"],
+                "unattributed_remainder_status": attribution["unattributed_remainder_status"],
+            },
+        )
         writer("session-release-start", details)
         writer("session-release-complete", details)
     return writer
@@ -1102,6 +1185,155 @@ class ProbeV05DContractTests(unittest.TestCase):
         cache = provider.cache_for_step(0, np.asarray([0.0], dtype=np.float32))
         provider.release_step(0, cache)
         self.assertEqual(provider.aggregate()["dense_temporary_reconstructions"], 0)
+
+    def test_fake_cache_session_emits_all_attribution_fields_for_all_fifty_blocks(self):
+        provider = FakeCacheProvider()
+        cache = provider.cache_for_step(0, np.asarray([0.0], dtype=np.float32))
+        provider.release_step(0, cache)
+        attribution = provider.records[0]["cache_attribution"]
+        self.assertEqual(attribution["attribution_schema_version"], probe.ATTRIBUTION_SCHEMA_VERSION)
+        self.assertEqual(len(attribution["blocks"]), probe.EXPECTED_BLOCK_COUNT)
+        for index, block in enumerate(attribution["blocks"]):
+            self.assertEqual(block["block_index"], index)
+            for field in (*probe.ATTRIBUTION_COMPONENT_FIELDS, probe.ATTRIBUTION_TOTAL_FIELD):
+                self.assertIn(field, block)
+                self.assertGreaterEqual(block[field], 0.0)
+        self.assertEqual(attribution["sidecar_opens"], 50)
+        self.assertEqual(attribution["sidecar_releases"], 50)
+
+    def test_attribution_category_sums_are_preserved(self):
+        attribution = probe.build_cache_session_attribution(
+            full_builder_stats(),
+            session_index=0,
+            wall_clock_seconds=1.0,
+        )
+        for field in probe.ATTRIBUTION_COMPONENT_FIELDS:
+            self.assertEqual(
+                attribution["component_totals_seconds"][field],
+                sum(block[field] for block in attribution["blocks"]),
+            )
+        aggregate = probe.build_cache_attribution_aggregate([attribution])
+        for field in probe.ATTRIBUTION_COMPONENT_FIELDS:
+            self.assertEqual(aggregate["component_totals_seconds"][field], attribution["component_totals_seconds"][field])
+        probe.validate_cache_attribution(aggregate, require_full_schedule=False)
+
+    def test_unattributed_remainder_is_calculated_and_retained(self):
+        attribution = probe.build_cache_session_attribution(
+            full_builder_stats(),
+            session_index=0,
+            wall_clock_seconds=1.0,
+        )
+        self.assertAlmostEqual(attribution["measured_component_sum_seconds"], 0.57)
+        self.assertAlmostEqual(attribution["unattributed_remainder_seconds"], 0.43)
+        self.assertNotEqual(attribution["unattributed_remainder_seconds"], 0.0)
+
+    def test_negative_unattributed_remainder_is_explicitly_retained_as_timer_noise(self):
+        attribution = probe.build_cache_session_attribution(
+            full_builder_stats(),
+            session_index=0,
+            wall_clock_seconds=0.5,
+        )
+        self.assertLess(attribution["unattributed_remainder_seconds"], 0.0)
+        self.assertEqual(
+            attribution["unattributed_remainder_status"],
+            "negative-timer-noise-or-overlapping-boundaries",
+        )
+        self.assertIsNotNone(attribution["unattributed_remainder_warning"])
+
+    def test_fifteen_session_aggregate_math_and_lifecycle_counts_remain_exact(self):
+        sessions = [
+            probe.build_cache_session_attribution(
+                full_builder_stats(),
+                session_index=index,
+                wall_clock_seconds=1.0 + index,
+            )
+            for index in range(probe.EXPECTED_DENOISING_TRANSITIONS)
+        ]
+        aggregate = probe.build_cache_attribution_aggregate(sessions)
+        self.assertEqual(aggregate["session_count"], 15)
+        self.assertEqual(aggregate["block_count"], 750)
+        self.assertEqual(aggregate["sidecar_opens"], 750)
+        self.assertEqual(aggregate["sidecar_releases"], 750)
+        self.assertAlmostEqual(aggregate["cache_wall_total_seconds"], sum(range(1, 16)))
+        probe.validate_cache_attribution(aggregate)
+
+    def test_first_session_and_warm_session_summary_is_explicit(self):
+        sessions = [
+            probe.build_cache_session_attribution(
+                full_builder_stats(),
+                session_index=index,
+                wall_clock_seconds=1.0 if index == 0 else 2.0,
+            )
+            for index in range(probe.EXPECTED_DENOISING_TRANSITIONS)
+        ]
+        summary = probe.build_cache_attribution_aggregate(sessions)["first_session_vs_sessions_1_14"]
+        self.assertEqual(summary["first_session_seconds"], 1.0)
+        self.assertEqual(summary["warm_session_count"], 14)
+        self.assertEqual(summary["warm_sessions_1_14_mean_seconds"], 2.0)
+        self.assertEqual(summary["delta_first_minus_warm_mean_seconds"], -1.0)
+
+    def test_per_block_ordering_and_statistics_are_retained(self):
+        sessions = [
+            probe.build_cache_session_attribution(full_builder_stats(), session_index=index, wall_clock_seconds=1.0)
+            for index in range(probe.EXPECTED_DENOISING_TRANSITIONS)
+        ]
+        aggregate = probe.build_cache_attribution_aggregate(sessions)
+        self.assertEqual(
+            [block["block_index"] for block in aggregate["sessions"][0]["blocks"]],
+            list(range(probe.EXPECTED_BLOCK_COUNT)),
+        )
+        self.assertEqual(set(aggregate["per_block_statistics"]), {str(index) for index in range(50)})
+        self.assertEqual(aggregate["per_block_statistics"]["0"]["sample_count"], 15)
+        self.assertIsNotNone(aggregate["per_block_statistics"]["0"]["total_block_cache_construction"]["p95_seconds"])
+        self.assertEqual(aggregate["slowest_block"]["block_index"], 0)
+        self.assertIn("category", aggregate["slowest_block_category"])
+        self.assertEqual(aggregate["fastest_block"]["block_index"], 0)
+
+    def test_attribution_does_not_change_sidecar_residency_or_add_reuse_path(self):
+        result, _scheduler, provider, _calls, _events = run_fake()
+        self.assertEqual(result.lifecycle["sidecar_opens"], 750)
+        self.assertEqual(result.lifecycle["sidecar_releases"], 750)
+        self.assertEqual(result.lifecycle["maximum_simultaneous_sidecars"], 1)
+        self.assertEqual(result.lifecycle["overlap_violations"], 0)
+        self.assertEqual(len(provider.records), 15)
+        self.assertEqual(
+            [record["cache_session_id"] for record in provider.records],
+            [f"cache-session-{index + 1:02d}" for index in range(15)],
+        )
+        self.assertFalse(any("prefetch" in name.lower() or "reuse" in name.lower() for name in dir(provider)))
+
+    def test_attribution_event_stream_checksum_and_linkage_remain_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            write_valid_event_stream(path)
+            summary = probe.validate_event_stream(path)
+            self.assertEqual(summary["attribution_block_event_count"], 750)
+            self.assertEqual(summary["attribution_session_event_count"], 15)
+            report = {
+                "event_file_path": summary["event_file_path"],
+                "event_file_record_count": summary["event_file_record_count"],
+                "event_file_sha256": summary["event_file_sha256"],
+            }
+            probe.validate_event_file_linkage(report, path)
+            path.write_text(path.read_text() + "{}\n")
+            with self.assertRaisesRegex(ValueError, "stale"):
+                probe.validate_event_file_linkage(report, path)
+
+    def test_telemetry_failure_is_recorded_and_cannot_report_a_released_success(self):
+        provider = FakeCacheProvider()
+
+        def failing_sink(event, _details):
+            if event == probe.ATTRIBUTION_BLOCK_EVENT:
+                raise RuntimeError("synthetic attribution sink failure")
+
+        provider.event_sink = failing_sink
+        with self.assertRaisesRegex(RuntimeError, "synthetic attribution sink failure"):
+            provider.cache_for_step(0, np.asarray([0.0], dtype=np.float32))
+        record = provider.records[0]
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["telemetry_failures"][0]["event"], probe.ATTRIBUTION_BLOCK_EVENT)
+        self.assertIn("failure", record)
+        self.assertGreater(provider.aggregate()["telemetry_failure_count"], 0)
 
     def test_exact_one_forward_per_transition(self):
         result, _scheduler, _provider, calls, _events = run_fake()
@@ -2679,7 +2911,20 @@ class ProbeV05DContractTests(unittest.TestCase):
             args = type("Args", (), {"prompt": probe.LOCKED_PROMPT, "operator_declared_uncontended": False})()
             report = probe._base_report(args, output_paths)
             report["schedule_contract"] = artifact["schedule_contract"]
-            report["streamed_adaln_lifecycle"] = artifact["streamed_adaln_lifecycle"]
+            report["streamed_adaln_lifecycle"] = {
+                **artifact["streamed_adaln_lifecycle"],
+                "attribution_block_event_count": 750,
+                "attribution_session_event_count": 15,
+            }
+            session_attributions = [
+                probe.build_cache_session_attribution(
+                    full_builder_stats(),
+                    session_index=index,
+                    wall_clock_seconds=1.0,
+                )
+                for index in range(probe.EXPECTED_DENOISING_TRANSITIONS)
+            ]
+            report["cache_attribution"] = probe.build_cache_attribution_aggregate(session_attributions)
             report["final_artifact"] = artifact
             report["conditioning_worker"] = {
                 **probe.decoder_worker_receipt("conditioning"),
@@ -2690,6 +2935,7 @@ class ProbeV05DContractTests(unittest.TestCase):
                 **probe.decoder_worker_receipt("derived"),
                 "status": "success",
                 "transformer_release": artifact["transformer_release_receipt"],
+                "cache_attribution": report["cache_attribution"],
             }
             def worker(identity):
                 receipt = probe.decoder_worker_receipt(identity)
