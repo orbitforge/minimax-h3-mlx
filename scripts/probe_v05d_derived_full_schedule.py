@@ -73,11 +73,11 @@ EXPECTED_AUDIO_SIGMA_POINTS = 16
 EXPECTED_DENOISING_TRANSITIONS = 15
 EXPECTED_TRANSFORMER_FORWARDS = 15
 
-# Slice 3B2 exposes only these two square core geometries.  The downstream decoder/media
-# validators below intentionally retain their frozen 128x128 constants until Slice 3B3.
+# Slice 3B2 exposes only these two square core geometries.  Media validators below intentionally
+# retain their frozen 128x128 constants until Slice 3B3B.
 DEFAULT_VIDEO_SIZE = 128
 PROOF_VIDEO_SIZES = (128, 256)
-FULL_RUN_256_GATE_MESSAGE = "256x256 full-run decoder/media support is not enabled until Slice 3B3"
+FULL_RUN_256_GATE_MESSAGE = "256x256 full-run media support is not enabled until Slice 3B3B"
 
 VIDEO_NATIVE_SHAPE = (1, 24, 9, 8, 8)
 AUDIO_NATIVE_SHAPE = (2, 32, 50)
@@ -1108,6 +1108,7 @@ def decoder_worker_receipt(
     release_gate_passed: bool = True,
     allocator_cache_zero: bool = True,
     published_artifact_valid: bool = True,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the complete parent-side receipt shape used by fake/future workers."""
     receipt = {
@@ -1123,6 +1124,25 @@ def decoder_worker_receipt(
         "allocator_cache_zero": allocator_cache_zero,
         "published_artifact_valid": published_artifact_valid,
     }
+    if worker_identity == VIDEO_WORKER_IDENTITY:
+        core_geometry = canonical_geometry_contract(geometry=geometry) if geometry is not None else canonical_geometry_contract()
+        decoder_geometry = video_decoder_geometry_contract(core_geometry)
+        receipt.update(
+            {
+                "geometry": core_geometry,
+                "video_geometry": decoder_geometry,
+                "video_width": decoder_geometry["video_width"],
+                "video_height": decoder_geometry["video_height"],
+                "video_native_shape": decoder_geometry["video_native_shape"],
+                "video_raw_shape": decoder_geometry["video_raw_shape"],
+                "video_rgb_shape": decoder_geometry["video_rgb_shape"],
+                "frame_count": decoder_geometry["frame_count"],
+                "video_output": {
+                    "raw": {"shape": decoder_geometry["video_raw_shape"], "dtype": "float32"},
+                    "rgb": {"shape": decoder_geometry["video_rgb_shape"], "dtype": "uint8"},
+                },
+            }
+        )
     if worker_identity == AUDIO_WORKER_IDENTITY:
         receipt.update(
             {
@@ -1149,7 +1169,12 @@ def validate_decoder_worker_termination(receipt: Mapping[str, Any], *, identity:
         raise ValueError(f"{identity} decoder worker termination is missing an exit code")
 
 
-def validate_decoder_worker_receipt(receipt: Mapping[str, Any], *, identity: str) -> None:
+def validate_decoder_worker_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    identity: str,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> None:
     """Require a successful, terminated worker and every downstream release/artifact gate."""
     missing = sorted(DECODER_WORKER_RECEIPT_KEYS - set(receipt))
     if missing:
@@ -1166,6 +1191,8 @@ def validate_decoder_worker_receipt(receipt: Mapping[str, Any], *, identity: str
     ):
         if type(receipt.get(key)) is not bool or receipt.get(key) is not True:
             raise ValueError(f"{identity} decoder worker receipt gate {key} did not pass")
+    if identity == VIDEO_WORKER_IDENTITY:
+        validate_video_decoder_receipt_geometry(receipt, expected_geometry=expected_geometry)
     if identity == AUDIO_WORKER_IDENTITY:
         if receipt.get("wav_manifest_valid") is not True:
             raise ValueError("audio decoder worker receipt WAV manifest gate did not pass")
@@ -1267,9 +1294,11 @@ class DecoderPhaseOrchestrator:
         implemented_phase_scope: Mapping[str, bool] | None = None,
         implemented_scope: Mapping[str, bool] | None = None,
         artifact_validators: Mapping[str, Callable[[], Mapping[str, Any]]] | None = None,
+        expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
     ) -> None:
         self.derived_gate = dict(derived_gate)
         self.worker_launcher = worker_launcher
+        self.expected_geometry = expected_geometry
         self.artifact_specs = {"video": video_artifact, "audio": audio_artifact}
         if implemented_phase_scope is not None and implemented_scope is not None:
             raise ValueError("provide only one explicit decoder phase scope")
@@ -1413,7 +1442,11 @@ class DecoderPhaseOrchestrator:
             validate_decoder_worker_termination(receipt, identity=identity)
             self._phase(termination_phase, "completed")
             self._phase(release_phase, "running")
-            validate_decoder_worker_receipt(receipt, identity=identity)
+            validate_decoder_worker_receipt(
+                receipt,
+                identity=identity,
+                expected_geometry=self.expected_geometry if identity == VIDEO_WORKER_IDENTITY else None,
+            )
             artifact_validation = self._validate_artifact(identity)
             section["artifact_validation"] = artifact_validation
             if artifact_validation is not None:
@@ -1734,6 +1767,92 @@ def canonical_geometry_contract(
     contract = _geometry_contract(geometry)
     validate_geometry_contract(contract)
     return contract
+
+
+def video_decoder_geometry_contract(
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive proof-side decoder shapes from the selected core geometry only."""
+    core = canonical_geometry_contract(geometry=geometry) if geometry is not None else canonical_geometry_contract()
+    width = int(core["video_width"])
+    height = int(core["video_height"])
+    frame_count = int(core["frames"])
+    native_shape = [int(value) for value in core["video_native_shape"]]
+    raw_shape = [1, 3, frame_count, height, width]
+    rgb_shape = [frame_count, height, width, 3]
+    return {
+        "video_width": width,
+        "video_height": height,
+        "video_native_shape": native_shape,
+        "video_raw_shape": raw_shape,
+        "video_rgb_shape": rgb_shape,
+        "frame_count": frame_count,
+        # Preserve the established decoder receipt aliases while adding explicit fields.
+        "frames": frame_count,
+        "width": width,
+        "height": height,
+        "fps": int(core["fps"]),
+        "duration_seconds": core["duration_seconds"],
+    }
+
+
+def validate_video_decoder_receipt_geometry(
+    receipt: Mapping[str, Any],
+    *,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate explicit video decoder receipt geometry against the selected core contract."""
+    receipt_core = receipt.get("geometry")
+    selected = expected_geometry if expected_geometry is not None else (
+        receipt_core if isinstance(receipt_core, Mapping) else None
+    )
+    if selected is None and expected_geometry is not None:
+        raise ValueError("video decoder receipt is missing its selected geometry identity")
+    core = canonical_geometry_contract(geometry=selected) if selected is not None else canonical_geometry_contract()
+    if not isinstance(receipt_core, Mapping):
+        if core["video_width"] != DEFAULT_VIDEO_SIZE:
+            raise ValueError("video decoder receipt is missing explicit non-default geometry identity")
+    else:
+        validate_geometry_contract(receipt_core, expected=core)
+    expected = video_decoder_geometry_contract(core)
+    required_fields = (
+        "video_width",
+        "video_height",
+        "video_native_shape",
+        "video_raw_shape",
+        "video_rgb_shape",
+        "frame_count",
+    )
+    missing = [field for field in required_fields if field not in receipt]
+    if missing:
+        raise ValueError(f"video decoder receipt is missing geometry fields: {missing}")
+    for field in required_fields:
+        if receipt.get(field) != expected[field]:
+            raise ValueError(f"video decoder receipt geometry field {field} does not match the selected geometry")
+    nested = receipt.get("video_geometry")
+    if nested is not None:
+        if not isinstance(nested, Mapping):
+            raise ValueError("video decoder receipt nested geometry is invalid")
+        for field in required_fields:
+            if nested.get(field) != expected[field]:
+                raise ValueError(f"video decoder receipt nested geometry field {field} differs")
+    output = receipt.get("video_output")
+    if output is not None:
+        if not isinstance(output, Mapping):
+            raise ValueError("video decoder receipt output geometry is invalid")
+        raw_output = output.get("raw")
+        rgb_output = output.get("rgb")
+        if (
+            not isinstance(raw_output, Mapping)
+            or raw_output.get("shape") != expected["video_raw_shape"]
+        ):
+            raise ValueError("video decoder receipt raw output shape differs from the selected geometry")
+        if (
+            not isinstance(rgb_output, Mapping)
+            or rgb_output.get("shape") != expected["video_rgb_shape"]
+        ):
+            raise ValueError("video decoder receipt RGB output shape differs from the selected geometry")
+    return expected
 
 
 def derive_row_ranges(
@@ -3742,17 +3861,25 @@ def validate_final_video_input_artifact(
     *,
     expected_attempt_identifier: str,
     expected_checkpoint_identity: Mapping[str, Any],
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Independently validate every final-latent gate needed by the video child."""
     artifact_file = Path(artifact_path).resolve()
     metadata_file = Path(metadata_path).resolve()
     metadata = _read_json_object(metadata_file, "final native latent metadata")
     arrays = _load_npz(artifact_file)
+    artifact_geometry = metadata.get("geometry")
+    selected_geometry = expected_geometry if expected_geometry is not None else (
+        artifact_geometry if isinstance(artifact_geometry, Mapping) else None
+    )
+    core_geometry = canonical_geometry_contract(geometry=selected_geometry) if selected_geometry is not None else canonical_geometry_contract()
+    decoder_geometry = video_decoder_geometry_contract(core_geometry)
     validate_final_artifact(
         metadata,
         arrays=arrays,
         artifact_path=artifact_file,
         metadata_path=metadata_file,
+        geometry=core_geometry,
     )
     if metadata.get("attempt_identifier") != expected_attempt_identifier:
         raise ValueError("video worker final latent attempt identifier mismatch")
@@ -3783,8 +3910,9 @@ def validate_final_video_input_artifact(
     video = np.asarray(arrays["final_video_native"])
     if video.dtype != np.dtype(np.float32):
         raise ValueError(f"video worker final latent storage dtype must be float32, got {video.dtype}")
-    if tuple(video.shape) != VIDEO_NATIVE_SHAPE:
-        raise ValueError("video worker final latent shape is not (1,24,9,8,8)")
+    expected_native_shape = tuple(decoder_geometry["video_native_shape"])
+    if tuple(video.shape) != expected_native_shape:
+        raise ValueError(f"video worker final latent shape is not {expected_native_shape}")
     descriptor = metadata.get("native_video")
     if not isinstance(descriptor, Mapping) or descriptor.get("dtype") != "bfloat16":
         raise ValueError("video worker final latent logical dtype is not bfloat16")
@@ -3803,6 +3931,8 @@ def validate_final_video_input_artifact(
         "derived_worker_termination_confirmed": True,
         "transformer_release_gate_passed": True,
         "allocator_cache_zero": True,
+        "geometry": core_geometry,
+        "video_geometry": decoder_geometry,
         "video_shape": list(video.shape),
         "video_storage_dtype": np.dtype(video.dtype).name,
         "video_logical_dtype": descriptor["dtype"],
@@ -3818,13 +3948,15 @@ def restore_video_latent_logical_bfloat16(
     *,
     expected_fingerprint: str,
     materialize: Callable[[Any], None] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> tuple[Any, str]:
     """Restore float32 NPZ storage to a materialized logical MLX bfloat16 latent."""
     stored_array = np.asarray(stored)
     if stored_array.dtype != np.dtype(np.float32):
         raise ValueError(f"video latent NPZ storage must be float32, got {stored_array.dtype}")
-    if tuple(stored_array.shape) != VIDEO_NATIVE_SHAPE:
-        raise ValueError(f"video latent shape mismatch: {tuple(stored_array.shape)} != {VIDEO_NATIVE_SHAPE}")
+    expected_shape = tuple(video_decoder_geometry_contract(geometry)["video_native_shape"])
+    if tuple(stored_array.shape) != expected_shape:
+        raise ValueError(f"video latent shape mismatch: {tuple(stored_array.shape)} != {expected_shape}")
     float32_latent = mx.array(np.ascontiguousarray(stored_array, dtype=np.float32), dtype=mx.float32)
     logical_latent = float32_latent.astype(mx.bfloat16)
     _materialize_value(logical_latent, mx, materialize)
@@ -3852,8 +3984,14 @@ def normalize_video_latent_for_decode(
     return decoder_input
 
 
-def validate_locked_video_config(config: Any, layout: Any) -> dict[str, Any]:
-    """Validate the exact 30-frame, 128x128 geometry before loading video VAE weights."""
+def validate_locked_video_config(
+    config: Any,
+    layout: Any,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate selected core geometry before loading video VAE weights."""
+    decoder_geometry = video_decoder_geometry_contract(geometry)
     expected_fields = {
         "latent_channels": 24,
         "out_channels": 3,
@@ -3881,20 +4019,21 @@ def validate_locked_video_config(config: Any, layout: Any) -> dict[str, Any]:
         if int(getattr(layout, field)) != expected:
             raise ValueError(f"video decode layout {field}={getattr(layout, field)!r}, expected {expected}")
     decoded_frames = _v05a_decoder_helpers().video_decoded_frame_count(9, layout)
-    if decoded_frames != VIDEO_FRAME_COUNT:
-        raise ValueError(f"video decoder geometry produces {decoded_frames} frames, expected {VIDEO_FRAME_COUNT}")
+    if decoded_frames != decoder_geometry["frame_count"]:
+        raise ValueError(
+            f"video decoder geometry produces {decoded_frames} frames, expected {decoder_geometry['frame_count']}"
+        )
     mean = np.asarray(getattr(config, "latents_mean"), dtype=np.float32)
     std = np.asarray(getattr(config, "latents_std"), dtype=np.float32)
     if mean.shape != (24,) or std.shape != (24,):
         raise ValueError("video latent normalization metadata must have shape [24]")
     return {
-        "native_latent_shape": list(VIDEO_NATIVE_SHAPE),
-        "raw_shape": list(VIDEO_RAW_SHAPE),
-        "rgb_shape": list(VIDEO_RGB_SHAPE),
-        "frames": VIDEO_FRAME_COUNT,
-        "resolution": [VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT],
-        "fps": VIDEO_FRAME_FPS,
-        "duration_seconds": VIDEO_FRAME_DURATION_SECONDS,
+        **decoder_geometry,
+        "native_latent_shape": decoder_geometry["video_native_shape"],
+        "raw_shape": decoder_geometry["video_raw_shape"],
+        "rgb_shape": decoder_geometry["video_rgb_shape"],
+        "frames": decoder_geometry["frame_count"],
+        "resolution": [decoder_geometry["video_width"], decoder_geometry["video_height"]],
         "layout": {field: int(getattr(layout, field)) for field in expected_layout},
     }
 
@@ -3904,29 +4043,40 @@ def materialize_and_validate_video_raw_output(
     mx: Any,
     *,
     materialize: Callable[[Any], None] | None = None,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Materialize once, then validate the locked raw decoder tensor and finite values."""
     if _dtype_name(getattr(raw, "dtype", None)) != _dtype_name(mx.float32):
         raise ValueError(f"raw video decoder output must be float32, got {getattr(raw, 'dtype', None)}")
     _materialize_value(raw, mx, materialize)
     raw_np = np.array(raw, dtype=np.float32, copy=True)
-    if tuple(raw_np.shape) != VIDEO_RAW_SHAPE:
-        raise ValueError(f"raw video shape mismatch: {tuple(raw_np.shape)} != {VIDEO_RAW_SHAPE}")
+    expected_shape = tuple(video_decoder_geometry_contract(geometry)["video_raw_shape"])
+    if tuple(raw_np.shape) != expected_shape:
+        raise ValueError(f"raw video shape mismatch: {tuple(raw_np.shape)} != {expected_shape}")
     if not np.isfinite(raw_np).all():
         raise ValueError("raw video decoder output contains non-finite values")
     return raw_np, {"shape": list(raw_np.shape), "dtype": str(raw_np.dtype)}
 
 
-def convert_and_validate_video_rgb(raw_np: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+def convert_and_validate_video_rgb(
+    raw_np: np.ndarray,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Use the proven v0.5a inverse-normalization/RGB conversion and enforce the locked output."""
     frames = _v05a_decoder_helpers().video_frames_from_raw(raw_np)
-    return frames, validate_video_rgb_output(frames)
+    return frames, validate_video_rgb_output(frames, geometry=geometry)
 
 
-def validate_video_rgb_output(frames: Any) -> dict[str, Any]:
+def validate_video_rgb_output(
+    frames: Any,
+    *,
+    geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     frames = np.asarray(frames)
-    if tuple(frames.shape) != VIDEO_RGB_SHAPE:
-        raise ValueError(f"RGB video shape mismatch: {tuple(frames.shape)} != {VIDEO_RGB_SHAPE}")
+    expected_shape = tuple(video_decoder_geometry_contract(geometry)["video_rgb_shape"])
+    if tuple(frames.shape) != expected_shape:
+        raise ValueError(f"RGB video shape mismatch: {tuple(frames.shape)} != {expected_shape}")
     if frames.dtype != np.dtype(np.uint8):
         raise ValueError(f"RGB video dtype must be uint8, got {frames.dtype}")
     if not np.isfinite(frames).all():
@@ -4143,6 +4293,7 @@ def execute_video_decode_once(
     materialize: Callable[[Any], None] | None = None,
     memory_snapshot: Callable[[], Mapping[str, Any]] | None = None,
     references: dict[str, Any] | None = None,
+    expected_geometry: ProductionMultimodalGeometry | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run exactly one injected video decode, with all MLX work supplied by the child."""
     refs = references if references is not None else {}
@@ -4151,7 +4302,9 @@ def execute_video_decode_once(
         metadata_path,
         expected_attempt_identifier=expected_attempt_identifier,
         expected_checkpoint_identity=expected_checkpoint_identity,
+        expected_geometry=expected_geometry,
     )
+    core_geometry = input_validation["geometry"]
     partial = Path(frames_partial).resolve()
     final = Path(frames_final).resolve()
     manifest_file = Path(manifest_path).resolve()
@@ -4162,7 +4315,7 @@ def execute_video_decode_once(
     config = load_video_config(Path(video_root).resolve())
     refs["config"] = config
     layout = _v05a_decoder_helpers().resolve_video_decode_layout(config)
-    geometry = validate_locked_video_config(config, layout)
+    geometry = validate_locked_video_config(config, layout, geometry=core_geometry)
     memory: dict[str, Any] = {}
     snapshot = memory_snapshot or (lambda: _memory_snapshot(mx))
     memory["before_load"] = dict(snapshot())
@@ -4173,6 +4326,7 @@ def execute_video_decode_once(
         mx,
         expected_fingerprint=input_validation["video_fingerprint"],
         materialize=materialize,
+        geometry=core_geometry,
     )
     refs["latent"] = latent
     decoder_input = normalize_video_latent_for_decode(latent, config, mx, materialize=materialize)
@@ -4184,9 +4338,14 @@ def execute_video_decode_once(
     memory["after_load"] = dict(snapshot())
     raw = decoder.decode(decoder_input)
     refs["raw"] = raw
-    raw_np, raw_shape_dtype = materialize_and_validate_video_raw_output(raw, mx, materialize=materialize)
+    raw_np, raw_shape_dtype = materialize_and_validate_video_raw_output(
+        raw,
+        mx,
+        materialize=materialize,
+        geometry=core_geometry,
+    )
     refs["raw_np"] = raw_np
-    frames, rgb_shape_dtype = convert_and_validate_video_rgb(raw_np)
+    frames, rgb_shape_dtype = convert_and_validate_video_rgb(raw_np, geometry=core_geometry)
     refs["frames"] = frames
     memory["peak"] = dict(snapshot())
     if save_frames is None:
@@ -4202,6 +4361,7 @@ def execute_video_decode_once(
     )
     return {
         "input_artifact": {key: value for key, value in input_validation.items() if key not in {"arrays", "metadata"}},
+        "geometry": core_geometry,
         "video_geometry": geometry,
         "logical_video_fingerprint": logical_fingerprint,
         "raw_shape_dtype": raw_shape_dtype,
@@ -6915,6 +7075,7 @@ def _video_worker_parser(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--checkpoint-root", required=True)
     parser.add_argument("--derived-transformer", required=True)
     parser.add_argument("--attempt-identifier", required=True)
+    parser.add_argument("--video-size", type=int, choices=PROOF_VIDEO_SIZES, default=DEFAULT_VIDEO_SIZE)
     parser.add_argument("--final-artifact", required=True)
     parser.add_argument("--final-artifact-metadata", required=True)
     parser.add_argument("--frames-partial", required=True)
@@ -6965,8 +7126,11 @@ def _video_worker_main(argv: Sequence[str]) -> int:
     baseline: Mapping[str, Any] | None = None
     primary: BaseException | None = None
     cleanup: BaseException | None = None
+    core_geometry: dict[str, Any] | None = None
     started = time.perf_counter()
     try:
+        selected_video_size = validate_video_size(args.video_size)
+        core_geometry = canonical_geometry_contract(selected_video_size)
         preflight = validate_derived_filesystem(derived)
         checkpoint_identity = _checkpoint_identity(root, derived, preflight)
         input_validation = validate_final_video_input_artifact(
@@ -6974,6 +7138,7 @@ def _video_worker_main(argv: Sequence[str]) -> int:
             final_metadata,
             expected_attempt_identifier=args.attempt_identifier,
             expected_checkpoint_identity=checkpoint_identity,
+            expected_geometry=core_geometry,
         )
         receipt["input_artifact"] = {
             key: value
@@ -7012,8 +7177,20 @@ def _video_worker_main(argv: Sequence[str]) -> int:
             materialize=lambda value: mx.eval(value),
             memory_snapshot=lambda: _memory_snapshot(mx),
             references=references,
+            expected_geometry=core_geometry,
         )
+        receipt["geometry"] = core_geometry
         receipt["video_geometry"] = result["video_geometry"]
+        receipt.update(
+            {
+                "video_width": result["video_geometry"]["video_width"],
+                "video_height": result["video_geometry"]["video_height"],
+                "video_native_shape": result["video_geometry"]["video_native_shape"],
+                "video_raw_shape": result["video_geometry"]["video_raw_shape"],
+                "video_rgb_shape": result["video_geometry"]["video_rgb_shape"],
+                "frame_count": result["video_geometry"]["frame_count"],
+            }
+        )
         receipt["logical_video_fingerprint"] = result["logical_video_fingerprint"]
         receipt["video_output"] = {
             "raw": result["raw_shape_dtype"],
@@ -8223,6 +8400,7 @@ def _parent_run(
         "--checkpoint-root", str(root),
         "--derived-transformer", str(derived),
         "--attempt-identifier", paths["attempt_identifier"],
+        "--video-size", str(selected_video_size),
         "--final-artifact", paths["final_artifact"],
         "--final-artifact-metadata", paths["final_artifact_metadata"],
         "--frames-partial", paths["frames_partial"],
@@ -8297,6 +8475,7 @@ def _parent_run(
         worker_launcher=launch_worker,
         implemented_phase_scope={"video": True, "audio": True},
         artifact_validators={"video": validate_published_video, "audio": validate_published_audio},
+        expected_geometry=core_geometry,
     ).run()
     report["decoder_phase"] = dict(decoder_orchestration["decoder_phase"])
     report["decoder_phase"]["reason"] = "Slice 3C implements video decode followed by audio decode and standalone publication"
@@ -8528,7 +8707,14 @@ def validate_report(report: Mapping[str, Any]) -> None:
             or not isinstance(video_artifacts.get("manifest_sha256"), str)
         ):
             raise ValueError("successful report must prove the published 30-frame video manifest")
-        validate_decoder_worker_receipt(report["video_decoder"].get("worker_receipt", {}), identity=VIDEO_WORKER_IDENTITY)
+        report_geometry = report.get("geometry")
+        if not isinstance(report_geometry, Mapping):
+            raise ValueError("successful report is missing its selected geometry contract")
+        validate_decoder_worker_receipt(
+            report["video_decoder"].get("worker_receipt", {}),
+            identity=VIDEO_WORKER_IDENTITY,
+            expected_geometry=report_geometry,
+        )
         for identity in (VIDEO_WORKER_IDENTITY, AUDIO_WORKER_IDENTITY):
             section = report[f"{identity}_decoder"]
             if section.get("release_gate_passed") is not True or section.get("allocator_cache_zero") is not True or section.get("published_artifact_valid") is not True:
