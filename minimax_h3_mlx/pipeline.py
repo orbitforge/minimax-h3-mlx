@@ -8,8 +8,10 @@ CFG-distilled, so there is no unconditional pass and no guidance scale.
 Conditioning rows are re-imposed by construction rather than by masking: only the generated rows are
 ever written back, so keyframe anchors survive the whole loop untouched.
 
-The AdaLN modulation cache is built once over the union of every timestep the run will present, and
-the 13B of `adaln_proj` is then dropped — see :mod:`minimax_h3_mlx.adaln`.
+Resident AdaLN modulation is cached once over the union of every timestep the run will present, and
+the 13B of `adaln_proj` is then dropped. Derived cache-only checkpoints instead build and release
+one streamed modulation cache per transition — see :mod:`minimax_h3_mlx.adaln` and
+:mod:`minimax_h3_mlx.denoise`.
 """
 
 from __future__ import annotations
@@ -26,6 +28,12 @@ import numpy as np
 
 from .adaln import ModulationCache, drop_adaln_weights
 from .config import DiTConfig, PipelineConfig
+from .denoise import (
+    StreamedTransitionSession,
+    apply_target_scheduler_updates,
+    run_streamed_transition,
+)
+from .dit import CACHE_ONLY_CONSTRUCTION
 from .packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -43,7 +51,7 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
-from .scheduler import MiniMaxH3Scheduler
+from .scheduler import MiniMaxH3MultimodalScheduler, MiniMaxH3Scheduler
 
 
 def _format_bytes(value: int | float | None) -> str:
@@ -373,6 +381,10 @@ class MiniMaxH3Pipeline:
         audio.set_timesteps(num_inference_steps)
         return video, audio
 
+    def _uses_streamed_adaln(self) -> bool:
+        """Return whether the loaded transformer requires per-transition sidecar caches."""
+        return getattr(self.dit, "construction_mode", "resident") == CACHE_ONLY_CONSTRUCTION
+
     def _row_timestep_plan(self, layout, video_timesteps, audio_timesteps):
         """Per-step ``(timestep_indices,)`` against one global timestep table.
 
@@ -587,10 +599,37 @@ class MiniMaxH3Pipeline:
                 video_rows = mx.concatenate([condition_rows, video_rows])
 
             video_sched, audio_sched = self._build_schedules(num_inference_steps)
-            timestep_table, plan = self._row_timestep_plan(
-                layout, video_sched.timesteps, audio_sched.timesteps
-            )
-            self._ensure_cache(timestep_table, drop_adaln, verbose)
+            streamed_adaln = self._uses_streamed_adaln()
+            if streamed_adaln:
+                if not drop_adaln:
+                    raise RuntimeError(
+                        "--keep-adaln is not supported for derived checkpoints: block AdaLN weights "
+                        "are stored in sidecars and resident loading is not implemented"
+                    )
+                # `_ensure_cache` intentionally remains a resident-only operation. Each derived
+                # transition acquires its own streamed cache below and receives only a released,
+                # materialized prediction from the session.
+                transition_scheduler = MiniMaxH3MultimodalScheduler(video_sched, audio_sched)
+                # Unlike the resident path's union cache, a streamed cache covers only the exact
+                # row timesteps presented by this transition.
+                streamed_plan = [
+                    build_row_timesteps(
+                        layout,
+                        float(video_timestep),
+                        float(audio_timestep),
+                        max(float(video_timestep), KEYFRAME_NOISE_AUG),
+                        1.0,
+                    )
+                    for video_timestep, audio_timestep in zip(
+                        video_sched.timesteps.tolist(), audio_sched.timesteps.tolist()
+                    )
+                ]
+            else:
+                timestep_table, plan = self._row_timestep_plan(
+                    layout, video_sched.timesteps, audio_sched.timesteps
+                )
+                self._ensure_cache(timestep_table, drop_adaln, verbose)
+                transition_scheduler = None
 
             n_cond_v = layout.num_condition_video_rows
             n_cond_a = layout.num_condition_audio_rows
@@ -601,35 +640,58 @@ class MiniMaxH3Pipeline:
                 print(f"  [memory] before denoising: {_memory_snapshot()}", flush=True)
             for i, t in enumerate(video_sched.timesteps.tolist()):
                 started = time.perf_counter()
-                video_pred, audio_pred = self.dit(
-                    video_rows[None].astype(mx.bfloat16),
-                    audio_rows[None].astype(mx.bfloat16),
-                    embeds,
-                    timestep_table,
-                    plan[i],
-                    layout.token_tags,
-                    layout.position_ids,
-                    layout.video_indices,
-                    layout.audio_indices,
-                    layout.text_indices,
-                    modulation_cache=self._cache,
-                )
-                # Rebind rather than assign into a slice: the stepped result is a lazy graph reading
-                # the very rows it would overwrite, and the conditioning rows must stay distinct.
-                stepped_video = video_sched.step(
-                    video_pred[0, n_cond_v:].astype(mx.float32), float(t), video_rows[n_cond_v:]
-                )
-                stepped_audio = audio_sched.step(
-                    audio_pred[0, n_cond_a:].astype(mx.float32),
-                    float(audio_sched.timesteps[i].item()),
-                    audio_rows[n_cond_a:],
-                )
-                video_rows = (
-                    mx.concatenate([video_rows[:n_cond_v], stepped_video]) if n_cond_v else stepped_video
-                )
-                audio_rows = (
-                    mx.concatenate([audio_rows[:n_cond_a], stepped_audio]) if n_cond_a else stepped_audio
-                )
+                if streamed_adaln:
+                    video_rows, audio_rows, video_pred, audio_pred = run_streamed_transition(
+                        self.dit,
+                        transition_scheduler,
+                        video_sched,
+                        audio_sched,
+                        video_model_input=video_rows[None].astype(mx.bfloat16),
+                        audio_model_input=audio_rows[None].astype(mx.bfloat16),
+                        text_embedding=embeds,
+                        timestep=streamed_plan[i][0],
+                        timestep_indices=streamed_plan[i][1],
+                        layout=layout,
+                        step_index=i,
+                        video_timestep=float(t),
+                        audio_timestep=float(audio_sched.timesteps[i].item()),
+                        num_condition_video_rows=n_cond_v,
+                        num_condition_audio_rows=n_cond_a,
+                        prediction_cast=lambda value: value.astype(mx.float32),
+                        concatenate=mx.concatenate,
+                        session_factory=StreamedTransitionSession,
+                    )
+                else:
+                    video_pred, audio_pred = self.dit(
+                        video_rows[None].astype(mx.bfloat16),
+                        audio_rows[None].astype(mx.bfloat16),
+                        embeds,
+                        timestep_table,
+                        plan[i],
+                        layout.token_tags,
+                        layout.position_ids,
+                        layout.video_indices,
+                        layout.audio_indices,
+                        layout.text_indices,
+                        modulation_cache=self._cache,
+                    )
+                    # Rebind rather than assign into a slice: the stepped result is a lazy graph
+                    # reading the very rows it would overwrite, and conditioning rows must stay
+                    # distinct. The shared helper keeps this update identical to derived mode.
+                    video_rows, audio_rows = apply_target_scheduler_updates(
+                        video_sched,
+                        audio_sched,
+                        video_prediction=video_pred,
+                        audio_prediction=audio_pred,
+                        video_rows=video_rows,
+                        audio_rows=audio_rows,
+                        video_timestep=float(t),
+                        audio_timestep=float(audio_sched.timesteps[i].item()),
+                        num_condition_video_rows=n_cond_v,
+                        num_condition_audio_rows=n_cond_a,
+                        prediction_cast=lambda value: value.astype(mx.float32),
+                        concatenate=mx.concatenate,
+                    )
                 mx.eval(video_rows, audio_rows)
                 step_times.append(time.perf_counter() - started)
                 if verbose:

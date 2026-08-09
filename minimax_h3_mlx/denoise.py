@@ -309,6 +309,120 @@ class StreamedTransitionSession:
                 raise release_error
 
 
+def apply_target_scheduler_updates(
+    video_scheduler: Any,
+    audio_scheduler: Any,
+    *,
+    video_prediction: Any,
+    audio_prediction: Any,
+    video_rows: Any,
+    audio_rows: Any,
+    video_timestep: float,
+    audio_timestep: float,
+    num_condition_video_rows: int,
+    num_condition_audio_rows: int,
+    prediction_cast: Callable[[Any], Any],
+    concatenate: Callable[[list[Any]], Any],
+) -> tuple[Any, Any]:
+    """Apply the established target-only video/audio scheduler update once.
+
+    Both resident and derived pipeline modes use this seam so the scheduler math, modality
+    slicing, and conditioning-row rebind remain one implementation. The caller controls when this
+    function runs; derived mode calls it only after its streamed session has released the cache.
+    """
+    stepped_video = video_scheduler.step(
+        prediction_cast(video_prediction[0, num_condition_video_rows:]),
+        video_timestep,
+        video_rows[num_condition_video_rows:],
+    )
+    stepped_audio = audio_scheduler.step(
+        prediction_cast(audio_prediction[0, num_condition_audio_rows:]),
+        audio_timestep,
+        audio_rows[num_condition_audio_rows:],
+    )
+    video_rows = (
+        concatenate([video_rows[:num_condition_video_rows], stepped_video])
+        if num_condition_video_rows
+        else stepped_video
+    )
+    audio_rows = (
+        concatenate([audio_rows[:num_condition_audio_rows], stepped_audio])
+        if num_condition_audio_rows
+        else stepped_audio
+    )
+    return video_rows, audio_rows
+
+
+def run_streamed_transition(
+    transformer: Any,
+    transition_scheduler: Any,
+    video_scheduler: Any,
+    audio_scheduler: Any,
+    *,
+    video_model_input: Any,
+    audio_model_input: Any,
+    text_embedding: Any,
+    timestep: Any,
+    timestep_indices: Any,
+    layout: Any,
+    step_index: int,
+    video_timestep: float,
+    audio_timestep: float,
+    num_condition_video_rows: int,
+    num_condition_audio_rows: int,
+    prediction_cast: Callable[[Any], Any],
+    concatenate: Callable[[list[Any]], Any],
+    session_factory: Callable[[Any], Any] | None = None,
+) -> tuple[Any, Any, Any, Any]:
+    """Run one derived transition and update only generated rows after cache release.
+
+    The model inputs are prepared by the caller so this orchestration seam remains independent of
+    MLX array construction in tests. ``StreamedTransitionSession`` returns only after prediction
+    materialization and streamed-cache release; scheduler updates therefore happen strictly after
+    that ownership boundary. A session factory is injectable for MLX-free integration contracts.
+    """
+    session = (session_factory or StreamedTransitionSession)(transformer)
+    result = session.run(
+        transition_scheduler,
+        video_latent=video_model_input,
+        audio_latent=audio_model_input,
+        text_embedding=text_embedding,
+        timestep=timestep,
+        timestep_indices=timestep_indices,
+        token_tags=layout.token_tags,
+        position_ids=layout.position_ids,
+        video_indices=layout.video_indices,
+        audio_indices=layout.audio_indices,
+        text_indices=layout.text_indices,
+        step_index=step_index,
+        expected_video_shape=tuple(int(value) for value in video_model_input.shape),
+        expected_audio_shape=tuple(int(value) for value in audio_model_input.shape),
+        expected_text_shape=tuple(int(value) for value in text_embedding.shape),
+    )
+    video_prediction = result.forward.video_prediction
+    audio_prediction = result.forward.audio_prediction
+    scheduler_video_rows = result.forward.input_video_latent[0]
+    scheduler_audio_rows = result.forward.input_audio_latent[0]
+
+    # The session has already released its cache. Apply the shared target-only scheduler update
+    # and rebind complete row buffers so conditioning rows cannot be overwritten.
+    video_rows, audio_rows = apply_target_scheduler_updates(
+        video_scheduler,
+        audio_scheduler,
+        video_prediction=video_prediction,
+        audio_prediction=audio_prediction,
+        video_rows=scheduler_video_rows,
+        audio_rows=scheduler_audio_rows,
+        video_timestep=video_timestep,
+        audio_timestep=audio_timestep,
+        num_condition_video_rows=num_condition_video_rows,
+        num_condition_audio_rows=num_condition_audio_rows,
+        prediction_cast=prediction_cast,
+        concatenate=concatenate,
+    )
+    return video_rows, audio_rows, video_prediction, audio_prediction
+
+
 @dataclass(frozen=True)
 class DenoiseStepReceipt:
     """The complete observable result of one loop transition."""
