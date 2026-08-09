@@ -56,6 +56,8 @@ def save_mp4(
     Raises :class:`FFmpegUnavailableError` if ``ffmpeg`` is not on PATH; use
     :func:`save_frames` in that case. A nonzero ffmpeg exit raises
     :class:`FFmpegEncodingError` and must not be treated as an unavailable binary.
+    Audio is staged in a unique temporary sibling WAV for the mux and removed
+    when this function finishes.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -65,21 +67,28 @@ def save_mp4(
     video = np.ascontiguousarray(video, dtype=np.uint8)
     frames, height, width, _ = video.shape
 
-    audio_path = None
-    if audio is not None:
-        audio_path = path.with_suffix(".wav")
-        save_wav(audio_path, audio, sample_rate)
-
-    cmd = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
-    ]
-    if audio_path is not None:
-        cmd += ["-i", str(audio_path), "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    mux_wav_path: Path | None = None
     staged_path: Path | None = None
     published = False
     try:
+        if audio is not None:
+            mux_fd, mux_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.mux-",
+                suffix=".wav",
+            )
+            mux_wav_path = Path(mux_name)
+            os.close(mux_fd)
+            save_wav(mux_wav_path, audio, sample_rate)
+
+        cmd = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
+        ]
+        if mux_wav_path is not None:
+            cmd += ["-i", str(mux_wav_path), "-c:a", "aac", "-b:a", "192k", "-shortest"]
+
         staged_fd, staged_name = tempfile.mkstemp(
             dir=path.parent,
             prefix=f".{path.name}.",
@@ -101,6 +110,11 @@ def save_mp4(
         if staged_path is not None and not published:
             try:
                 staged_path.unlink()
+            except OSError:
+                pass
+        if mux_wav_path is not None:
+            try:
+                mux_wav_path.unlink()
             except OSError:
                 pass
 

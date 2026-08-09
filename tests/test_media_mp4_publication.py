@@ -40,10 +40,15 @@ class FakeFFmpeg:
         self.stderr = stderr
         self.raised = raised
         self.calls: list[tuple[list[str], dict[str, object]]] = []
+        self.audio_inputs: list[tuple[Path, bool]] = []
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append((argv, dict(kwargs)))
+        for value in argv:
+            if isinstance(value, str) and value.endswith(".wav"):
+                audio_path = Path(value)
+                self.audio_inputs.append((audio_path, audio_path.exists()))
         staged_path = Path(argv[-1])
         self.events.append(("ffmpeg", self.final_path.exists(), staged_path.exists(), staged_path))
         staged_path.write_bytes(self.payload)
@@ -81,13 +86,57 @@ class AtomicMP4PublicationTests(unittest.TestCase):
         final_path: Path,
         runner: FakeFFmpeg,
         publisher: RecordingReplace,
+        audio: np.ndarray | None = None,
     ) -> Path:
         with (
             mock.patch.object(media.shutil, "which", return_value="/fake/ffmpeg"),
             mock.patch.object(media.subprocess, "run", side_effect=runner),
             mock.patch.object(media.os, "replace", side_effect=publisher),
         ):
-            return media.save_mp4(final_path, self._video(), 24)
+            return media.save_mp4(final_path, self._video(), 24, audio)
+
+    def test_audio_mux_uses_temporary_sibling_wav_and_removes_it_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_path = root / "clip.mp4"
+            events: list[tuple[object, ...]] = []
+            publisher = RecordingReplace(events)
+            runner = FakeFFmpeg(final_path, events, payload=b"encoded")
+
+            result = self._save_mp4(
+                final_path, runner, publisher, np.zeros((2, 4), dtype=np.float32)
+            )
+
+            self.assertEqual(result, final_path)
+            self.assertEqual(final_path.read_bytes(), b"encoded")
+            self.assertEqual(publisher.calls[0][1], final_path)
+            self.assertEqual(len(runner.audio_inputs), 1)
+            mux_wav_path, existed_at_ffmpeg = runner.audio_inputs[0]
+            self.assertTrue(existed_at_ffmpeg)
+            self.assertEqual(mux_wav_path.parent, final_path.parent)
+            self.assertTrue(mux_wav_path.name.startswith(f".{final_path.name}.mux-"))
+            self.assertTrue(mux_wav_path.name.endswith(".wav"))
+            self.assertNotEqual(mux_wav_path, final_path.with_suffix(".wav"))
+            self.assertFalse(mux_wav_path.exists())
+            self.assertFalse(final_path.with_suffix(".wav").exists())
+
+    def test_audio_mux_failure_cleans_temporary_wav_and_never_leaves_final_wav(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_path = root / "clip.mp4"
+            events: list[tuple[object, ...]] = []
+            runner = FakeFFmpeg(final_path, events, returncode=7, stderr=b"encoder failed")
+            publisher = RecordingReplace(events)
+
+            with self.assertRaisesRegex(media.FFmpegEncodingError, "encoder failed"):
+                self._save_mp4(final_path, runner, publisher, np.zeros((2, 4), dtype=np.float32))
+
+            mux_wav_path, existed_at_ffmpeg = runner.audio_inputs[0]
+            self.assertTrue(existed_at_ffmpeg)
+            self.assertFalse(mux_wav_path.exists())
+            self.assertFalse(final_path.with_suffix(".wav").exists())
+            self.assertFalse(final_path.exists())
+            self.assertEqual(publisher.calls, [])
 
     def test_success_stages_to_unique_sibling_then_publishes_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -194,11 +243,15 @@ class AtomicMP4PublicationTests(unittest.TestCase):
             publisher = RecordingReplace(events)
 
             with self.assertRaisesRegex(OSError, "subprocess seam failed"):
-                self._save_mp4(final_path, runner, publisher)
+                self._save_mp4(final_path, runner, publisher, np.zeros((2, 4), dtype=np.float32))
 
             self.assertEqual(final_path.read_bytes(), b"original")
             self.assertEqual(publisher.calls, [])
             self.assertEqual(self._partial_paths(root), [])
+            mux_wav_path, existed_at_ffmpeg = runner.audio_inputs[0]
+            self.assertTrue(existed_at_ffmpeg)
+            self.assertFalse(mux_wav_path.exists())
+            self.assertFalse(final_path.with_suffix(".wav").exists())
 
 
 if __name__ == "__main__":

@@ -80,20 +80,23 @@ class MediaFailureClassificationTests(unittest.TestCase):
 
     def test_missing_ffmpeg_has_unavailable_exception(self):
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "clip.mp4"
             with (
                 mock.patch.object(media.shutil, "which", return_value=None),
                 mock.patch.object(media.subprocess, "run") as run,
             ):
                 with self.assertRaises(media.FFmpegUnavailableError):
-                    media.save_mp4(Path(directory) / "clip.mp4", FakeResult.video, 24)
+                    media.save_mp4(output, FakeResult.video, 24, FakeResult.audio)
             run.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_missing_ffmpeg_triggers_png_wav_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "clip.mp4"
             save_mp4 = mock.Mock(side_effect=media.FFmpegUnavailableError("missing"))
             save_frames = mock.Mock()
-            save_wav = mock.Mock()
+            save_wav = mock.Mock(wraps=media.save_wav)
             with (
                 mock.patch.object(generate, "save_frames", save_frames),
                 mock.patch.object(generate, "save_wav", save_wav),
@@ -106,6 +109,7 @@ class MediaFailureClassificationTests(unittest.TestCase):
             self.assertIs(save_mp4.call_args.args[3], FakeResult.audio)
             self.assertEqual(save_frames.call_args.args, (output.with_suffix(""), FakeResult.video))
             self.assertEqual(save_wav.call_args.args, (output.with_suffix(".wav"), FakeResult.audio, 32000))
+            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["clip.wav"])
 
     def test_encoding_failure_does_not_trigger_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
