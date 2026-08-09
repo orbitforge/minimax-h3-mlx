@@ -69,6 +69,247 @@ def materialize_predictions(video_prediction: Any, audio_prediction: Any) -> Non
 
 
 @dataclass(frozen=True)
+class StreamedTransitionResult:
+    """The scheduler-safe result of one streamed transformer transition.
+
+    The cache is intentionally absent from this result.  A caller receives this value only after
+    the session has materialized the predictions and completed cache release, so the value can be
+    passed to a scheduler without retaining streamed AdaLN state.
+    """
+
+    step_index: int
+    forward: ValidatedForwardResult
+
+
+def _default_streamed_cache_builder(transformer: Any, timestep: Any) -> Any:
+    """Build one cache through the established derived-checkpoint sidecar seam."""
+    # Keep the MLX import behind the runtime boundary so the lifecycle contract remains unit
+    # testable with injected fakes and importing denoise.py remains MLX-free.
+    from .streamed_adaln import build_streamed_modulation_cache
+
+    return build_streamed_modulation_cache(transformer, timestep)
+
+
+def _split_streamed_cache_builder_result(value: Any) -> Any:
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            raise ValueError("streamed cache builder must return a cache or (cache, statistics)")
+        return value[0]
+    return value
+
+
+def release_streamed_modulation_cache(cache: Any) -> None:
+    """Release one streamed cache through a bounded runtime-owned reference boundary.
+
+    ``ModulationCache`` is deliberately reusable for the resident path and therefore has no
+    resident-specific release method.  Derived transition state is released by clearing its
+    retained tables and timetable here, or by honoring a cache-provided release method when one
+    exists.  The caller's local reference is dropped by :class:`StreamedTransitionSession` after
+    this function returns.
+    """
+    if cache is None:
+        raise RuntimeError("cannot release a missing streamed modulation cache")
+
+    release = getattr(cache, "release", None)
+    if callable(release):
+        release()
+        tables = getattr(cache, "tables", None)
+        if isinstance(tables, list) and tables:
+            raise RuntimeError("streamed cache release returned with retained modulation tables")
+        return
+
+    tables = getattr(cache, "tables", None)
+    if not isinstance(tables, list):
+        raise RuntimeError("streamed modulation cache has no bounded release path")
+    tables.clear()
+    try:
+        setattr(cache, "tables", [])
+        if hasattr(cache, "timesteps"):
+            setattr(cache, "timesteps", None)
+    except BaseException as exc:
+        raise RuntimeError("streamed modulation cache references could not be dropped") from exc
+    if getattr(cache, "tables", None):
+        raise RuntimeError("streamed modulation cache tables remained live after release")
+
+
+def _mark_streamed_transition_cleanup(
+    error: BaseException,
+    *,
+    started: bool,
+    succeeded: bool,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Attach distinct cleanup state without replacing the primary runtime exception."""
+    for name, value in (
+        ("streamed_transition_cleanup_started", started),
+        ("streamed_transition_cleanup_succeeded", succeeded),
+        ("streamed_transition_cleanup_error", cleanup_error),
+    ):
+        try:
+            setattr(error, name, value)
+        except BaseException:
+            # Exception annotation is diagnostic only; never mask the runtime failure.
+            pass
+
+
+class StreamedTransitionSession:
+    """Own one derived streamed-AdaLN transition from cache build through release.
+
+    ``run`` performs one validated transformer forward and returns only after the streamed cache
+    has been released.  It deliberately does not call the scheduler: the returned predictions and
+    copied input latents are the scheduler-facing boundary.  Packed token metadata and modality
+    indices are passed through unchanged, including fixed keyframe or reference rows; this class
+    does not assume a text/audio/video-only layout or slice target rows on the caller's behalf.
+
+    The instance may be reused for sequential transitions, but it rejects reentrant use while a
+    cache is active.  The cache builder and releaser are injectable for MLX-free contract tests;
+    the defaults use the established streamed sidecar builder and the bounded runtime release
+    helper above.
+    """
+
+    def __init__(
+        self,
+        transformer: Any,
+        *,
+        cache_builder: Callable[[Any, Any], Any] | None = None,
+        cache_releaser: Callable[[Any], None] | None = None,
+    ) -> None:
+        self._transformer = transformer
+        self._cache_builder = cache_builder or _default_streamed_cache_builder
+        self._cache_releaser = cache_releaser or release_streamed_modulation_cache
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        """Whether this session currently owns an unreleased streamed cache."""
+        return self._active
+
+    def run(
+        self,
+        scheduler: Any,
+        *,
+        video_latent: Any,
+        audio_latent: Any,
+        text_embedding: Any,
+        timestep: Any,
+        timestep_indices: Any,
+        token_tags: Any,
+        position_ids: Any,
+        video_indices: Any,
+        audio_indices: Any,
+        text_indices: Any,
+        step_index: int,
+        expected_video_shape: tuple[int, ...] | None = CANONICAL_VIDEO_SHAPE,
+        expected_audio_shape: tuple[int, ...] | None = CANONICAL_AUDIO_SHAPE,
+        expected_text_shape: tuple[int, ...] | None = CANONICAL_TEXT_SHAPE,
+        expected_video_dtype: str = CANONICAL_VIDEO_DTYPE,
+        expected_audio_dtype: str = CANONICAL_AUDIO_DTYPE,
+        expected_text_dtype: str = CANONICAL_TEXT_DTYPE,
+        expected_prediction_dtype: str = CANONICAL_PREDICTION_DTYPE,
+    ) -> StreamedTransitionResult:
+        """Build, forward, materialize, release, and return one transition result.
+
+        The existing :func:`validated_transformer_forward` owns the explicit prediction
+        materialization boundary.  Any failure before return prevents a scheduler-facing result
+        from being produced; a cache acquired before that failure is released in the surrounding
+        cleanup boundary.  If both the forward and release fail, the forward exception remains the
+        raised exception and carries the release exception as
+        ``streamed_transition_cleanup_error``.
+        """
+        if self._active:
+            raise RuntimeError("streamed transition session already owns an active cache")
+        self._active = True
+        cache = None
+        primary_error: BaseException | None = None
+        release_error: BaseException | None = None
+
+        try:
+            try:
+                built = self._cache_builder(self._transformer, timestep)
+                cache = _split_streamed_cache_builder_result(built)
+                if cache is None:
+                    raise ValueError("streamed cache builder returned no cache")
+                forward = validated_transformer_forward(
+                    self._transformer,
+                    scheduler,
+                    video_latent=video_latent,
+                    audio_latent=audio_latent,
+                    text_embedding=text_embedding,
+                    timestep=timestep,
+                    timestep_indices=timestep_indices,
+                    token_tags=token_tags,
+                    position_ids=position_ids,
+                    video_indices=video_indices,
+                    audio_indices=audio_indices,
+                    text_indices=text_indices,
+                    step_index=step_index,
+                    modulation_cache=cache,
+                    expected_video_shape=expected_video_shape,
+                    expected_audio_shape=expected_audio_shape,
+                    expected_text_shape=expected_text_shape,
+                    expected_video_dtype=expected_video_dtype,
+                    expected_audio_dtype=expected_audio_dtype,
+                    expected_text_dtype=expected_text_dtype,
+                    expected_prediction_dtype=expected_prediction_dtype,
+                )
+                result = StreamedTransitionResult(
+                    step_index=step_index,
+                    forward=forward,
+                )
+                return result
+            except BaseException as exc:
+                primary_error = exc
+                raise
+        finally:
+            try:
+                if cache is not None:
+                    try:
+                        self._cache_releaser(cache)
+                    except BaseException as exc:
+                        release_error = exc
+                        if primary_error is not None:
+                            _mark_streamed_transition_cleanup(
+                                primary_error,
+                                started=True,
+                                succeeded=False,
+                                cleanup_error=release_error,
+                            )
+                        else:
+                            _mark_streamed_transition_cleanup(
+                                release_error,
+                                started=True,
+                                succeeded=False,
+                                cleanup_error=None,
+                            )
+                    else:
+                        if primary_error is not None:
+                            _mark_streamed_transition_cleanup(
+                                primary_error,
+                                started=True,
+                                succeeded=True,
+                                cleanup_error=None,
+                            )
+                elif primary_error is not None and not hasattr(
+                    primary_error, "streamed_transition_cleanup_started"
+                ):
+                    # A builder failure owns any partial-build cleanup internally; no complete
+                    # cache was returned to this session for a second release.
+                    _mark_streamed_transition_cleanup(
+                        primary_error,
+                        started=False,
+                        succeeded=False,
+                        cleanup_error=None,
+                    )
+            finally:
+                # This is the ownership boundary: neither the reusable session nor the returned
+                # result retains the cache after a transition, including failure paths.
+                cache = None
+                self._active = False
+            if release_error is not None and primary_error is None:
+                raise release_error
+
+
+@dataclass(frozen=True)
 class DenoiseStepReceipt:
     """The complete observable result of one loop transition."""
 
