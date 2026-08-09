@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from minimax_h3_mlx.media import save_frames, save_mp4, save_wav
+from minimax_h3_mlx.media import FFmpegUnavailableError, save_frames, save_mp4, save_wav
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 
 DEFAULT_CHECKPOINT = "/Volumes/models/MiniMax-H3/FL2VA"
@@ -83,7 +83,7 @@ def main() -> int:
         save_mp4(output, result.video, result.fps, result.audio, result.sample_rate)
         print(f"\nwrote {output} ({result.video.shape[0]} frames, "
               f"{result.audio.shape[-1] / result.sample_rate:.2f}s audio)")
-    except RuntimeError as exc:
+    except FFmpegUnavailableError as exc:
         print(f"\nffmpeg unavailable ({exc}); writing frames and wav instead")
         save_frames(output.with_suffix(""), result.video)
         save_wav(output.with_suffix(".wav"), result.audio, result.sample_rate)

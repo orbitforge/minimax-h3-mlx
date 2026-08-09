@@ -18,6 +18,14 @@ from pathlib import Path
 import numpy as np
 
 
+class FFmpegUnavailableError(RuntimeError):
+    """Raised when the ffmpeg executable cannot be found."""
+
+
+class FFmpegEncodingError(RuntimeError):
+    """Raised when a located ffmpeg process fails to encode the requested media."""
+
+
 def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
     """Write ``(channels, samples)`` float audio in ``[-1, 1]`` as 16-bit PCM."""
     path = Path(path)
@@ -45,11 +53,13 @@ def save_mp4(
 ) -> Path:
     """Encode ``(frames, height, width, 3)`` uint8 video, muxing audio when given.
 
-    Raises if ``ffmpeg`` is not on PATH; use :func:`save_frames` in that case.
+    Raises :class:`FFmpegUnavailableError` if ``ffmpeg`` is not on PATH; use
+    :func:`save_frames` in that case. A nonzero ffmpeg exit raises
+    :class:`FFmpegEncodingError` and must not be treated as an unavailable binary.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        raise RuntimeError("ffmpeg not found on PATH; use save_frames() instead.")
+        raise FFmpegUnavailableError("ffmpeg not found on PATH; use save_frames() instead.")
 
     path = Path(path)
     video = np.ascontiguousarray(video, dtype=np.uint8)
@@ -82,7 +92,7 @@ def save_mp4(
 
         process = subprocess.run(cmd, input=video.tobytes(), capture_output=True)
         if process.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {process.stderr.decode()[:500]}")
+            raise FFmpegEncodingError(f"ffmpeg failed: {process.stderr.decode()[:500]}")
 
         os.replace(staged_path, path)
         published = True
