@@ -3685,6 +3685,7 @@ class StreamedCacheSessionProvider:
             ATTRIBUTION_SESSION_EVENT,
             {
                 "step_index": step_index,
+                "transition_index": step_index,
                 "cache_session_id": record["cache_session_id"],
                 "attribution_schema_version": ATTRIBUTION_SCHEMA_VERSION,
                 "wall_clock_cache_session_total_seconds": updated["wall_clock_cache_session_total_seconds"],

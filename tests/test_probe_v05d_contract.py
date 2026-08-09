@@ -438,6 +438,7 @@ class DeferredPrediction:
 class FakeCacheProvider(probe.StreamedCacheSessionProvider):
     def __init__(self, *, fail_build_step: int | None = None, events=None, fail_cleanup_step: int | None = None):
         self.test_events = events if events is not None else []
+        self.event_records: list[dict[str, object]] = []
         self.fail_build_step = fail_build_step
         self.fail_cleanup_step = fail_cleanup_step
 
@@ -471,6 +472,7 @@ class FakeCacheProvider(probe.StreamedCacheSessionProvider):
         super().__init__(builder, event_sink=self._record_event, cleanup_hook=cleanup)
 
     def _record_event(self, event, details):
+        self.event_records.append({"event": event, **dict(details)})
         self.test_events.append((event, details.get("step_index", details.get("transition_index"))))
 
 
@@ -1201,6 +1203,32 @@ class ProbeV05DContractTests(unittest.TestCase):
         self.assertEqual(attribution["sidecar_opens"], 50)
         self.assertEqual(attribution["sidecar_releases"], 50)
 
+    def test_real_provider_emits_canonical_session_attribution_transition_identity(self):
+        captured: list[tuple[str, dict[str, object]]] = []
+        provider = provider_for_sidecar_events(valid_sidecar_events())
+        provider.event_sink = lambda event, details: captured.append((event, dict(details)))
+        cache = provider.cache_for_step(0, np.asarray([0.0], dtype=np.float32))
+        provider.note_cache_construction_wall(0, 1.0)
+        provider.release_step(0, cache)
+
+        attribution_events = [details for event, details in captured if event == probe.ATTRIBUTION_SESSION_EVENT]
+        self.assertEqual(len(attribution_events), 1)
+        attribution = attribution_events[0]
+        self.assertEqual(attribution["cache_session_id"], "cache-session-01")
+        self.assertEqual(attribution["step_index"], 0)
+        self.assertEqual(attribution["transition_index"], 0)
+        self.assertTrue(
+            {
+                "attribution_schema_version",
+                "wall_clock_cache_session_total_seconds",
+                "component_totals_seconds",
+                "session_overhead_seconds",
+                "measured_component_sum_seconds",
+                "unattributed_remainder_seconds",
+                "unattributed_remainder_status",
+            }.issubset(attribution)
+        )
+
     def test_attribution_category_sums_are_preserved(self):
         attribution = probe.build_cache_session_attribution(
             full_builder_stats(),
@@ -1318,6 +1346,36 @@ class ProbeV05DContractTests(unittest.TestCase):
             path.write_text(path.read_text() + "{}\n")
             with self.assertRaisesRegex(ValueError, "stale"):
                 probe.validate_event_file_linkage(report, path)
+
+    def test_strict_event_validator_accepts_real_emitter_and_rejects_session_identity_mutations(self):
+        _result, _scheduler, provider, _calls, _events = run_fake()
+        original_records = [dict(record) for record in provider.event_records]
+        attribution_indices = [
+            index for index, record in enumerate(original_records) if record["event"] == probe.ATTRIBUTION_SESSION_EVENT
+        ]
+        self.assertEqual(len(attribution_indices), probe.EXPECTED_DENOISING_TRANSITIONS)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+
+            def write_records(records):
+                path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
+
+            write_records(original_records)
+            summary = probe.validate_event_stream(path)
+            self.assertEqual(summary["attribution_session_event_count"], probe.EXPECTED_DENOISING_TRANSITIONS)
+
+            missing_transition = [dict(record) for record in original_records]
+            missing_transition[attribution_indices[0]].pop("transition_index")
+            write_records(missing_transition)
+            with self.assertRaisesRegex(ValueError, "cache attribution session transition identity"):
+                probe.validate_event_stream(path)
+
+            mismatched_transition = [dict(record) for record in original_records]
+            mismatched_transition[attribution_indices[0]]["transition_index"] = 7
+            write_records(mismatched_transition)
+            with self.assertRaisesRegex(ValueError, "cache attribution session transition identity"):
+                probe.validate_event_stream(path)
 
     def test_telemetry_failure_is_recorded_and_cannot_report_a_released_success(self):
         provider = FakeCacheProvider()
