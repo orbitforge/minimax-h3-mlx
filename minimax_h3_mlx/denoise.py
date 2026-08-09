@@ -164,7 +164,8 @@ class StreamedTransitionSession:
     The instance may be reused for sequential transitions, but it rejects reentrant use while a
     cache is active.  The cache builder and releaser are injectable for MLX-free contract tests;
     the defaults use the established streamed sidecar builder and the bounded runtime release
-    helper above.
+    helper above.  An optional observer receives runtime-neutral phase events for proof or
+    diagnostics; it never owns the cache or changes the scheduler boundary.
     """
 
     def __init__(
@@ -173,10 +174,12 @@ class StreamedTransitionSession:
         *,
         cache_builder: Callable[[Any, Any], Any] | None = None,
         cache_releaser: Callable[[Any], None] | None = None,
+        observer: Callable[[str, Mapping[str, Any]], None] | None = None,
     ) -> None:
         self._transformer = transformer
         self._cache_builder = cache_builder or _default_streamed_cache_builder
         self._cache_releaser = cache_releaser or release_streamed_modulation_cache
+        self._observer = observer
         self._active = False
 
     @property
@@ -206,6 +209,7 @@ class StreamedTransitionSession:
         expected_audio_dtype: str = CANONICAL_AUDIO_DTYPE,
         expected_text_dtype: str = CANONICAL_TEXT_DTYPE,
         expected_prediction_dtype: str = CANONICAL_PREDICTION_DTYPE,
+        prediction_materializer: Callable[[Any, Any], None] | None = None,
     ) -> StreamedTransitionResult:
         """Build, forward, materialize, release, and return one transition result.
 
@@ -215,6 +219,9 @@ class StreamedTransitionSession:
         cleanup boundary.  If both the forward and release fail, the forward exception remains the
         raised exception and carries the release exception as
         ``streamed_transition_cleanup_error``.
+
+        ``prediction_materializer`` is an optional dependency-injection seam for proof doubles;
+        the session still controls when that callback runs and when cache release follows it.
         """
         if self._active:
             raise RuntimeError("streamed transition session already owns an active cache")
@@ -223,12 +230,32 @@ class StreamedTransitionSession:
         primary_error: BaseException | None = None
         release_error: BaseException | None = None
 
+        def observe(event: str, **details: Any) -> None:
+            if self._observer is not None:
+                self._observer(event, {"step_index": step_index, **details})
+
+        def materialize(video_prediction: Any, audio_prediction: Any) -> None:
+            # The transformer call has returned at this point, while the predictions are still
+            # deferred. Keeping these callbacks here makes the runtime ownership boundary visible
+            # to proof observers without moving proof terminology into the runtime seam.
+            observe("forward-complete")
+            observe("materialize-start")
+            if prediction_materializer is None:
+                materialize_predictions(video_prediction, audio_prediction)
+            else:
+                prediction_materializer(video_prediction, audio_prediction)
+            observe("materialize-complete")
+
         try:
             try:
+                observe("transition-start")
+                observe("cache-build-start")
                 built = self._cache_builder(self._transformer, timestep)
                 cache = _split_streamed_cache_builder_result(built)
                 if cache is None:
                     raise ValueError("streamed cache builder returned no cache")
+                observe("cache-build-complete")
+                observe("forward-start")
                 forward = validated_transformer_forward(
                     self._transformer,
                     scheduler,
@@ -251,7 +278,9 @@ class StreamedTransitionSession:
                     expected_audio_dtype=expected_audio_dtype,
                     expected_text_dtype=expected_text_dtype,
                     expected_prediction_dtype=expected_prediction_dtype,
+                    materialize=materialize,
                 )
+                observe("transition-succeeded")
                 result = StreamedTransitionResult(
                     step_index=step_index,
                     forward=forward,
@@ -259,14 +288,36 @@ class StreamedTransitionSession:
                 return result
             except BaseException as exc:
                 primary_error = exc
+                try:
+                    observe("transition-failed", cache_acquired=cache is not None)
+                except BaseException as observer_error:
+                    # Observer failures are diagnostic and must not replace the runtime failure.
+                    try:
+                        setattr(exc, "streamed_transition_observer_error", observer_error)
+                    except BaseException:
+                        pass
                 raise
         finally:
             try:
                 if cache is not None:
+                    release_observer_error: BaseException | None = None
+                    try:
+                        observe("cache-release-start", forward_succeeded=primary_error is None)
+                    except BaseException as exc:
+                        # Always attempt the actual release even if an observer is faulty.
+                        release_observer_error = exc
                     try:
                         self._cache_releaser(cache)
                     except BaseException as exc:
                         release_error = exc
+                    else:
+                        try:
+                            observe("cache-release-complete", forward_succeeded=primary_error is None)
+                        except BaseException as exc:
+                            release_error = exc
+                    if release_error is None and release_observer_error is not None:
+                        release_error = release_observer_error
+                    if release_error is not None:
                         if primary_error is not None:
                             _mark_streamed_transition_cleanup(
                                 primary_error,
@@ -281,14 +332,13 @@ class StreamedTransitionSession:
                                 succeeded=False,
                                 cleanup_error=None,
                             )
-                    else:
-                        if primary_error is not None:
-                            _mark_streamed_transition_cleanup(
-                                primary_error,
-                                started=True,
-                                succeeded=True,
-                                cleanup_error=None,
-                            )
+                    elif primary_error is not None:
+                        _mark_streamed_transition_cleanup(
+                            primary_error,
+                            started=True,
+                            succeeded=True,
+                            cleanup_error=None,
+                        )
                 elif primary_error is not None and not hasattr(
                     primary_error, "streamed_transition_cleanup_started"
                 ):

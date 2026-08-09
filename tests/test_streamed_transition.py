@@ -224,6 +224,44 @@ class StreamedTransitionSessionTests(unittest.TestCase):
         self.assertFalse(hasattr(result, "cache"))
         self.assertFalse(session.active)
 
+    def test_optional_runtime_observer_reports_lifecycle_without_owning_it(self):
+        events: list[str] = []
+        observed: list[tuple[str, int]] = []
+        builder = FakeBuilder(events)
+        transformer = FakeTransformer(events)
+
+        def release(cache):
+            events.append("release")
+            cache.tables.clear()
+            cache.timesteps = None
+
+        session = StreamedTransitionSession(
+            transformer,
+            cache_builder=builder,
+            cache_releaser=release,
+            observer=lambda event, details: observed.append((event, details["step_index"])),
+        )
+        self.run_transition(session)
+
+        self.assertEqual(
+            [event for event, _step in observed],
+            [
+                "transition-start",
+                "cache-build-start",
+                "cache-build-complete",
+                "forward-start",
+                "forward-complete",
+                "materialize-start",
+                "materialize-complete",
+                "transition-succeeded",
+                "cache-release-start",
+                "cache-release-complete",
+            ],
+        )
+        self.assertTrue(all(step == 0 for _event, step in observed))
+        self.assertEqual(events[-1], "release")
+        self.assertFalse(session.active)
+
     def test_session_reuses_sequentially_without_overlapping_caches(self):
         events: list[str] = []
         builder = FakeBuilder(events)

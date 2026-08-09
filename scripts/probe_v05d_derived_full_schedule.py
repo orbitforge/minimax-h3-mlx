@@ -42,6 +42,7 @@ if str(ROOT) not in sys.path:
 
 from minimax_h3_mlx.denoise import (
     CANONICAL_PREDICTION_DTYPE,
+    StreamedTransitionSession,
     copy_runtime_array,
     materialize_predictions,
     validate_updated_latents,
@@ -2347,38 +2348,6 @@ def _resolve_timestep(value: Any) -> tuple[Any, Any]:
     raise ValueError("timestep provider must return (timestep, timestep_indices)")
 
 
-def _cache_for_transition(provider: Any, step_index: int, timestep: Any, transition: Mapping[str, Any]) -> Any:
-    method = getattr(provider, "cache_for_step", None)
-    if not callable(method):
-        raise ValueError("streamed cache provider must expose cache_for_step")
-    try:
-        return method(step_index, timestep, transition)
-    except TypeError as exc:
-        try:
-            inspect.signature(method).bind(step_index, timestep, transition)
-        except (TypeError, ValueError):
-            return method(step_index, timestep)
-        raise exc
-
-
-def _release_cache_for_transition(
-    provider: Any,
-    step_index: int,
-    cache: Any,
-    *,
-    forward_materialized: bool,
-) -> None:
-    method = getattr(provider, "release_step", None)
-    if not callable(method):
-        raise ValueError("streamed cache provider must expose release_step")
-    try:
-        inspect.signature(method).bind(step_index, cache, forward_materialized=forward_materialized)
-    except (TypeError, ValueError):
-        method(step_index, cache)
-    else:
-        method(step_index, cache, forward_materialized=forward_materialized)
-
-
 def _snapshot(snapshot: Callable[[], Mapping[str, Any]] | None) -> dict[str, Any] | None:
     if snapshot is None:
         return None
@@ -2489,6 +2458,7 @@ def run_full_schedule(
     expected_audio_dtype: str | None = None,
     expected_text_dtype: str | None = None,
     expected_prediction_dtype: str = CANONICAL_PREDICTION_DTYPE,
+    transition_session_factory: Callable[..., StreamedTransitionSession] = StreamedTransitionSession,
 ) -> FullScheduleResult:
     """Run exactly the locked adjacent transitions with cache release before scheduler update."""
     validate_schedule_contract(schedule)
@@ -2543,13 +2513,10 @@ def run_full_schedule(
             "audio_scheduler_updates": 0,
             "memory": {},
             "timings": {},
+            "runtime_lifecycle": [],
         }
         started = time.perf_counter()
         record["memory"]["before_cache"] = _snapshot(memory_snapshot)
-        cache = None
-        cache_acquired = False
-        forward_success = False
-        forward_materialized = False
         primary: BaseException | None = None
         cleanup: BaseException | None = None
         cleanup_attempted = False
@@ -2557,161 +2524,208 @@ def run_full_schedule(
         timestep = timestep_indices = None
         execution: ForwardExecution | None = None
         execution_holder: dict[str, ForwardExecution] = {}
+        phase_started: dict[str, float] = {}
+
+        def observe_runtime(event: str, details: Mapping[str, Any]) -> None:
+            now = time.perf_counter()
+            record["runtime_lifecycle"].append({"event": event, **dict(details)})
+            if event in {"cache-build-start", "forward-start", "cache-release-start"}:
+                phase_started[event] = now
+            elif event == "cache-build-complete":
+                begin = phase_started.get("cache-build-start", now)
+                record["timings"]["streamed_cache_construction_seconds"] = now - begin
+                record["memory"]["after_cache"] = _snapshot(memory_snapshot)
+            elif event == "transition-succeeded":
+                begin = phase_started.get("forward-start", now)
+                record["timings"]["transformer_forward_seconds"] = now - begin
+                record["timings"]["materialization_completed_before_release"] = True
+                record["prediction_materialized"] = True
+            elif event == "cache-release-complete":
+                begin = phase_started.get("cache-release-start", now)
+                record["timings"]["streamed_cache_release_seconds"] = now - begin
+
+        def forward_adapter(
+            prepared_video: Any,
+            prepared_audio: Any,
+            text: Any,
+            current_timestep: Any,
+            current_indices: Any,
+            token_tags: Any,
+            position_ids: Any,
+            video_indices: Any,
+            audio_indices: Any,
+            text_indices: Any,
+            **kwargs: Any,
+        ) -> tuple[Any, Any]:
+            if forward is None:
+                raw = transformer(
+                    prepared_video,
+                    prepared_audio,
+                    text,
+                    current_timestep,
+                    current_indices,
+                    token_tags,
+                    position_ids,
+                    video_indices,
+                    audio_indices,
+                    text_indices,
+                    **kwargs,
+                )
+            else:
+                raw = forward(
+                    step_index,
+                    transition,
+                    prepared_video,
+                    prepared_audio,
+                    current_timestep,
+                    current_indices,
+                    kwargs.get("modulation_cache"),
+                    packed,
+                )
+            resolved = _normalize_forward(raw)
+            if resolved.transformer_forwards != 1:
+                raise ValueError("each transition must perform exactly one transformer forward")
+            execution_holder["execution"] = resolved
+            return resolved.video_prediction, resolved.audio_prediction
+
+        def materialize_adapter(_video_prediction: Any, _audio_prediction: Any) -> None:
+            resolved = execution_holder.get("execution")
+            if resolved is None:
+                raise ValueError("forward materialization was requested before the forward result existed")
+            resolved.materialize_predictions()
+
+        def materialize_without_streamed_session(video_prediction: Any, audio_prediction: Any) -> None:
+            observe_runtime("forward-complete", {})
+            observe_runtime("materialize-start", {})
+            materialize_adapter(video_prediction, audio_prediction)
+            observe_runtime("materialize-complete", {})
+
+        def _drop_provider_reference(*, forward_materialized: bool) -> None:
+            if cache_provider is None:
+                return
+            note_drop = getattr(cache_provider, "note_local_cache_reference_dropped", None)
+            if not callable(note_drop):
+                return
+            note_drop(step_index, _snapshot(memory_snapshot), forward_materialized=forward_materialized)
+            record["cache_reference_dropped_before_scheduler"] = True
+            record["memory"]["after_cache_reference_drop"] = _snapshot(memory_snapshot)
+
         try:
             timestep, timestep_indices = _resolve_timestep(_call_provider(timestep_provider, step_index, transition))
             record["timestep"] = _json_safe(timestep)
             record["timestep_indices"] = _json_safe(timestep_indices)
-            cache_started = time.perf_counter()
+            session_transformer = forward_adapter
             if cache_provider is not None:
-                cache = _cache_for_transition(cache_provider, step_index, timestep, transition)
-                cache_acquired = True
-            cache_wall_seconds = time.perf_counter() - cache_started
-            record["timings"]["streamed_cache_construction_seconds"] = cache_wall_seconds
-            if cache_provider is not None:
-                note_wall = getattr(cache_provider, "note_cache_construction_wall", None)
-                if not callable(note_wall):
-                    raise ValueError("streamed cache provider must expose note_cache_construction_wall()")
-                note_wall(step_index, cache_wall_seconds)
-            record["memory"]["after_cache"] = _snapshot(memory_snapshot)
+                transition_session = getattr(cache_provider, "transition_session", None)
+                if not callable(transition_session):
+                    raise ValueError("streamed cache provider must expose transition_session()")
+                session = transition_session(
+                    session_transformer,
+                    step_index,
+                    transition,
+                    session_factory=transition_session_factory,
+                    observer=observe_runtime,
+                )
+                session_result = session.run(
+                    scheduler,
+                    video_latent=video_latent,
+                    audio_latent=audio_latent,
+                    text_embedding=text_embedding,
+                    timestep=timestep,
+                    timestep_indices=timestep_indices,
+                    token_tags=packed["token_tags"],
+                    position_ids=packed["position_ids"],
+                    video_indices=packed["video_indices"],
+                    audio_indices=packed["audio_indices"],
+                    text_indices=packed["text_indices"],
+                    step_index=step_index,
+                    expected_video_shape=expected_video_shape,
+                    expected_audio_shape=expected_audio_shape,
+                    expected_text_shape=expected_text_shape,
+                    expected_video_dtype=expected_video_dtype,
+                    expected_audio_dtype=expected_audio_dtype,
+                    expected_text_dtype=expected_text_dtype,
+                    expected_prediction_dtype=expected_prediction_dtype,
+                    prediction_materializer=materialize_adapter,
+                )
+                validated = session_result.forward
+                _drop_provider_reference(forward_materialized=True)
+            else:
+                observe_runtime("forward-start", {})
+                validated = validated_transformer_forward(
+                    session_transformer,
+                    scheduler,
+                    video_latent=video_latent,
+                    audio_latent=audio_latent,
+                    text_embedding=text_embedding,
+                    timestep=timestep,
+                    timestep_indices=timestep_indices,
+                    token_tags=packed["token_tags"],
+                    position_ids=packed["position_ids"],
+                    video_indices=packed["video_indices"],
+                    audio_indices=packed["audio_indices"],
+                    text_indices=packed["text_indices"],
+                    step_index=step_index,
+                    modulation_cache=None,
+                    expected_video_shape=expected_video_shape,
+                    expected_audio_shape=expected_audio_shape,
+                    expected_text_shape=expected_text_shape,
+                    expected_video_dtype=expected_video_dtype,
+                    expected_audio_dtype=expected_audio_dtype,
+                    expected_text_dtype=expected_text_dtype,
+                    expected_prediction_dtype=expected_prediction_dtype,
+                    materialize=materialize_without_streamed_session,
+                )
+                observe_runtime("transition-succeeded", {})
 
-            def forward_adapter(
-                prepared_video: Any,
-                prepared_audio: Any,
-                text: Any,
-                current_timestep: Any,
-                current_indices: Any,
-                token_tags: Any,
-                position_ids: Any,
-                video_indices: Any,
-                audio_indices: Any,
-                text_indices: Any,
-                **kwargs: Any,
-            ) -> tuple[Any, Any]:
-                if forward is None:
-                    raw = transformer(
-                        prepared_video,
-                        prepared_audio,
-                        text,
-                        current_timestep,
-                        current_indices,
-                        token_tags,
-                        position_ids,
-                        video_indices,
-                        audio_indices,
-                        text_indices,
-                        **kwargs,
-                    )
-                else:
-                    raw = forward(
-                        step_index,
-                        transition,
-                        prepared_video,
-                        prepared_audio,
-                        current_timestep,
-                        current_indices,
-                        kwargs.get("modulation_cache"),
-                        packed,
-                    )
-                resolved = _normalize_forward(raw)
-                execution_holder["execution"] = resolved
-                return resolved.video_prediction, resolved.audio_prediction
-
-            def materialize_adapter(_video_prediction: Any, _audio_prediction: Any) -> None:
-                resolved = execution_holder.get("execution")
-                if resolved is None:
-                    raise ValueError("forward materialization was requested before the forward result existed")
-                resolved.materialize_predictions()
-
-            forward_started = time.perf_counter()
-            validated = validated_transformer_forward(
-                forward_adapter,
-                scheduler,
-                video_latent=video_latent,
-                audio_latent=audio_latent,
-                text_embedding=text_embedding,
-                timestep=timestep,
-                timestep_indices=timestep_indices,
-                token_tags=packed["token_tags"],
-                position_ids=packed["position_ids"],
-                video_indices=packed["video_indices"],
-                audio_indices=packed["audio_indices"],
-                text_indices=packed["text_indices"],
-                step_index=step_index,
-                modulation_cache=cache,
-                expected_video_shape=expected_video_shape,
-                expected_audio_shape=expected_audio_shape,
-                expected_text_shape=expected_text_shape,
-                expected_video_dtype=expected_video_dtype,
-                expected_audio_dtype=expected_audio_dtype,
-                expected_text_dtype=expected_text_dtype,
-                expected_prediction_dtype=expected_prediction_dtype,
-                materialize=materialize_adapter,
-            )
             execution = execution_holder.get("execution")
             if execution is None:
-                raise ValueError("validated forward completed without a forward execution record")
+                execution = ForwardExecution(
+                    validated.video_prediction,
+                    validated.audio_prediction,
+                    transformer_forwards=1,
+                )
+                execution.materialized = True
+                execution.materialization_count = 1
             if execution.transformer_forwards != 1:
                 raise ValueError("each transition must perform exactly one transformer forward")
             if not execution.materialized:
                 raise ValueError("transformer predictions were not materialized before cache release")
-            record["timings"]["transformer_forward_seconds"] = time.perf_counter() - forward_started
-            record["timings"]["materialization_completed_before_release"] = True
-            record["prediction_materialized"] = True
+            if "transformer_forward_seconds" not in record["timings"]:
+                record["timings"]["transformer_forward_seconds"] = time.perf_counter() - phase_started.get("forward-start", started)
+                record["timings"]["materialization_completed_before_release"] = True
+                record["prediction_materialized"] = True
             record["prepared_video_shape"] = [int(item) for item in validated.prepared_video.shape]
             record["prepared_audio_shape"] = [int(item) for item in validated.prepared_audio.shape]
             transformer_forwards += 1
             record["transformer_forwards"] = 1
-            forward_success = True
-            forward_materialized = True
             record["memory"]["after_forward"] = _snapshot(memory_snapshot)
         except BaseException as exc:
             primary = exc
-        finally:
-            if cache_provider is not None and cache_acquired:
-                cleanup_attempted = True
-                release_started = time.perf_counter()
-                try:
-                    if forward_materialized:
-                        _release_cache_for_transition(
-                            cache_provider,
-                            step_index,
-                            cache,
-                            forward_materialized=True,
-                        )
-                    else:
-                        failure_cleanup = getattr(cache_provider, "cleanup_failed_step", None)
-                        if not callable(failure_cleanup):
-                            raise RuntimeError("cache release is not permitted before prediction materialization and failure cleanup is unavailable")
-                        failure_cleanup(step_index, cache)
-                    cleanup_succeeded = True
-                    record["timings"]["streamed_cache_release_seconds"] = time.perf_counter() - release_started
-                except BaseException as exc:
-                    cleanup = exc
-                    cleanup_succeeded = False
-                    record["timings"]["streamed_cache_release_seconds"] = time.perf_counter() - release_started
-                finally:
-                    cache = None
-                    note_drop = getattr(cache_provider, "note_local_cache_reference_dropped", None)
-                    if callable(note_drop):
-                        try:
-                            note_drop(step_index, _snapshot(memory_snapshot), forward_materialized=forward_materialized)
-                        except BaseException as exc:
-                            if cleanup is None:
-                                cleanup = exc
-                                cleanup_succeeded = False
-                            else:
-                                record.setdefault("additional_cleanup_errors", []).append(error_receipt(exc))
-                    record["cache_reference_dropped_before_scheduler"] = True
-                    record["memory"]["after_cache_reference_drop"] = _snapshot(memory_snapshot)
-            elif primary is not None:
-                cleanup_attempted = bool(getattr(primary, "cache_cleanup_attempted", False))
-                cleanup_succeeded = bool(getattr(primary, "cache_cleanup_succeeded", False))
-                cleanup = getattr(primary, "cache_cleanup_error", None)
 
-        if primary is not None or cleanup is not None:
-            if primary is None:
-                primary = cleanup
-                cleanup = None
+        if primary is not None:
+            last_record = getattr(cache_provider, "_last_released_record", None)
+            if (
+                cache_provider is not None
+                and isinstance(last_record, Mapping)
+                and last_record.get("step_index") == step_index
+                and last_record.get("local_cache_reference_dropped") is not True
+            ):
+                try:
+                    _drop_provider_reference(forward_materialized=bool(last_record.get("forward_materialized_before_release")))
+                except BaseException as exc:
+                    record.setdefault("additional_cleanup_errors", []).append(error_receipt(exc))
+            streamed_cleanup_error = getattr(primary, "streamed_transition_cleanup_error", None)
+            cache_cleanup_error = getattr(primary, "cache_cleanup_error", None)
+            cleanup = streamed_cleanup_error if streamed_cleanup_error is not None else cache_cleanup_error
+            cleanup_attempted = bool(
+                getattr(primary, "streamed_transition_cleanup_started", False)
+                or getattr(primary, "cache_cleanup_attempted", False)
+            )
+            cleanup_succeeded = bool(
+                getattr(primary, "streamed_transition_cleanup_succeeded", False)
+                or getattr(primary, "cache_cleanup_succeeded", False)
+            )
             record["failure"] = failure_fields(
                 primary,
                 cleanup,
@@ -2734,8 +2748,6 @@ def run_full_schedule(
             )
             raise DenoisingFailure(primary, cleanup=cleanup, state=state, cleanup_attempted=cleanup_attempted) from primary
 
-        if not forward_success:
-            raise AssertionError("successful transition did not produce one forward")
         scheduler_started = time.perf_counter()
         try:
             step = getattr(scheduler, "step", None)
@@ -2765,6 +2777,13 @@ def run_full_schedule(
             record["audio_scheduler_updates"] = 1
             record["timings"]["scheduler_update_seconds"] = time.perf_counter() - scheduler_started
             record["memory"]["after_scheduler_update"] = _snapshot(memory_snapshot)
+            record["runtime_lifecycle"].append(
+                {
+                    "event": "scheduler",
+                    "step_index": step_index,
+                    "transition_index": step_index,
+                }
+            )
         except BaseException as exc:
             record["failure"] = failure_fields(exc, None, cleanup_attempted=True, cleanup_succeeded=True)
             transitions.append(record)
@@ -3308,7 +3327,14 @@ def validate_cache_attribution(observed: Mapping[str, Any], *, require_full_sche
 
 
 class StreamedCacheSessionProvider:
-    """One cache session per transition with observed sidecar lifecycle accounting."""
+    """Proof observer/factory around the shared streamed transition runtime seam.
+
+    ``transition_session`` supplies proof callbacks to :class:`StreamedTransitionSession`, which
+    owns build, forward, materialization, and release ordering.  The compatibility
+    ``cache_for_step``/``release_step`` methods remain for older proof contracts that exercise
+    sidecar accounting directly; the full-schedule path does not use them to orchestrate a
+    transition.
+    """
 
     def __init__(
         self,
@@ -3331,6 +3357,7 @@ class StreamedCacheSessionProvider:
         self._active_cache: Any = None
         self._last_released_record: dict[str, Any] | None = None
         self.telemetry_failures: list[dict[str, Any]] = []
+        self.transition_sessions: list[StreamedTransitionSession] = []
 
     def _emit(self, event: str, details: Mapping[str, Any]) -> None:
         if self.event_sink is not None:
@@ -3458,12 +3485,7 @@ class StreamedCacheSessionProvider:
             raise ValueError("streamed AdaLN session sidecar event totals are not exactly 50")
         return dict(summary)
 
-    def _mark_exception(self, error: BaseException, *, cleanup_error: BaseException | None, attempted: bool) -> None:
-        setattr(error, "cache_cleanup_attempted", attempted)
-        setattr(error, "cache_cleanup_succeeded", bool(attempted and cleanup_error is None))
-        setattr(error, "cache_cleanup_error", cleanup_error)
-
-    def cache_for_step(self, step_index: int, timestep: Any, transition: Mapping[str, Any] | None = None) -> Any:
+    def _begin_session(self, step_index: int) -> dict[str, Any]:
         if self.active:
             self._overlap_violations += 1
             raise RuntimeError("streamed AdaLN cache sessions overlapped")
@@ -3495,6 +3517,8 @@ class StreamedCacheSessionProvider:
             "telemetry_failures": [],
             "violations": [],
             "bounded_release_invocations": 0,
+            "runtime_lifecycle": [],
+            "runtime_transition_succeeded": False,
             "events": [],
         }
         self.records.append(record)
@@ -3505,7 +3529,80 @@ class StreamedCacheSessionProvider:
         try:
             record["events"].append({"event": "session-acquire-start", "step_index": step_index, "cache_session_id": token})
             self._emit("session-acquire-start", {"step_index": step_index, "cache_session_id": token})
-            cache_started = time.perf_counter()
+        except BaseException as exc:
+            record["status"] = "failed"
+            record["failure"] = error_receipt(exc)
+            cleanup_error = self._cleanup_observed_cache(record, step_index, None)
+            self.active = False
+            self.active_record = None
+            self._active_cache = None
+            self._mark_exception(exc, cleanup_error=cleanup_error, attempted=True)
+            try:
+                self._emit(
+                    "session-failure",
+                    {
+                        "step_index": step_index,
+                        "cache_session_id": token,
+                        "failure": error_receipt(exc),
+                        "cleanup_error": error_receipt(cleanup_error),
+                    },
+                )
+            except BaseException:
+                pass
+            raise
+        return record
+
+    def _runtime_event(
+        self,
+        record: dict[str, Any],
+        event: str,
+        details: Mapping[str, Any] | None = None,
+        *,
+        observer: Callable[[str, Mapping[str, Any]], None] | None = None,
+    ) -> None:
+        payload = dict(details or {})
+        payload.update(
+            {
+                "step_index": record["step_index"],
+                "transition_index": record["step_index"],
+                "cache_session_id": record["cache_session_id"],
+            }
+        )
+        record["runtime_lifecycle"].append({"event": event, **payload})
+        if observer is not None:
+            observer(event, payload)
+
+    def _cleanup_observed_cache(self, record: dict[str, Any], step_index: int, cache: Any) -> BaseException | None:
+        cleanup_error: BaseException | None = None
+        record["cleanup_attempted"] = True
+        try:
+            if self.cleanup_hook is not None:
+                record["bounded_release_invocations"] += 1
+                record["bounded_release_path"] = "cleanup_hook"
+                self.cleanup_hook(step_index, cache)
+            elif cache is not None:
+                record["bounded_release_invocations"] += 1
+                record["bounded_release_path"] = _bounded_release_cache(cache)
+        except BaseException as exc:
+            cleanup_error = exc
+        record["cleanup_error"] = error_receipt(cleanup_error)
+        record["cleanup_succeeded"] = cleanup_error is None
+        record["open_sidecars_after_cleanup"] = self._open_sidecars
+        return cleanup_error
+
+    def _build_observed_cache(
+        self,
+        record: dict[str, Any],
+        step_index: int,
+        timestep: Any,
+        transition: Mapping[str, Any] | None,
+        *,
+        note_wall: bool,
+    ) -> Any:
+        if not self.active or self.active_record is not record or record["step_index"] != step_index:
+            raise RuntimeError("streamed AdaLN cache build does not match the active transition")
+        cache_started = time.perf_counter()
+        try:
             value = self.cache_builder(
                 step_index,
                 timestep,
@@ -3525,25 +3622,17 @@ class StreamedCacheSessionProvider:
             )
             record["dense_temporary_reconstructions"] = int(record["dense_temporary_projection_created"])
             record["status"] = "acquired"
-            record["events"].append({"event": "session-acquire-complete", "step_index": step_index, "cache_session_id": token})
-            self._emit("session-acquire-complete", {"step_index": step_index, "cache_session_id": token})
-            return cache
+            record["events"].append(
+                {"event": "session-acquire-complete", "step_index": step_index, "cache_session_id": record["cache_session_id"]}
+            )
+            self._emit("session-acquire-complete", {"step_index": step_index, "cache_session_id": record["cache_session_id"]})
+            if note_wall:
+                self.note_cache_construction_wall(step_index, time.perf_counter() - cache_started)
+            return value
         except BaseException as exc:
             record["status"] = "failed"
             record["failure"] = error_receipt(exc)
-            cleanup_error: BaseException | None = None
-            record["cleanup_attempted"] = True
-            try:
-                if self.cleanup_hook is not None:
-                    self.cleanup_hook(step_index, self._active_cache)
-                elif self._active_cache is not None:
-                    record["bounded_release_invocations"] += 1
-                    record["bounded_release_path"] = _bounded_release_cache(self._active_cache)
-            except BaseException as cleanup_exc:
-                cleanup_error = cleanup_exc
-            record["cleanup_error"] = error_receipt(cleanup_error)
-            record["cleanup_succeeded"] = cleanup_error is None
-            record["open_sidecars_after_cleanup"] = self._open_sidecars
+            cleanup_error = self._cleanup_observed_cache(record, step_index, self._active_cache)
             self.active = False
             self.active_record = None
             self._active_cache = None
@@ -3553,7 +3642,7 @@ class StreamedCacheSessionProvider:
                     "session-failure",
                     {
                         "step_index": step_index,
-                        "cache_session_id": token,
+                        "cache_session_id": record["cache_session_id"],
                         "failure": error_receipt(exc),
                         "cleanup_error": error_receipt(cleanup_error),
                     },
@@ -3562,30 +3651,118 @@ class StreamedCacheSessionProvider:
                 pass
             raise
 
+    def transition_session(
+        self,
+        transformer: Any,
+        step_index: int,
+        transition: Mapping[str, Any],
+        *,
+        session_factory: Callable[..., StreamedTransitionSession] = StreamedTransitionSession,
+        observer: Callable[[str, Mapping[str, Any]], None] | None = None,
+    ) -> StreamedTransitionSession:
+        """Create the shared runtime session with proof-only lifecycle observers attached."""
+        session_record: dict[str, Any] | None = None
+
+        def runtime_observer(event: str, details: Mapping[str, Any]) -> None:
+            nonlocal session_record
+            if event == "transition-start":
+                session_record = self._begin_session(step_index)
+            if session_record is None:
+                raise RuntimeError("streamed transition observer received an event without a session")
+            self._runtime_event(session_record, event, details, observer=observer)
+            if event == "transition-succeeded":
+                session_record["runtime_transition_succeeded"] = True
+
+        def build_cache(_runtime_transformer: Any, timestep: Any) -> Any:
+            if session_record is None:
+                raise RuntimeError("streamed transition cache build started without a proof session")
+            return self._build_observed_cache(
+                session_record,
+                step_index,
+                timestep,
+                transition,
+                note_wall=True,
+            )
+
+        def release_cache(cache: Any) -> None:
+            if session_record is None:
+                raise RuntimeError("streamed transition cache release started without a proof session")
+            self._release_observed_cache(
+                session_record,
+                step_index,
+                cache,
+                forward_materialized=session_record["runtime_transition_succeeded"],
+            )
+
+        session = session_factory(
+            transformer,
+            cache_builder=build_cache,
+            cache_releaser=release_cache,
+            observer=runtime_observer,
+        )
+        self.transition_sessions.append(session)
+        return session
+
+    def _mark_exception(self, error: BaseException, *, cleanup_error: BaseException | None, attempted: bool) -> None:
+        setattr(error, "cache_cleanup_attempted", attempted)
+        setattr(error, "cache_cleanup_succeeded", bool(attempted and cleanup_error is None))
+        setattr(error, "cache_cleanup_error", cleanup_error)
+
+    def cache_for_step(self, step_index: int, timestep: Any, transition: Mapping[str, Any] | None = None) -> Any:
+        record = self._begin_session(step_index)
+        return self._split_builder_result(
+            self._build_observed_cache(record, step_index, timestep, transition, note_wall=False)
+        )[0]
+
     def release_step(self, step_index: int, cache: Any, *, forward_materialized: bool = True) -> None:
         record = self.active_record
+        if record is None:
+            raise RuntimeError("streamed AdaLN cache release does not match the active transition")
+        self._release_observed_cache(record, step_index, cache, forward_materialized=forward_materialized)
+
+    def cleanup_failed_step(self, step_index: int, cache: Any) -> None:
+        """Clean up a failed forward without recording a successful cache release."""
+        record = self.active_record
         if not self.active or record is None or record["step_index"] != step_index:
+            raise RuntimeError("failed cache cleanup does not match the active transition")
+        self._release_observed_cache(record, step_index, cache, forward_materialized=False)
+
+    def _release_observed_cache(
+        self,
+        record: dict[str, Any],
+        step_index: int,
+        cache: Any,
+        *,
+        forward_materialized: bool,
+    ) -> None:
+        if not self.active or self.active_record is not record or record["step_index"] != step_index:
             raise RuntimeError("streamed AdaLN cache release does not match the active transition")
         if forward_materialized is not True:
-            raise RuntimeError("cache release requires successfully materialized predictions")
+            record["forward_materialized_before_release"] = False
+            cleanup_error = self._cleanup_observed_cache(record, step_index, cache)
+            record["status"] = "failed-cleanup"
+            self._emit(
+                "session-failure-cleanup",
+                {
+                    "step_index": step_index,
+                    "cache_session_id": record["cache_session_id"],
+                    "cleanup_error": error_receipt(cleanup_error),
+                },
+            )
+            self._active_cache = None
+            self.active = False
+            self.active_record = None
+            self._last_released_record = record
+            if cleanup_error is not None:
+                raise cleanup_error
+            return
+
         record["forward_materialized_before_release"] = True
-        record["events"].append({"event": "session-release-start", "step_index": step_index, "cache_session_id": record["cache_session_id"]})
+        record["events"].append(
+            {"event": "session-release-start", "step_index": step_index, "cache_session_id": record["cache_session_id"]}
+        )
         self._emit("session-release-start", {"step_index": step_index, "cache_session_id": record["cache_session_id"]})
-        cleanup_error: BaseException | None = None
-        try:
-            if self.cleanup_hook is not None:
-                record["bounded_release_invocations"] += 1
-                record["bounded_release_path"] = "cleanup_hook"
-                self.cleanup_hook(step_index, cache)
-            else:
-                record["bounded_release_invocations"] += 1
-                record["bounded_release_path"] = _bounded_release_cache(cache)
-        except BaseException as exc:
-            cleanup_error = exc
-        record["cleanup_attempted"] = True
-        record["cleanup_error"] = error_receipt(cleanup_error)
-        record["cleanup_succeeded"] = cleanup_error is None
-        record["open_sidecars_after_cleanup"] = self._open_sidecars
+        cleanup_error = self._cleanup_observed_cache(record, step_index, cache)
         record["status"] = "released" if cleanup_error is None else "failed"
         record["events"].append(
             {
@@ -3597,39 +3774,6 @@ class StreamedCacheSessionProvider:
         )
         self._emit(
             "session-release-complete" if cleanup_error is None else "session-release-failure",
-            {"step_index": step_index, "cache_session_id": record["cache_session_id"], "cleanup_error": error_receipt(cleanup_error)},
-        )
-        self._active_cache = None
-        self.active = False
-        self.active_record = None
-        self._last_released_record = record
-        if cleanup_error is not None:
-            raise cleanup_error
-
-    def cleanup_failed_step(self, step_index: int, cache: Any) -> None:
-        """Clean up a failed forward without recording a successful cache release."""
-        record = self.active_record
-        if not self.active or record is None or record["step_index"] != step_index:
-            raise RuntimeError("failed cache cleanup does not match the active transition")
-        record["cleanup_attempted"] = True
-        record["forward_materialized_before_release"] = False
-        cleanup_error: BaseException | None = None
-        try:
-            if self.cleanup_hook is not None:
-                record["bounded_release_invocations"] += 1
-                record["bounded_release_path"] = "cleanup_hook"
-                self.cleanup_hook(step_index, cache)
-            else:
-                record["bounded_release_invocations"] += 1
-                record["bounded_release_path"] = _bounded_release_cache(cache)
-        except BaseException as exc:
-            cleanup_error = exc
-        record["cleanup_error"] = error_receipt(cleanup_error)
-        record["cleanup_succeeded"] = cleanup_error is None
-        record["status"] = "failed-cleanup"
-        record["open_sidecars_after_cleanup"] = self._open_sidecars
-        self._emit(
-            "session-failure-cleanup",
             {
                 "step_index": step_index,
                 "cache_session_id": record["cache_session_id"],

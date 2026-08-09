@@ -1156,6 +1156,59 @@ class ProbeV05DContractTests(unittest.TestCase):
         self.assertEqual(result.lifecycle["dense_temporary_reconstructions"], 0)
         self.assertEqual(result.lifecycle["open_sidecars_after_cleanup"], 0)
 
+    def test_full_schedule_uses_one_shared_runtime_session_per_transition(self):
+        result, _scheduler, provider, _calls, _events = run_fake()
+        self.assertEqual(len(provider.transition_sessions), probe.EXPECTED_DENOISING_TRANSITIONS)
+        self.assertTrue(all(isinstance(session, probe.StreamedTransitionSession) for session in provider.transition_sessions))
+        self.assertTrue(all(not session.active for session in provider.transition_sessions))
+        expected = [
+            "transition-start",
+            "cache-build-start",
+            "cache-build-complete",
+            "forward-start",
+            "forward-complete",
+            "materialize-start",
+            "materialize-complete",
+            "transition-succeeded",
+            "cache-release-start",
+            "cache-release-complete",
+            "scheduler",
+        ]
+        for transition in result.transitions:
+            self.assertEqual([item["event"] for item in transition["runtime_lifecycle"]], expected)
+
+    def test_runtime_session_observation_retains_transition_and_cache_identity(self):
+        result, _scheduler, provider, _calls, _events = run_fake()
+        for index, (transition, session) in enumerate(zip(result.transitions, provider.records)):
+            self.assertEqual(transition["step_index"], index)
+            self.assertEqual(session["step_index"], index)
+            self.assertEqual(session["cache_session_id"], f"cache-session-{index + 1:02d}")
+            for event in transition["runtime_lifecycle"]:
+                if event["event"] != "scheduler":
+                    self.assertEqual(event["transition_index"], index)
+                    self.assertEqual(event["cache_session_id"], session["cache_session_id"])
+
+    def test_runtime_session_failure_translates_without_scheduler_advancement(self):
+        with self.assertRaises(probe.DenoisingFailure) as context:
+            run_fake(deferred=True, fail_materialization=True)
+        failure = context.exception
+        self.assertIn("deferred prediction materialization failed", str(failure.primary_error))
+        self.assertEqual(failure.state["scheduler_update_counts"], {"video": 0, "audio": 0})
+        self.assertEqual(
+            [item["event"] for item in failure.state["transitions"][0]["runtime_lifecycle"]],
+            [
+                "transition-start",
+                "cache-build-start",
+                "cache-build-complete",
+                "forward-start",
+                "forward-complete",
+                "materialize-start",
+                "transition-failed",
+                "cache-release-start",
+                "cache-release-complete",
+            ],
+        )
+
     def test_cache_release_precedes_scheduler_update(self):
         result, scheduler, _provider, _calls, events = run_fake()
         self.assertEqual(len(result.transitions), 15)
