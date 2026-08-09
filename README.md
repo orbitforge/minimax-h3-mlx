@@ -186,9 +186,11 @@ took `5.881 s`. After releasing both cache and transformer, the measured result 
 and zero allocator cache.
 
 The probe loaded no Qwen or VAE, performed no transformer forward, and did no denoising, decoding, or
-rendering. This receipt does not claim generation support. Still unproven are real original-resident
+rendering. At v0.3d, this receipt therefore did not claim generation support; real original-resident
 versus streamed-sidecar numerical parity, real transformer-forward parity, denoising, rendering, the
-final generation peak, and swap-write reduction.
+final generation peak, and swap-write reduction were unproven at that slice. Later v0.5d/v0.5e
+receipts establish the derived full-schedule transformer-forward, denoising, decoding/rendering, and
+lifecycle proofs; they do not claim cross-format numerical parity or swap-write reduction.
 
 The external real-cache probe is:
 
@@ -309,7 +311,7 @@ Things that cost real debugging time here and generalize to other diffusion port
 | Text encoder | **done** — `hidden_states[50]` matches HF to 5.0e-08 |
 | Checkpoint loaders | **done** — all four components load from the release, zero key mismatches |
 | Pipeline / denoise loop | **done** — generates prompt-faithful video + synced audio |
-| Derived full-schedule proof | **done** — v0.5d functional proof passed; canonical timing remains future work |
+| Derived full-schedule proof | **done** — v0.5e complete; the 128×128 canonical baseline is frozen and the 256×256 quality/resource proof passed |
 | Quant set | **done** — f32 / bf16 / 8 / 6 / 4-bit published; 3-bit built but withheld |
 
 All four components were loaded from the released checkpoint and exercised:
@@ -363,12 +365,14 @@ The repository includes a v0.3b converter that creates a new
 `minimax-h3-mlx-streamed-adaln-v1` directory with an AdaLN-free base, one exact raw-byte sidecar per
 transformer block, manifests, and verification receipts. v0.3c consumes the derived base in
 cache-only mode, and v0.3d constructs the retained modulation cache sequentially. At those earlier
-slices the original mixed-shard format remained the only generation-capable runtime format; v0.5d
-below closes that gap.
+slices the original mixed-shard format remained the only generation-capable runtime format; the
+v0.5d/v0.5e derived full-schedule receipts below close that gap for the proven path.
 The derived base has loaded and evaluated successfully, with component-level active MLX memory of
 approximately 16.466 GB—approximately 11.7 GB below the previous full-transformer load. Sidecar
-real transformer-forward parity, denoising, render peak, swap-write reduction, and streamed numerical
-parity remain unproven.
+real transformer-forward execution, denoising, render peak, swap-write reduction, and streamed
+numerical parity were unproven at the v0.3c/v0.3d boundary. Later v0.5d/v0.5e evidence below proves
+the derived full-schedule transformer, denoising, decoding/rendering, and lifecycle path; swap-write
+reduction and cross-format numerical parity remain unclaimed.
 
 #### v0.3b Metal consumer-compatibility receipt
 
@@ -480,7 +484,7 @@ count; video and audio worker receipts do not split VAE load time from decode ti
 partial MP4 SHA was not retained; and host-process inspection was unavailable. None of these limits
 invalidate the functional proof.
 
-Future v0.5e attempts record `functional_success` independently from canonical timing eligibility.
+The v0.5e receipts below record `functional_success` independently from canonical timing eligibility.
 `--operator-declared-uncontended` defaults false and is never inferred. Before conditioning, the
 parent writes one bounded, read-only `ps` snapshot and classifies only narrow known MLX, model-server,
 generation, MPS, or Metal-compute workloads; ordinary desktop compositing is not a conflict and the
@@ -491,8 +495,122 @@ ineligibility. Derived preflight also requires the conversion manifest and base 
 exactly 850 base tensors without opening tensor payloads.
 
 Real MLX execution is currently constrained by the Codex/macOS Metal sandbox and must be launched
-from ordinary Terminal. Canonical benchmark timing therefore remains future work. Cache construction
-is the next identified optimization target.
+from ordinary Terminal. The v0.5e closeout below preserves cache-construction attribution as deferred
+optimization evidence; it does not begin optimization or benchmarking.
+
+#### v0.5e Slice 3B6B milestone closeout
+
+`V0.5E_COMPLETE` is recorded through `bd29ce3ec0610075247176d37a9eb795bbe4d427`
+(`Fix cache attribution transition identity`). The successful end-to-end 256×256 proof is
+`quality-256-02` with `functional_success: true` and `retry_count: 0`.
+
+The evidence namespaces are intentionally distinct:
+
+| Namespace | Meaning |
+|---|---|
+| `canonical-baseline-01` | Frozen 128×128 canonical timing baseline |
+| `quality-256-01` | Preserved failed telemetry-contract attempt |
+| `quality-256-02` | Successful 256×256 quality/resource proof; not a replacement canonical baseline |
+
+The completed 256 contract is:
+
+```text
+output:                  256×256
+frames:                  30
+fps:                     24
+duration:                1.25 s nominal
+
+video latent:            [1,24,9,16,16]
+audio latent:            [2,32,50]
+
+text rows:               103
+audio rows:              100
+video rows:              576
+total packed rows:       779
+
+sigma points:            16
+transitions:             15
+transformer forwards:    15
+
+video shift:             12.0
+audio shift:              3.0
+seed:                    0
+```
+
+Prompt SHA-256: `c7d57d0bf61aa78dfe79d3267c13fc74b91bc397e09f1d73c35d12f4179dd00a`.
+The global RNG draw order is video noise before audio noise; changing spatial video geometry changes
+the subsequent audio initial noise, so cross-resolution bit-identical audio noise is not claimed.
+
+The streamed-AdaLN proof recorded 15 cache sessions with 50 blocks per session, 750 sidecar opens,
+750 sidecar releases, 750 matched pairs, maximum simultaneous sidecars `1`, overlap violations `0`,
+dense reconstruction `0`, and telemetry failures `0`. The transition-identity emitter defect exposed
+by `quality-256-01` was repaired in `bd29ce3` and strict parent validation accepted the corrected real
+event stream in `quality-256-02`.
+
+Lifecycle proof from `quality-256-02`:
+
+| Component | Verified result |
+|---|---|
+| Transformer | Final active memory `256` bytes; final allocator cache `0` bytes; release gate passed |
+| Video decoder | Raw `[1,3,30,256,256]`; RGB `[30,256,256,3]`; 30 PNGs published; video VAE peak `12,023,902,068` bytes; release gate passed; allocator cache `0` after release |
+| Audio decoder | Raw `[2,1,40000]`; waveform `[2,40000]`; stereo at 32,000 Hz; 40,000 samples/channel; audio VAE peak `2,595,794,740` bytes; release gate passed; allocator cache `0` after release |
+
+Final media proof:
+
+```text
+codec:              H.264
+pixel format:       yuv420p
+resolution:         256×256
+fps:                24
+frames:             30
+
+audio codec:        AAC
+channels:           stereo
+sample rate:        32 kHz
+
+ffmpeg calls:       1
+ffprobe calls:      1
+retries:            0
+
+duration:           1.250 s
+size:               133,521 bytes
+```
+
+Final MP4 SHA-256: `da5da3ce010673e09d6ddcb025311c6b62fd1ed294d8c6ee6661fb96fd2a427b`.
+The preserved manifest hashes are frame
+`12e4c56308a432d1539716e728081a9ca5864e964837228a334007af1909e3e2`, audio
+`9ca7b912a63c7b1a8de389c38a050e12b83d01856696e1600591948c1cc32231`, and MP4
+`c64bfc1098b36b6c6815fd1225ed086caa3a0b3f2c0af1b7f75174c7a09460e4`.
+
+Deferred cache-attribution evidence, not cross-run performance conclusions:
+
+```text
+cache wall total:                   31.10547550197225 s
+
+materialization/evaluation:         27.516481075639604 s  (88.46185641462036%)
+release/purge:                       2.836448738875333 s  (9.118808483398647%)
+sidecar I/O/reconstruction:          0.10752325801877305 s  (0.3456730890095395%)
+projection compute:                  0.01100156965549104 s  (0.03536859500763292%)
+```
+
+The first cache session was `2.4995043340022676 s`; the warm-session mean was
+`2.043283654854999 s`. These values are retained as deferred optimization evidence only.
+
+All 30 frames were reviewed at the qualitative/operator-review level. The 256 output was a
+coherent centered rotating faceted object with substantially better temporal stability and material
+separation than the previously observed 128 output. The generated object did not clearly satisfy
+regular-dodecahedron topology. That semantic finding is not classified as a runtime defect and is
+not a v0.5e blocker.
+
+The following work is intentionally deferred: same-HEAD 128-versus-256 timing, multi-seed quality
+characterization, resolution scaling, streamed-AdaLN optimization, and semantic prompt/topology
+investigation. None is required for v0.5e completion.
+
+The next engineering milestone is **v0.6 — production generation surface**. Its first slice is
+**production-surface reconnaissance** only: inspect how the proven v0.5e machinery should become a
+normal user-facing/runtime generation path rather than remaining centered around
+`scripts/probe_v05d_derived_full_schedule.py`. This closeout does not design or implement that
+surface and does not decide CLI/API architecture.
 
 ### Validation
 
