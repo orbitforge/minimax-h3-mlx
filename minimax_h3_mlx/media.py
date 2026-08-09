@@ -8,8 +8,10 @@ sequence.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import tempfile
 import wave
 from pathlib import Path
 
@@ -65,12 +67,32 @@ def save_mp4(
     ]
     if audio_path is not None:
         cmd += ["-i", str(audio_path), "-c:a", "aac", "-b:a", "192k", "-shortest"]
-    cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(path)]
+    staged_path: Path | None = None
+    published = False
+    try:
+        staged_fd, staged_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".partial.mp4",
+        )
+        staged_path = Path(staged_name)
+        os.close(staged_fd)
 
-    process = subprocess.run(cmd, input=video.tobytes(), capture_output=True)
-    if process.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {process.stderr.decode()[:500]}")
-    return path
+        cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(staged_path)]
+
+        process = subprocess.run(cmd, input=video.tobytes(), capture_output=True)
+        if process.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {process.stderr.decode()[:500]}")
+
+        os.replace(staged_path, path)
+        published = True
+        return path
+    finally:
+        if staged_path is not None and not published:
+            try:
+                staged_path.unlink()
+            except OSError:
+                pass
 
 
 def save_frames(directory: str | Path, video: np.ndarray, limit: int | None = None) -> Path:
