@@ -475,7 +475,7 @@ class MiniMaxH3Pipeline:
         mx.random.seed(KEYFRAME_ENCODE_SEED)
         rows = []
         for index, image in enumerate(images):
-            prepared = prepare_keyframe_image(image, height, width, stretch=index == 0)
+            prepared = prepare_keyframe_image(image, height, width)
             pixels = np.asarray(prepared, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
             pixels = (pixels / 255.0 - pixel_mean) / pixel_std
 

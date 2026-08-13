@@ -606,11 +606,38 @@ The following work is intentionally deferred: same-HEAD 128-versus-256 timing, m
 characterization, resolution scaling, streamed-AdaLN optimization, and semantic prompt/topology
 investigation. None is required for v0.5e completion.
 
-The next engineering milestone is **v0.6 — production generation surface**. Its first slice is
-**production-surface reconnaissance** only: inspect how the proven v0.5e machinery should become a
-normal user-facing/runtime generation path rather than remaining centered around
-`scripts/probe_v05d_derived_full_schedule.py`. This closeout does not design or implement that
-surface and does not decide CLI/API architecture.
+The next engineering milestone was **v0.6 — production generation surface**. Its completed Render
+Lab/image-conditioning slice is recorded in
+`docs/v0.6-render-lab-image-conditioning-closeout.md`. The slice is currently uncommitted on
+`experiment/h3-generation` at the production-good base `62fba38cc1737004fae570b31a2bdbae10835cea`;
+the unrelated ConvRot/CR-5 research files remain separate and must not hitchhike into its future
+transfer.
+
+#### v0.6 Render Lab and image-conditioning current state
+
+The local loopback Render Lab under `tools/render_lab/` wraps the existing `scripts/generate.py`
+runtime and supports T2V, I2V, and first/last-frame conditioning with curated geometry validation,
+immutable per-run evidence, live logs, benchmark/telemetry records, and terminal-state polling that
+stops after `SUCCESS` or `FAILED`. The still-image path uses the direct
+`Qwen2VLImageProcessorPil` PIL/NumPy processor with `local_files_only=True`; it does not construct
+the composite video processor and does not require torch or torchvision for image conditioning.
+
+The visual merge repair uses the MLX Qwen masked-scatter contract: compact visual rows are inserted
+at the selected positions in the full sequence, with fail-closed row/width checks for the initial
+and three deepstack tensors. The bounded receipt records 1,920 total tokens, 1,530 visual rows,
+and finite layer-50 output. Real post-repair artifact history contains successful 512×512 I2V and
+first/last-frame runs. Image inputs intentionally use deterministic resize with no crop or
+letterbox; aspect-matched references remain the caller's responsibility.
+
+The canonical local runtime paths are:
+
+```text
+H3_CHECKPOINT_ROOT=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/checkpoints/minimax-h3-fl2va
+H3_TRANSFORMER=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit
+```
+
+After this slice is checkpointed, **Turbo LoRA** is the next active implementation stream. ConvRot
+research remains a separate, explicitly excluded workstream.
 
 ### Validation
 

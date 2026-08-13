@@ -160,27 +160,19 @@ def audio_latent_num_frames(num_frames: int) -> int:
     return int(round(num_frames / FPS * AUDIO_LATENTS_PER_SECOND))
 
 
-def prepare_keyframe_image(image, height: int, width: int, stretch: bool):
+def prepare_keyframe_image(image, height: int, width: int):
     """Put a keyframe onto the target canvas.
 
-    The first keyframe of a request is the geometry anchor and is *stretched* onto the canvas; a
-    second keyframe follows that canvas and is cover-cropped (aspect-preserving max-scale LANCZOS
-    resize plus a centre crop). An image that already is the canvas is returned untouched, without a
-    resampling pass.
+    Every keyframe is deterministically resized onto the target canvas. This intentionally allows
+    aspect-ratio distortion: the runtime does not silently crop, letterbox, or add dead space, and
+    callers who need composition preserved must provide an aspect-matched reference image. An
+    image that already is the canvas is returned untouched, without a resampling pass.
     """
     from PIL import Image
 
     if image.size == (width, height):
         return image
-    if stretch:
-        return image.resize((width, height), Image.Resampling.LANCZOS)
-
-    scale = max(width / image.size[0], height / image.size[1])
-    resized_size = (max(width, round(image.size[0] * scale)), max(height, round(image.size[1] * scale)))
-    left = max(0, (resized_size[0] - width) // 2)
-    top = max(0, (resized_size[1] - height) // 2)
-    resized = image.resize(resized_size, Image.Resampling.LANCZOS)
-    return resized.crop((left, top, left + width, top + height))
+    return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
 def patchify_video_latents(latents: mx.array, patch_size: tuple[int, int, int]) -> mx.array:

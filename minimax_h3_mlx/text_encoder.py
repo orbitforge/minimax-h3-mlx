@@ -32,6 +32,47 @@ from .config import TAG_TEXT, TAG_VIDEO
 from .packing import TEXT_ENCODER_LAYER
 
 
+def _validate_visual_embedding_rows(
+    name: str,
+    visual_mask: mx.array,
+    visual_embeds: mx.array,
+    expected_width: int,
+) -> int:
+    """Fail closed unless compact visual rows match the selected token contract."""
+    visual_rows = int(mx.sum(visual_mask).item())
+    if visual_embeds.ndim != 2 or visual_embeds.shape[0] != visual_rows:
+        raise ValueError(
+            f"{name} rows do not match visual token positions: "
+            f"mask rows {visual_rows}, embedding shape {visual_embeds.shape}."
+        )
+    if visual_embeds.shape[1] != expected_width:
+        raise ValueError(
+            f"{name} width does not match text embeddings: "
+            f"expected {expected_width}, got {visual_embeds.shape[1]}."
+        )
+    return visual_rows
+
+
+def _merge_visual_embeddings(
+    inputs_embeds: mx.array,
+    visual_mask: mx.array,
+    visual_embeds: mx.array,
+) -> mx.array:
+    """Insert compact Qwen visual rows using mlx-vlm's reference scatter contract."""
+    _validate_visual_embedding_rows(
+        "initial visual embeddings", visual_mask, visual_embeds, inputs_embeds.shape[-1]
+    )
+    expanded_mask = mx.broadcast_to(visual_mask[..., None], inputs_embeds.shape)
+    visual_embeds = visual_embeds.astype(inputs_embeds.dtype)
+
+    # This is the exact MLX Qwen3-VL primitive used by the installed reference:
+    # flatten the full sequence and expanded mask, scatter compact visual rows into
+    # true positions, then reshape to the original sequence shape.
+    from mlx_vlm.models.qwen3_vl.qwen3_vl import masked_scatter
+
+    return masked_scatter(inputs_embeds, expanded_mask, visual_embeds)
+
+
 class MiniMaxH3TextEncoder:
     """Qwen3-VL-32B truncated to the layers MiniMax-H3 actually conditions on."""
 
@@ -107,7 +148,7 @@ class MiniMaxH3TextEncoder:
         self.merge_size = self.vision_config.spatial_merge_size
 
         self._tokenizer = None
-        self._processor = None
+        self._image_processor = None
         self._model_dir = model_dir
 
     # -- loading ---------------------------------------------------------------------------
@@ -185,15 +226,30 @@ class MiniMaxH3TextEncoder:
         return self._tokenizer
 
     @property
-    def processor(self):
-        if self._processor is None:
-            from transformers import AutoProcessor
+    def image_processor(self):
+        """Load only H3's still-image processor, without constructing video support.
+
+        The released processor directory contains both the Qwen3-VL image and video
+        configurations.  ``AutoProcessor`` eagerly constructs both sub-processors, which
+        makes an image-only request depend on the Qwen3-VL video backend.  The installed
+        Transformers build provides the same Qwen2-VL still-image contract through its
+        PIL/NumPy backend, so load that backend directly.
+        """
+        if self._image_processor is None:
+            from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
 
             processor_dir = self._model_dir.parent / "processor"
             if not processor_dir.exists():
                 processor_dir = self._model_dir
-            self._processor = AutoProcessor.from_pretrained(str(processor_dir))
-        return self._processor
+            self._image_processor = Qwen2VLImageProcessorPil.from_pretrained(
+                str(processor_dir), local_files_only=True
+            )
+        return self._image_processor
+
+    @property
+    def processor(self):
+        """Backward-compatible alias for the dedicated still-image processor."""
+        return self.image_processor
 
     # -- request presentation --------------------------------------------------------------
 
@@ -201,7 +257,7 @@ class MiniMaxH3TextEncoder:
         """Build H3's token sequence and its per-row modality tags.
 
         Returns ``(input_ids, token_tags, vision_inputs)``; ``vision_inputs`` is ``None`` for a
-        text-only request, otherwise the processor's ``pixel_values`` / ``image_grid_thw``.
+        text-only request, otherwise the image processor's ``pixel_values`` / ``image_grid_thw``.
         """
         if not isinstance(prompt, str):
             raise ValueError(f"`prompt` must be a single string, got {type(prompt).__name__}.")
@@ -211,10 +267,11 @@ class MiniMaxH3TextEncoder:
         vision_inputs = None
 
         if images:
-            vision = self.processor.image_processor(images=images, return_tensors="np")
+            image_processor = self.image_processor
+            vision = image_processor(images=images, return_tensors="np")
             pixel_values = np.asarray(vision["pixel_values"])
             grid_thw = np.asarray(vision["image_grid_thw"])
-            merge = self.processor.image_processor.merge_size**2
+            merge = image_processor.merge_size**2
             start = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
             pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
             end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -287,7 +344,17 @@ class MiniMaxH3TextEncoder:
             )
             inputs_embeds = self.language.embed_tokens(input_ids)
             image_mask = input_ids == self.image_token_id
-            inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
+            _validate_visual_embedding_rows(
+                "initial visual embeddings", image_mask, hidden, inputs_embeds.shape[-1]
+            )
+            for layer_idx, deepstack in enumerate(deepstack_embeds):
+                _validate_visual_embedding_rows(
+                    f"deepstack visual embeddings[{layer_idx}]",
+                    image_mask,
+                    deepstack,
+                    inputs_embeds.shape[-1],
+                )
+            inputs_embeds = _merge_visual_embeddings(inputs_embeds, image_mask, hidden)
             visual_pos_masks = image_mask
 
         # Qwen3-VL's 3D M-RoPE index, derived from the vision-start/pad token ids.
