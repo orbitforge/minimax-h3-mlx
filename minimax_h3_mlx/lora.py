@@ -765,23 +765,58 @@ class LoRASafetensorsSource:
         return _decode_safetensors_tensor(raw, reference.spec)
 
 
+_TARGET_WRAPPER_SCOPES: tuple[tuple[str, ...], ...] = (
+    # Match the longest composite scope first.  The remaining scopes are deliberately
+    # explicit rather than a generic "drop the first component" rule.
+    ("base_model", "model"),
+    ("base_model",),
+    ("model",),
+    ("transformer",),
+    ("diffusion_model",),
+)
+_MAX_TARGET_WRAPPER_SCOPES = len(_TARGET_WRAPPER_SCOPES)
+
+
+def _known_target_wrapper_scope(segments: list[str]) -> tuple[str, ...] | None:
+    for scope in _TARGET_WRAPPER_SCOPES:
+        if tuple(segments[: len(scope)]) == scope:
+            return scope
+    return None
+
+
 def canonical_target(target: str) -> str:
-    """Normalize common wrapper prefixes without changing a generic module path."""
+    """Normalize bounded exporter scopes without changing an unknown module path.
+
+    Exporters may compose more than one known scope, for example
+    ``base_model.model.diffusion_model.transformer_blocks``.  Scope removal is
+    therefore repeated only across the explicit, bounded wrapper set above; an
+    unknown leading scope remains visible and is not silently stripped.  The
+    exact ``transformer_blocks`` component is then mapped to the local ``blocks``
+    component.
+    """
     if not isinstance(target, str) or not target.strip():
         raise LoRAError(f"LoRA target must be a non-empty string, got {target!r}")
-    value = target.strip()
-    for prefix in ("base_model.model.", "base_model.", "model."):
-        if value.startswith(prefix):
-            value = value[len(prefix):]
+
+    segments = target.strip().split(".")
+    for _ in range(_MAX_TARGET_WRAPPER_SCOPES):
+        scope = _known_target_wrapper_scope(segments)
+        if scope is None:
             break
+        del segments[: len(scope)]
+    else:
+        if _known_target_wrapper_scope(segments) is not None:
+            raise LoRAError(
+                f"LoRA target {target!r} contains too many composed wrapper scopes"
+            )
+
+    if not segments:
+        raise LoRAError(f"LoRA target {target!r} has no module path after wrapper normalization")
+
     # Diffusers' H3 reference names the main stack `transformer_blocks`; the
-    # MLX port calls the same stack `blocks`.
-    if value.startswith("transformer."):
-        value = value[len("transformer."):]
-    value = value.replace(".transformer_blocks.", ".blocks.")
-    if value.startswith("transformer_blocks."):
-        value = "blocks." + value[len("transformer_blocks."):]
-    return value
+    # MLX port calls the same stack `blocks`.  Component matching avoids
+    # arbitrary substring replacement inside an unknown module name.
+    segments = ["blocks" if segment == "transformer_blocks" else segment for segment in segments]
+    return ".".join(segments)
 
 
 def _shape(value: Any) -> tuple[int, ...]:

@@ -40,6 +40,7 @@ from .denoise import (
     run_streamed_transition,
 )
 from .dit import CACHE_ONLY_CONSTRUCTION
+from .h3_lora import H3LoRACompatibilityError, H3LoRACompatibilityReport, validate_h3_lora_compatibility
 from .lora import (
     LIGHTX_FL2VA_TURBO_8STEP_V1_0,
     LightX2VManifest,
@@ -203,6 +204,7 @@ class MiniMaxH3Pipeline:
         self._cache: ModulationCache | None = None
         self._cache_timesteps: tuple[float, ...] | None = None
         self._cache_lora_identity: str | None = None
+        self._h3_lora_compatibility: H3LoRACompatibilityReport | None = None
         self._adaln_purge_attempts = 0
         self._adaln_purge_status = "not-run"
 
@@ -520,12 +522,29 @@ class MiniMaxH3Pipeline:
                 variant=self._lightx_manifest or LIGHTX_FL2VA_TURBO_8STEP_V1_0,
                 scale=self._lora_scale,
             )
-        dit = self._load_component("dit", "transformer", verbose)
         if self._lora_registry is None and self._lora_path is not None:
             self._lora_registry = load_lora_safetensors(
                 self._lora_path,
                 scale=self._lora_scale,
             )
+        if self._lora_registry is not None:
+            self._h3_lora_compatibility = validate_h3_lora_compatibility(
+                self._lora_registry,
+                adapter_path=self._lora_path or self._lightx_path,
+            )
+            if verbose and self._h3_lora_compatibility.incompatible_target_count:
+                examples = ", ".join(
+                    repr(target) for target in self._h3_lora_compatibility.incompatible_targets[:4]
+                )
+                print(
+                    "  H3 LoRA admission: "
+                    f"registered_targets={self._h3_lora_compatibility.registered_target_count} "
+                    f"compatible={self._h3_lora_compatibility.compatible_target_count} "
+                    f"incompatible={self._h3_lora_compatibility.incompatible_target_count} "
+                    f"examples={examples}",
+                    flush=True,
+                )
+        dit = self._load_component("dit", "transformer", verbose)
         if self._lora_registry is not None:
             setter = getattr(dit, "set_lora_registry", None)
             if callable(setter):
@@ -987,6 +1006,9 @@ class MiniMaxH3Pipeline:
                 if later_steps:
                     print(f"  later denoising step mean: {sum(later_steps) / len(later_steps):.1f}s", flush=True)
                 print(f"  [memory] after denoising: {_memory_snapshot()}", flush=True)
+        except H3LoRACompatibilityError:
+            self._release_component("dit", "transformer", verbose, "failure-cleanup")
+            raise
         except Exception as exc:
             self._release_component("dit", "transformer", verbose, "failure-cleanup")
             raise RuntimeError("Transformer/AdaLN/denoising phase failed; decoders were not loaded.") from exc
