@@ -30,6 +30,11 @@ ARTIFACT_SCHEMA_VERSION = 1
 CONDITIONING_DTYPE = "bfloat16"
 CONDITIONING_WIDTH = 5120
 SELECTED_HIDDEN_STATE = "hidden_states[50]"
+HERETIC_ENCODER_ID = "heretic-35b-a3b-state28"
+HERETIC_SELECTED_HIDDEN_STATE = "hidden_states[28]"
+HERETIC_BRIDGE_SHA256 = "8dc5dabb7da0d69dfe7ec0d5d80f684a50768d500b46bf70c03cec557141068e"
+HERETIC_SOURCE_WIDTH = 2048
+HERETIC_FULL_DECODER_LAYERS = 40
 
 _ARRAY_KEYS = frozenset({
     "metadata_json",
@@ -308,9 +313,92 @@ def _validate_canonical_encoder_provenance(encoder: Mapping[str, Any]) -> None:
             raise ConditioningArtifactError(f"artifact is missing {name} identity metadata")
 
 
+def _validate_heretic_encoder_provenance(encoder: Mapping[str, Any]) -> None:
+    if encoder.get("encoder_id") != HERETIC_ENCODER_ID or encoder.get("experimental") is not True:
+        raise ConditioningArtifactError("Heretic artifact must identify the experimental encoder explicitly")
+    config = encoder.get("config")
+    if not isinstance(config, Mapping):
+        raise ConditioningArtifactError("Heretic artifact is missing source-model configuration identity")
+    try:
+        hidden_size = int(config.get("hidden_size", -1))
+        full_decoder_layers = int(config.get("full_decoder_layers", -1))
+    except (TypeError, ValueError) as exc:
+        raise ConditioningArtifactError("Heretic source model configuration identity is invalid") from exc
+    if (
+        config.get("model_type") != "qwen3_5_moe"
+        or hidden_size != HERETIC_SOURCE_WIDTH
+        or full_decoder_layers != HERETIC_FULL_DECODER_LAYERS
+    ):
+        raise ConditioningArtifactError("Heretic source model geometry is incompatible with state 28")
+    selected = encoder.get("selected_state")
+    if (
+        not isinstance(selected, Mapping)
+        or selected.get("hidden_state") != HERETIC_SELECTED_HIDDEN_STATE
+        or selected.get("selected_decoder_layer") != 28
+        or selected.get("logical_dtype") != CONDITIONING_DTYPE
+        or selected.get("normalization") != "unnormalized-pre-final-norm"
+    ):
+        raise ConditioningArtifactError("Heretic artifact does not prove the pre-final-norm state-28 boundary")
+    source_model = encoder.get("source_model")
+    if (
+        not isinstance(source_model, Mapping)
+        or not str(source_model.get("path", ""))
+        or int(source_model.get("maximum_executed_state", -1)) != 28
+        or source_model.get("layers_29_through_40_executed") is not False
+    ):
+        raise ConditioningArtifactError("Heretic artifact does not prove that execution stopped at state 28")
+    bridge = encoder.get("bridge")
+    if not isinstance(bridge, Mapping):
+        raise ConditioningArtifactError("Heretic artifact is missing its state-28 conditioning bridge")
+    bridge_path = Path(str(bridge.get("path", ""))).expanduser().resolve(strict=False)
+    if bridge_path == Path("/tmp") or Path("/tmp") in bridge_path.parents or Path("/private/tmp") in bridge_path.parents:
+        raise ConditioningArtifactError("Heretic artifact bridge may not use volatile /tmp storage")
+    if (
+        bridge.get("sha256") != HERETIC_BRIDGE_SHA256
+        or int(bridge.get("input_width", -1)) != HERETIC_SOURCE_WIDTH
+        or int(bridge.get("target_width", -1)) != CONDITIONING_WIDTH
+        or bridge.get("keys") != ["input_mean", "input_scale", "target_mean", "weights"]
+        or bridge.get("shapes") != {
+            "input_mean": [HERETIC_SOURCE_WIDTH],
+            "input_scale": [HERETIC_SOURCE_WIDTH],
+            "target_mean": [CONDITIONING_WIDTH],
+            "weights": [HERETIC_SOURCE_WIDTH, CONDITIONING_WIDTH],
+        }
+        or bridge.get("operation") != "(state28 - input_mean) / input_scale @ weights + target_mean"
+    ):
+        raise ConditioningArtifactError("Heretic artifact bridge identity or affine shape contract is invalid")
+    alignment = encoder.get("token_alignment")
+    if (
+        not isinstance(alignment, Mapping)
+        or alignment.get("exact_token_piece_alignment") is not True
+        or not isinstance(alignment.get("canonical_h3_token_ids"), list)
+        or not isinstance(alignment.get("heretic_token_ids"), list)
+        or not isinstance(alignment.get("token_pieces"), list)
+        or len(alignment["canonical_h3_token_ids"]) != len(alignment["heretic_token_ids"])
+        or len(alignment["canonical_h3_token_ids"]) != len(alignment["token_pieces"])
+    ):
+        raise ConditioningArtifactError("Heretic artifact does not prove exact canonical/Heretic token-piece alignment")
+    canonical = encoder.get("canonical_h3_encoder")
+    if not isinstance(canonical, Mapping):
+        raise ConditioningArtifactError("Heretic artifact is missing canonical H3 encoder identity")
+    _validate_canonical_encoder_provenance(canonical)
+    for name in ("weights", "tokenizer", "processor"):
+        identity = encoder.get(name)
+        if not isinstance(identity, Mapping) or not isinstance(identity.get("manifest"), Mapping):
+            raise ConditioningArtifactError(f"Heretic artifact is missing {name} identity metadata")
+
+
+def _is_heretic_encoder(encoder: Mapping[str, Any]) -> bool:
+    return encoder.get("encoder_id") == HERETIC_ENCODER_ID
+
 
 def _validate_encoder_provenance(encoder: Mapping[str, Any]) -> None:
-    _validate_canonical_encoder_provenance(encoder)
+    if not isinstance(encoder, Mapping):
+        raise ConditioningArtifactError("artifact is missing encoder identity metadata")
+    if _is_heretic_encoder(encoder):
+        _validate_heretic_encoder_provenance(encoder)
+    else:
+        _validate_canonical_encoder_provenance(encoder)
 
 
 def _artifact_identity(metadata: Mapping[str, Any]) -> str:
@@ -380,8 +468,16 @@ def _required_metadata(metadata: Mapping[str, Any]) -> None:
     ):
         raise ConditioningArtifactError("artifact tokenizer presentation metadata is incompatible")
     postprocessing = metadata["postprocessing"]
-    expected_selected_state = SELECTED_HIDDEN_STATE
-    expected_projection = "none before H3 condition_proj"
+    expected_selected_state = (
+        HERETIC_SELECTED_HIDDEN_STATE
+        if _is_heretic_encoder(metadata["encoder"])
+        else SELECTED_HIDDEN_STATE
+    )
+    expected_projection = (
+        "state28-standardize-affine-bridge-before-H3-condition_proj"
+        if _is_heretic_encoder(metadata["encoder"])
+        else "none before H3 condition_proj"
+    )
     if (
         not isinstance(postprocessing, Mapping)
         or postprocessing.get("selected_state") != expected_selected_state
@@ -460,6 +556,13 @@ def _validate_arrays(
         raise ConditioningArtifactError("text-only conditioning artifacts require text_token_tags value 1")
     if token_ids.dtype != np.dtype("int32") or token_ids.shape != (1, conditioning_bits.shape[1]):
         raise ConditioningArtifactError("token_ids shape or dtype is incompatible with conditioning")
+    encoder = metadata["encoder"]
+    if _is_heretic_encoder(encoder):
+        alignment = encoder.get("token_alignment", {})
+        if alignment.get("canonical_h3_token_ids") != token_ids[0].astype(int).tolist():
+            raise ConditioningArtifactError("Heretic artifact token_ids are not the canonical H3 tokenizer IDs")
+        if len(alignment.get("token_pieces", [])) != conditioning_bits.shape[1]:
+            raise ConditioningArtifactError("Heretic artifact token-piece count does not match conditioning")
     if _bf16_bits_checksum(conditioning_bits) != conditioning.get("tensor_checksum"):
         raise ConditioningArtifactError("conditioning tensor checksum mismatch")
     token_metadata = metadata["token_metadata"]
@@ -541,7 +644,11 @@ def validate_conditioning_artifact(
             raise ConditioningArtifactError("prompt identity does not match the conditioning artifact")
     if checkpoint_root is not None:
         encoder = artifact.metadata["encoder"]
-        identity_to_compare = encoder
+        identity_to_compare = (
+            encoder.get("canonical_h3_encoder")
+            if _is_heretic_encoder(encoder)
+            else encoder
+        )
         if not isinstance(identity_to_compare, Mapping):
             raise ConditioningArtifactError("artifact is missing the canonical H3 encoder identity")
         selected = identity_to_compare.get("selected_state", {})
@@ -565,8 +672,15 @@ def _metadata_for_artifact(
 ) -> dict[str, Any]:
     prompt_sha256, byte_count = _prompt_digest(prompt)
     token_count = int(conditioning_bits.shape[1])
-    selected_state = SELECTED_HIDDEN_STATE
-    projection = "none before H3 condition_proj"
+    heretic = _is_heretic_encoder(encoder_provenance)
+    selected_state = (
+        HERETIC_SELECTED_HIDDEN_STATE if heretic else SELECTED_HIDDEN_STATE
+    )
+    projection = (
+        "state28-standardize-affine-bridge-before-H3-condition_proj"
+        if heretic
+        else "none before H3 condition_proj"
+    )
     metadata: dict[str, Any] = {
         "schema": {"id": ARTIFACT_SCHEMA_ID, "version": ARTIFACT_SCHEMA_VERSION},
         "request": {
@@ -729,6 +843,9 @@ __all__ = [
     "CONDITIONING_DTYPE",
     "CONDITIONING_WIDTH",
     "ConditioningArtifactError",
+    "HERETIC_BRIDGE_SHA256",
+    "HERETIC_ENCODER_ID",
+    "HERETIC_SELECTED_HIDDEN_STATE",
     "LoadedConditioningArtifact",
     "bfloat16_bits_from_float32",
     "bfloat16_bits_to_float32",

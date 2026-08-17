@@ -71,6 +71,30 @@ curated adapter paths resolve narrowly under the checkout's sibling `work/models
 the missing-manifest dependency is recorded in config/run evidence. No `/Volumes/models` fallback
 is used by the Render Lab.
 
+## Text-encoder policy
+
+The selector exposes exactly two choices: `Canonical Qwen3-VL` (the default, available for T2V,
+I2V, and first/last-frame generation) and `Heretic 35B-A3B · Experimental`. Heretic is T2V-only;
+the UI disables it for image-conditioned modes with the message `Heretic is currently text-only;
+image-conditioned modes require Canonical Qwen3-VL.`
+
+The experimental path is admitted only when the local source model
+`/Users/elbancol/AI/MLX-Models/Jundot/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit` and a
+stable state-28 bridge are readable. Set `H3_HERETIC_MODEL` to override the source model and
+`H3_HERETIC_BRIDGE` to point at the bridge. The default bridge location is the sibling work-models
+directory, named `qwen3.6-35b-a3b-heretic-state28-bridge.npz`; its SHA-256 must be
+`8dc5dabb7da0d69dfe7ec0d5d80f684a50768d500b46bf70c03cec557141068e`. Volatile `/tmp` bridge paths
+are rejected and the missing stable bridge leaves the option unavailable.
+
+When selected, Render Lab starts `heretic_encoder.py` in a child process. It checks exact canonical
+and Heretic token-piece alignment, executes only the pre-final-norm state 28 (`[1,T,2048]`), applies
+the standardize-plus-affine bridge to BF16 `[1,T,5120]`, writes the existing conditioning-artifact
+replay format with canonical H3 token IDs, and proves the Heretic process release gate. Only after
+that child exits successfully does Render Lab launch `scripts/generate.py` with
+`--conditioning-artifact`; the canonical Qwen construction is skipped by the existing replay path.
+The run evidence records source identity, bridge identity, alignment, artifact identity/checksum,
+timing, memory, release, and the encoder-before-H3 process boundary.
+
 ## Image-conditioning policy
 
 I2V and first/last-frame inputs are resized directly to the selected conditioning canvas with

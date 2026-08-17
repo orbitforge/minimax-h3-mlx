@@ -37,6 +37,14 @@ from .resolutions import (
     preset_payload,
     validate_preset_against_runtime,
 )
+from .encoder_catalog import (
+    CANONICAL_ENCODER_ID,
+    EncoderAssetError,
+    HERETIC_ENCODER_ID,
+    probe_heretic_assets,
+    text_encoder_payload,
+    validate_text_encoder_selection,
+)
 from .turbo_presets import (
     HOST_ASSET_MANIFEST_NOTE,
     HOST_ASSET_MANIFEST_STATUS,
@@ -49,6 +57,7 @@ from .turbo_presets import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = REPO_ROOT / "scripts" / "generate.py"
+HERETIC_ENCODER_SCRIPT = REPO_ROOT / "tools" / "render_lab" / "heretic_encoder.py"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "out" / "render-lab"
 DEFAULT_OUTPUT_NAME = "render.mp4"
 CANONICAL_TRANSFORMER_NAME = "minimax-h3-mlx-6bit-streamed-adaln"
@@ -116,6 +125,7 @@ class RenderRequest:
     turbo_enabled: bool = False
     turbo_steps: int | str | None = None
     turbo_preset_id: str | None = None
+    text_encoder_id: str = CANONICAL_ENCODER_ID
 
     def normalized(self) -> "RenderRequest":
         return replace(
@@ -144,6 +154,11 @@ class RenderRequest:
                 if self.turbo_preset_id is None or not str(self.turbo_preset_id).strip()
                 else str(self.turbo_preset_id)
             ),
+            text_encoder_id=(
+                CANONICAL_ENCODER_ID
+                if self.text_encoder_id is None or not str(self.text_encoder_id).strip()
+                else str(self.text_encoder_id).strip()
+            ),
         )
 
 
@@ -159,6 +174,7 @@ class ValidatedRequest:
     checkpoint_root: Path
     transformer_path: Path | None
     turbo_preset: TurboPreset | None
+    heretic_assets: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +207,18 @@ class RunNamespace:
     @property
     def telemetry_dir(self) -> Path:
         return self.run_dir / "telemetry"
+
+    @property
+    def conditioning_artifact_path(self) -> Path:
+        return self.run_dir / "conditioning-artifact.npz"
+
+    @property
+    def encoder_evidence_path(self) -> Path:
+        return self.run_dir / "heretic-encoder-evidence.json"
+
+    @property
+    def encoder_release_path(self) -> Path:
+        return self.run_dir / "heretic-release-evidence.json"
 
 
 @dataclass(frozen=True)
@@ -541,6 +569,15 @@ def validate_render_request(
     verify_runtime_geometry: bool = True,
 ) -> ValidatedRequest:
     request = request.normalized()
+    try:
+        heretic_assets = validate_text_encoder_selection(
+            request.text_encoder_id,
+            request.mode,
+            repo_root=repo_root,
+            check_runtime_paths=check_runtime_paths,
+        )
+    except EncoderAssetError as exc:
+        raise RenderValidationError(str(exc)) from exc
     _validate_number_fields(request)
     width, height = _validate_optional_dimensions(request)
     turbo_preset, turbo_asset_path = _validate_turbo_preset(
@@ -623,6 +660,7 @@ def validate_render_request(
         checkpoint_root=checkpoint_root,
         transformer_path=transformer_path,
         turbo_preset=turbo_preset,
+        heretic_assets=heretic_assets,
     )
 
 
@@ -634,6 +672,7 @@ def build_generation_command(
     validated: ValidatedRequest,
     *,
     python: str | Path = sys.executable,
+    conditioning_artifact: Path | None = None,
 ) -> list[str]:
     """Construct the only H3 command the Render Lab is allowed to launch."""
     request = validated.request
@@ -642,7 +681,8 @@ def build_generation_command(
         "-u",
         str(GENERATOR),
     ]
-    command.append(request.prompt)
+    if request.text_encoder_id != HERETIC_ENCODER_ID:
+        command.append(request.prompt)
     command.extend([
         "--checkpoint",
         str(validated.checkpoint_root),
@@ -659,6 +699,9 @@ def build_generation_command(
         "--output",
         str(validated.output_root / "<run-directory>" / request.output_name),
     ])
+    if request.text_encoder_id == HERETIC_ENCODER_ID:
+        artifact_path = conditioning_artifact or validated.output_root / "<run-directory>" / "conditioning-artifact.npz"
+        command.extend(["--conditioning-artifact", str(artifact_path)])
     if validated.transformer_path is not None:
         command.extend(["--transformer", str(validated.transformer_path)])
     for image_path, anchor in zip(validated.image_paths, validated.anchors):
@@ -689,11 +732,43 @@ def build_generation_command(
 
 
 def build_generation_command_for_namespace(validated: ValidatedRequest, namespace: RunNamespace) -> list[str]:
-    command = build_generation_command(validated)
+    command = build_generation_command(
+        validated,
+        conditioning_artifact=namespace.conditioning_artifact_path,
+    )
     output_marker = str(validated.output_root / "<run-directory>" / validated.request.output_name)
     command[command.index(output_marker)] = str(namespace.output_path)
     return command
 
+
+def build_heretic_encoder_command(
+    validated: ValidatedRequest,
+    namespace: RunNamespace,
+    *,
+    python: str | Path = sys.executable,
+) -> list[str]:
+    if validated.request.text_encoder_id != HERETIC_ENCODER_ID:
+        raise RenderValidationError("Heretic encoder command requested for a canonical encoder run")
+    assets = validated.heretic_assets or probe_heretic_assets(REPO_ROOT)
+    return [
+        str(python),
+        "-u",
+        str(HERETIC_ENCODER_SCRIPT),
+        "--prompt",
+        validated.request.prompt,
+        "--checkpoint",
+        str(validated.checkpoint_root),
+        "--model",
+        str(assets.model_path),
+        "--bridge",
+        str(assets.bridge_path),
+        "--artifact",
+        str(namespace.conditioning_artifact_path),
+        "--evidence",
+        str(namespace.encoder_evidence_path),
+        "--release-evidence",
+        str(namespace.encoder_release_path),
+    ]
 
 
 def sha256_file(path: Path) -> str:
@@ -833,6 +908,61 @@ def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
     }
 
 
+def _text_encoder_evidence(validated: ValidatedRequest, namespace: RunNamespace) -> dict[str, Any]:
+    request = validated.request
+    if request.text_encoder_id == CANONICAL_ENCODER_ID:
+        return {
+            "id": CANONICAL_ENCODER_ID,
+            "label": "Canonical Qwen3-VL",
+            "experimental": False,
+            "mode_contract": "T2V, I2V, FIRST_LAST",
+            "conditioning_artifact": None,
+            "h3_launch_after_encoder_exit": None,
+        }
+    assets = validated.heretic_assets or probe_heretic_assets(REPO_ROOT)
+    return {
+        "id": HERETIC_ENCODER_ID,
+        "label": "Heretic 35B-A3B · Experimental",
+        "experimental": True,
+        "mode_contract": "T2V only",
+        "hint": "Experimental text-only encoder using state 28 + learned H3 conditioning bridge.",
+        "source_model": {
+            "path": str(assets.model_path),
+            "config_sha256": assets.model_config_sha256,
+            "selected_state": "hidden_states[28]",
+            "maximum_executed_state": 28,
+            "layers_29_through_40_executed": False,
+            "source_width": 2048,
+            "full_decoder_layers": 40,
+        },
+        "target_width": 5120,
+        "bridge": {
+            "path": str(assets.bridge_path),
+            "sha256": assets.bridge_sha256 or "8dc5dabb7da0d69dfe7ec0d5d80f684a50768d500b46bf70c03cec557141068e",
+            "expected_sha256": "8dc5dabb7da0d69dfe7ec0d5d80f684a50768d500b46bf70c03cec557141068e",
+            "shapes": {
+                "input_mean": [2048],
+                "input_scale": [2048],
+                "target_mean": [5120],
+                "weights": [2048, 5120],
+            },
+        },
+        "token_alignment": "pending exact canonical-piece check",
+        "canonical_token_count": None,
+        "heretic_token_count": None,
+        "conditioning_artifact": str(namespace.conditioning_artifact_path),
+        "artifact_identity": None,
+        "tensor_checksum": None,
+        "timing_seconds": None,
+        "peak_memory_bytes": None,
+        "active_memory_after_release_bytes": None,
+        "cache_memory_after_release_bytes": None,
+        "release_gate": "pending",
+        "encoder_process_exit_code": None,
+        "h3_launched_before_encoder_exit": False,
+        "h3_launched_after_encoder_exit": False,
+    }
+
 
 def _status_record(namespace: RunNamespace, status: str, **extra: Any) -> dict[str, Any]:
     return {
@@ -901,6 +1031,7 @@ def build_render_config(
     command: Sequence[str],
     *,
     repo_root: Path = REPO_ROOT,
+    encoder_command: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     request = validated.request
     images = [
@@ -975,6 +1106,14 @@ def build_render_config(
         "checkpoint_root": str(validated.checkpoint_root),
         "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
         "transformer_mode": _transformer_mode(validated.transformer_path),
+        "text_encoder_id": request.text_encoder_id,
+        "text_encoder": _text_encoder_evidence(validated, namespace),
+        "conditioning_artifact_path": (
+            str(namespace.conditioning_artifact_path)
+            if request.text_encoder_id == HERETIC_ENCODER_ID
+            else None
+        ),
+        "encoder_command": list(encoder_command) if encoder_command is not None else None,
         "git": _git_identity(repo_root),
         "runtime_identity": runtime_identity(validated, repo_root),
         "command": list(command),
@@ -1250,6 +1389,153 @@ def _artifact_record(artifact: Path | None) -> dict[str, Any] | None:
     return record
 
 
+def _run_encoder_child(
+    namespace: RunNamespace,
+    command: Sequence[str],
+    *,
+    repo_root: Path,
+    on_update: Callable[[dict[str, Any]], None] | None,
+    command_runner: Callable[..., tuple[int, float, str, str]] | None,
+) -> tuple[int, float, str, str]:
+    runner = command_runner or _run_command_text_with_updates
+    try:
+        if runner is _run_command_text_with_updates:
+            return runner(command, repo_root, namespace, on_update)
+        return runner(command, repo_root, namespace)
+    except Exception as exc:
+        with namespace.stderr_path.open("ab") as handle:
+            handle.write(f"Heretic encoder runner failed: {exc}\n".encode("utf-8"))
+        return 127, 0.0, _tail_text(namespace.stdout_path, 2_000_000), _tail_text(namespace.stderr_path, 2_000_000)
+
+
+def execute_heretic_run(
+    namespace: RunNamespace,
+    encoder_command: Sequence[str],
+    h3_command: Sequence[str],
+    *,
+    repo_root: Path = REPO_ROOT,
+    output_root: Path | None = None,
+    on_update: Callable[[dict[str, Any]], None] | None = None,
+    command_runner: Callable[..., tuple[int, float, str, str]] | None = None,
+) -> RunResult:
+    """Run Heretic, validate/release its artifact, then launch H3 in a new process."""
+    output_root = output_root or namespace.run_dir.parent
+    write_status(
+        namespace,
+        "running",
+        phase="heretic-encoder",
+        encoder_command=list(encoder_command),
+        h3_launched_before_encoder_exit=False,
+        started_at=iso_timestamp(),
+    )
+    encoder_exit, encoder_elapsed, stdout, stderr = _run_encoder_child(
+        namespace,
+        encoder_command,
+        repo_root=repo_root,
+        on_update=on_update,
+        command_runner=command_runner,
+    )
+    evidence = _read_json(namespace.encoder_evidence_path)
+    release = _read_json(namespace.encoder_release_path)
+    encoder_error: str | None = None
+    loaded_artifact: Any | None = None
+    if encoder_exit != 0:
+        encoder_error = "Heretic encoder child exited nonzero"
+    elif not evidence or evidence.get("status") != "complete":
+        encoder_error = "Heretic encoder did not publish complete evidence"
+    elif evidence.get("h3_launched_before_encoder_exit") is not False:
+        encoder_error = "Heretic evidence does not prove H3 waited for encoder process exit"
+    elif evidence.get("release_gate") is not True or release.get("clean") is not True:
+        encoder_error = "Heretic encoder release gate did not pass"
+    else:
+        try:
+            from minimax_h3_mlx.conditioning_artifact import (
+                load_conditioning_artifact,
+                validate_conditioning_artifact,
+            )
+
+            loaded_artifact = load_conditioning_artifact(namespace.conditioning_artifact_path)
+            config = _read_json(namespace.config_path)
+            validate_conditioning_artifact(
+                loaded_artifact,
+                checkpoint_root=config.get("checkpoint_root"),
+                prompt=config.get("prompt"),
+            )
+            artifact_evidence = evidence.get("conditioning_artifact", {})
+            if (
+                artifact_evidence.get("path") != str(namespace.conditioning_artifact_path)
+                or artifact_evidence.get("identity") != loaded_artifact.artifact_identity
+                or artifact_evidence.get("tensor_checksum") != loaded_artifact.tensor_checksum
+            ):
+                encoder_error = "Heretic evidence does not match the validated conditioning artifact"
+        except Exception as exc:
+            encoder_error = f"Heretic conditioning artifact failed replay validation: {exc}"
+    if encoder_error is not None:
+        benchmark = {
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "run_id": namespace.run_id,
+            "success": False,
+            "process_exit_code": encoder_exit,
+            "encoder_process_exit_code": encoder_exit,
+            "encoder_process_elapsed_seconds": encoder_elapsed,
+            "encoder_evidence": evidence or None,
+            "encoder_release_evidence": release or None,
+            "h3_launched_before_encoder_exit": False,
+            "h3_launched_after_encoder_exit": False,
+            "failure_reason": encoder_error,
+        }
+        _write_json(namespace.benchmark_path, benchmark)
+        write_status(
+            namespace,
+            "failed",
+            success=False,
+            phase="heretic-encoder",
+            exit_code=encoder_exit,
+            encoder_process_exit_code=encoder_exit,
+            h3_launched_before_encoder_exit=False,
+            failure_reason=encoder_error,
+            finished_at=iso_timestamp(),
+        )
+        return RunResult(namespace, encoder_exit, False, None, benchmark)
+
+    h3_result = execute_run(
+        namespace,
+        h3_command,
+        repo_root=repo_root,
+        output_root=output_root,
+        on_update=on_update,
+        command_runner=command_runner,
+    )
+    benchmark = dict(h3_result.benchmark)
+    benchmark.update({
+        "encoder_process_exit_code": encoder_exit,
+        "encoder_process_elapsed_seconds": encoder_elapsed,
+        "encoder_evidence": evidence,
+        "encoder_release_evidence": release,
+        "h3_launched_before_encoder_exit": False,
+        "h3_launched_after_encoder_exit": True,
+        "h3_process_created_after_encoder_exit": True,
+        "conditioning_artifact": {
+            "path": str(loaded_artifact.path),
+            "identity": loaded_artifact.artifact_identity,
+            "tensor_checksum": loaded_artifact.tensor_checksum,
+        },
+    })
+    _write_json(namespace.benchmark_path, benchmark)
+    write_status(
+        namespace,
+        "succeeded" if h3_result.success else "failed",
+        exit_code=h3_result.exit_code,
+        success=h3_result.success,
+        phase="h3",
+        encoder_process_exit_code=encoder_exit,
+        h3_launched_before_encoder_exit=False,
+        h3_launched_after_encoder_exit=True,
+        finished_at=benchmark.get("wall_clock_end", iso_timestamp()),
+        output_artifact=_artifact_record(h3_result.output_artifact),
+    )
+    return RunResult(namespace, h3_result.exit_code, h3_result.success, h3_result.output_artifact, benchmark)
+
 
 def execute_run(
     namespace: RunNamespace,
@@ -1469,6 +1755,11 @@ class RenderController:
                     verify_runtime_geometry=False,
                 )
                 command = build_generation_command_for_namespace(validated, namespace)
+                encoder_command = (
+                    build_heretic_encoder_command(validated, namespace)
+                    if validated.request.text_encoder_id == HERETIC_ENCODER_ID
+                    else None
+                )
                 initialize_run(
                     namespace,
                     build_render_config(
@@ -1476,6 +1767,7 @@ class RenderController:
                         namespace,
                         command,
                         repo_root=self.repo_root,
+                        encoder_command=encoder_command,
                     ),
                 )
             except Exception as exc:
@@ -1533,6 +1825,8 @@ class RenderController:
                             "checkpoint_root": str(validated.checkpoint_root),
                             "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
                             "transformer_mode": _transformer_mode(validated.transformer_path),
+                            "text_encoder_id": request.text_encoder_id,
+                            "text_encoder": _text_encoder_evidence(validated, namespace),
                             "git": _git_identity(self.repo_root),
                             "admission_failure": str(exc),
                         })
@@ -1553,12 +1847,21 @@ class RenderController:
 
             def worker() -> None:
                 try:
-                    self._last_result = execute_run(
-                        namespace,
-                        command,
-                        repo_root=self.repo_root,
-                        output_root=validated.output_root,
-                    )
+                    if validated.request.text_encoder_id == HERETIC_ENCODER_ID:
+                        self._last_result = execute_heretic_run(
+                            namespace,
+                            encoder_command or (),
+                            command,
+                            repo_root=self.repo_root,
+                            output_root=validated.output_root,
+                        )
+                    else:
+                        self._last_result = execute_run(
+                            namespace,
+                            command,
+                            repo_root=self.repo_root,
+                            output_root=validated.output_root,
+                        )
                 finally:
                     output_lock.release()
 
@@ -1582,6 +1885,7 @@ class RenderController:
         transformer = default_transformer_path(self.repo_root)
         return {
             "modes": [{"id": mode, "label": MODE_LABELS[mode], "image_count": expected_image_count(mode)} for mode in (T2V, I2V, FIRST_LAST)],
+            "text_encoders": text_encoder_payload(self.repo_root),
             "resolutions": preset_payload(),
             "turbo_presets": turbo_preset_payload(self.repo_root),
             "defaults": {
@@ -1599,6 +1903,7 @@ class RenderController:
                 "turbo_enabled": False,
                 "turbo_steps": 8,
                 "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
+                "text_encoder_id": CANONICAL_ENCODER_ID,
             },
             "resolution_contract": {
                 "min_dimension": MIN_RESOLUTION,

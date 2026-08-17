@@ -96,6 +96,9 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
   <select id="mode"></select>
   <label for="prompt">Prompt</label>
   <textarea id="prompt" placeholder="Describe the video to generate.">A cinematic live-action scene with natural movement and atmosphere.</textarea>
+  <label for="text-encoder">Text encoder</label>
+  <select id="text-encoder"></select>
+  <div id="text-encoder-hint" class="meta">Canonical Qwen3-VL is the default H3 conditioning path.</div>
   <div class="grid">
     <div id="image1-slot" class="image-slot hidden"><label for="image1">First image</label><input id="image1" type="file" accept="image/*"></div>
     <div id="image2-slot" class="image-slot hidden"><label for="image2">Last image</label><input id="image2" type="file" accept="image/*"></div>
@@ -203,8 +206,33 @@ function updateMode() {
   const mode = $('mode').value;
   $('image1-slot').classList.toggle('hidden', mode === 'T2V');
   $('image2-slot').classList.toggle('hidden', mode !== 'FIRST_LAST');
+  updateTextEncoderControls();
 }
-
+function selectedTextEncoder() {
+  const id = $('text-encoder').value;
+  return (config.text_encoders || []).find(item => item.id === id) || null;
+}
+function updateTextEncoderControls() {
+  const mode = $('mode').value;
+  const heretic = (config.text_encoders || []).find(item => item.experimental);
+  const current = selectedTextEncoder();
+  const hereticDisabled = Boolean(heretic && (mode !== 'T2V' || !heretic.available));
+  for (const option of $('text-encoder').options) {
+    const item = (config.text_encoders || []).find(entry => entry.id === option.value);
+    option.disabled = Boolean(item && item.experimental && (mode !== 'T2V' || !item.available));
+  }
+  if (hereticDisabled && current && current.experimental) {
+    $('text-encoder').value = (config.text_encoders || []).find(item => !item.experimental).id;
+  }
+  const selected = selectedTextEncoder();
+  if (mode !== 'T2V' && heretic) {
+    $('text-encoder-hint').textContent = 'Heretic is currently text-only; image-conditioned modes require Canonical Qwen3-VL.';
+  } else if (selected && selected.experimental && !selected.available) {
+    $('text-encoder-hint').textContent = selected.disabled_reason || selected.hint;
+  } else {
+    $('text-encoder-hint').textContent = selected ? selected.hint : 'Canonical Qwen3-VL is the default H3 conditioning path.';
+  }
+}
 let referenceControlState = null;
 function selectedTurboPreset() {
   const id = $('turbo-preset').value;
@@ -340,6 +368,7 @@ async function renderJob() {
   if (!validateDimensionsBeforeLaunch()) return;
   const form = new FormData();
   form.set('mode', mode); form.set('prompt', $('prompt').value);
+  form.set('text_encoder_id', $('text-encoder').value);
   form.set('width', $('width').value); form.set('height', $('height').value);
   form.set('steps', $('steps').value); form.set('duration_seconds', $('duration').value); form.set('seed', $('seed').value);
   form.set('output_root', $('output-root').value); form.set('output_name', $('output-name').value);
@@ -363,6 +392,8 @@ async function renderJob() {
 async function boot() {
   config = await (await fetch('/api/config')).json();
   $('mode').innerHTML = config.modes.map(item => `<option value="${item.id}">${item.label}</option>`).join('');
+  $('text-encoder').innerHTML = (config.text_encoders || []).map(item => `<option value="${item.id}" ${item.available ? '' : 'disabled'}>${item.label}</option>`).join('');
+  $('text-encoder').value = config.defaults.text_encoder_id || 'canonical-qwen3-vl';
   $('turbo-preset').innerHTML = (config.turbo_presets || []).map(item => `<option value="${item.id}">${item.label}</option>`).join('');
   $('turbo-preset').value = config.defaults.turbo_preset_id || 'none';
   const bounds = config.resolution_contract || {min_dimension: 128, max_dimension: 1344, step: 32};
@@ -383,6 +414,7 @@ async function boot() {
   $('lora-scale').value = config.defaults.lora_scale;
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
   $('mode').onchange = updateMode;
+  $('text-encoder').onchange = updateTextEncoderControls;
   $('lora-enabled').onchange = updateReferenceLoraControls;
   $('turbo-preset').onchange = updateTurboPresetControls;
   updateTurboPresetControls(); updateMode(); updateGeometry();
@@ -543,6 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             request = RenderRequest(
                 mode=fields.get("mode", ""),
                 prompt=fields.get("prompt", ""),
+                text_encoder_id=fields.get("text_encoder_id", "canonical-qwen3-vl"),
                 resolution_id=fields.get("resolution_id") or None,
                 steps=int(fields.get("steps", "")),
                 duration_seconds=float(fields.get("duration_seconds", "")),
