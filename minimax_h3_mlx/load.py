@@ -26,6 +26,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 from .config import DiTConfig
 from .checkpoint_forge.topology import BLOCK_COUNT, FORMAT_IDENTIFIER
 from .dit import CACHE_ONLY_CONSTRUCTION, MiniMaxH3DiT, RESIDENT_CONSTRUCTION
+from .lora import LoRARegistry, load_lora_safetensors
 
 # Substring matches, mirroring the reference's `_keep_in_fp32_modules`.
 FP32_PREFIXES = (
@@ -305,6 +306,9 @@ def load_dit(
     keep_adaln: bool = False,
     telemetry: Callable[[str, MiniMaxH3DiT | None, CheckpointFormatInfo], None] | None = None,
     tensor_loader: Callable[[str], dict[str, mx.array]] | None = None,
+    lora_registry: LoRARegistry | None = None,
+    lora_path: str | Path | None = None,
+    lora_scale: float = 1.0,
 ) -> MiniMaxH3DiT:
     """Load the 33B DiT from a released ``FL2VA/transformer`` (or ``Ref2VA/transformer``) directory.
 
@@ -314,6 +318,9 @@ def load_dit(
             mixed float32/bfloat16 split, which is what the reference runs.
         strict: raise if the checkpoint and the module tree disagree on any key.
         verbose: print per-shard progress.
+        lora_registry: optional generic registry attached after base weights load.
+        lora_path: optional LoRA safetensors file; mutually exclusive with ``lora_registry``.
+        lora_scale: multiplier used when loading ``lora_path``.
 
     Returns:
         A parameter-loaded :class:`MiniMaxH3DiT`.
@@ -407,6 +414,11 @@ def load_dit(
             f"derived base loaded {len(weights)} tensors; expected {DERIVED_BASE_TENSOR_COUNT}"
         )
     model.update(tree_unflatten(list(weights.items())))
+    if lora_registry is not None and lora_path is not None:
+        raise ValueError("pass either lora_registry or lora_path, not both")
+    if lora_path is not None:
+        lora_registry = load_lora_safetensors(lora_path, scale=lora_scale)
+    model.set_lora_registry(lora_registry)
     model.load_stats = LoadStats(
         loaded_tensor_count=len(weights),
         loaded_logical_bytes=loaded_logical_bytes,

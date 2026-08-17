@@ -21,6 +21,14 @@ from typing import Callable
 RUNTIME_RESOLUTION_RULE_ID = "minimax_h3_mlx.packing.resolve_canvas_size:v1"
 PROJECT_RESOLUTION_SOURCE_ID = "render-lab-approved-resolutions:v2"
 
+# The independent-dimension surface is bounded by the smallest and largest canvases already
+# admitted by the Render Lab catalog.  The runtime itself requires 32-pixel alignment.
+RESOLUTION_STEP = 32
+MIN_RESOLUTION = 128
+MAX_RESOLUTION = 1344
+INDEPENDENT_DIMENSION_SOURCE_ID = "render-lab-independent-dimensions:v1"
+INDEPENDENT_DIMENSION_RULE_ID = "render-lab.independent-dimensions:v1"
+
 
 @dataclass(frozen=True)
 class ResolutionPreset:
@@ -176,6 +184,24 @@ RESOLUTION_PRESETS: tuple[ResolutionPreset, ...] = (
     _curated_preset(576, 1024),
     _curated_preset(768, 1344),
 )
+
+
+def explicit_resolution_preset(width: int, height: int) -> ResolutionPreset:
+    """Describe a validated explicit canvas while retaining the legacy preset contract."""
+    return ResolutionPreset(
+        preset_id=f"explicit-{width}x{height}",
+        label=f"{width} × {height} — independent dimensions",
+        aspect_width=width,
+        aspect_height=height,
+        megapixels=(width * height) / 1_000_000,
+        expected_height=height,
+        expected_width=width,
+        evidence_class="explicit-independent-dimensions",
+        evidence_reference=INDEPENDENT_DIMENSION_SOURCE_ID,
+        approval_note="Explicit width and height passed the Render Lab dimension contract.",
+        runtime_height=height,
+        runtime_width=width,
+    )
 
 
 def preset_by_id(preset_id: str) -> ResolutionPreset:

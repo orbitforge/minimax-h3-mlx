@@ -17,6 +17,7 @@ one streamed modulation cache per transition — see :mod:`minimax_h3_mlx.adaln`
 from __future__ import annotations
 
 import gc
+import math
 import resource
 import time
 from dataclasses import dataclass
@@ -27,6 +28,11 @@ import mlx.core as mx
 import numpy as np
 
 from .adaln import ModulationCache, drop_adaln_weights
+from .conditioning_artifact import (
+    LoadedConditioningArtifact,
+    load_conditioning_artifact,
+    validate_conditioning_artifact,
+)
 from .config import DiTConfig, PipelineConfig
 from .denoise import (
     StreamedTransitionSession,
@@ -34,6 +40,13 @@ from .denoise import (
     run_streamed_transition,
 )
 from .dit import CACHE_ONLY_CONSTRUCTION
+from .lora import (
+    LIGHTX_FL2VA_TURBO_8STEP_V1_0,
+    LightX2VManifest,
+    LoRARegistry,
+    load_lightx_safetensors,
+    load_lora_safetensors,
+)
 from .packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -52,6 +65,12 @@ from .packing import (
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3MultimodalScheduler, MiniMaxH3Scheduler
+from .turbo import TurboSchedule
+from .transformer_routing import (
+    REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED,
+    TASK_REF2VA,
+    resolve_manifest_transformer,
+)
 
 
 def _format_bytes(value: int | float | None) -> str:
@@ -116,7 +135,17 @@ class MiniMaxH3Pipeline:
         dit_config: DiTConfig | None = None,
         video_vae_config=None,
         audio_vae_config=None,
+        lora_registry: LoRARegistry | None = None,
+        lora_path: str | Path | None = None,
+        lightx_path: str | Path | None = None,
+        lightx_manifest: LightX2VManifest | None = None,
+        lora_scale: float = 1.0,
+        turbo: bool = False,
+        turbo_steps: int | None = None,
+        conditioning_artifact: LoadedConditioningArtifact | None = None,
     ):
+        if conditioning_artifact is not None and text_encoder is not None:
+            raise ValueError("artifact replay cannot retain a live Qwen text encoder")
         self.dit = dit
         self.text_encoder = text_encoder
         self.video_vae = video_vae
@@ -127,8 +156,53 @@ class MiniMaxH3Pipeline:
         self._dit_config = dit_config or getattr(dit, "config", None)
         self._video_vae_config = video_vae_config or getattr(video_vae, "config", None)
         self._audio_vae_config = audio_vae_config or getattr(audio_vae, "config", None)
+        if lora_registry is not None and (lora_path is not None or lightx_path is not None):
+            raise ValueError("pass either lora_registry, lora_path, or lightx_path, not more than one")
+        if lora_path is not None and lightx_path is not None:
+            raise ValueError("pass either lora_path or lightx_path, not both")
+        inferred_lightx_manifest = lightx_manifest
+        if inferred_lightx_manifest is None and lora_registry is not None:
+            inferred_lightx_manifest = getattr(lora_registry, "lightx_manifest", None)
+        if lightx_path is not None and inferred_lightx_manifest is None:
+            inferred_lightx_manifest = LIGHTX_FL2VA_TURBO_8STEP_V1_0
+        if inferred_lightx_manifest is not None and not isinstance(inferred_lightx_manifest, LightX2VManifest):
+            raise TypeError(
+                "expected LightX2VManifest or None, "
+                f"got {type(inferred_lightx_manifest).__name__}"
+            )
+        if inferred_lightx_manifest is not None and inferred_lightx_manifest.task == TASK_REF2VA:
+            raise RuntimeError(REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED)
+        self._lora_registry = lora_registry
+        self._lora_path = Path(lora_path) if lora_path is not None else None
+        self._lightx_path = Path(lightx_path) if lightx_path is not None else None
+        self._lightx_manifest = inferred_lightx_manifest
+        self._lora_scale = float(lora_scale)
+        self._turbo = bool(turbo)
+        self._turbo_steps = None if turbo_steps is None else int(turbo_steps)
+        self._conditioning_artifact = conditioning_artifact
+        if self._lightx_manifest is not None:
+            if not math.isclose(
+                self._lora_scale,
+                self._lightx_manifest.runtime_scale_default,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "native LightX production scale is fixed by the manifest at "
+                    f"{self._lightx_manifest.runtime_scale_default}"
+                )
+            if self._turbo_steps is not None and self._turbo_steps != self._lightx_manifest.nfe:
+                raise ValueError(
+                    "native LightX production NFE is fixed by the manifest at "
+                    f"{self._lightx_manifest.nfe}"
+                )
+            self._turbo = True
+            self._turbo_steps = self._lightx_manifest.nfe
+        if self._turbo_steps is not None:
+            TurboSchedule(self._turbo_steps)
         self._cache: ModulationCache | None = None
         self._cache_timesteps: tuple[float, ...] | None = None
+        self._cache_lora_identity: str | None = None
         self._adaln_purge_attempts = 0
         self._adaln_purge_status = "not-run"
 
@@ -141,6 +215,13 @@ class MiniMaxH3Pipeline:
         load_vision: bool = False,
         unload_text_encoder: bool = False,
         keep_adaln: bool = False,
+        lora_path: str | Path | None = None,
+        lightx_path: str | Path | None = None,
+        lightx_manifest: LightX2VManifest | None = None,
+        lora_scale: float = 1.0,
+        turbo: bool = False,
+        turbo_steps: int | None = None,
+        conditioning_artifact: str | Path | LoadedConditioningArtifact | None = None,
         verbose: bool = True,
     ) -> "MiniMaxH3Pipeline":
         """Load a released ``FL2VA/`` (or ``Ref2VA/``) directory.
@@ -151,6 +232,13 @@ class MiniMaxH3Pipeline:
                 This is how a published quant is used: the quantized repository holds only the
                 transformer, and everything else still comes from upstream. ``load_dit`` picks up
                 the recorded recipe from its ``quant_config.json`` automatically.
+            lora_path: optional generic or Turbo LoRA safetensors file, loaded when the transformer
+                stage is admitted.
+            lightx_path: native LightX2V safetensors file. Its explicit manifest owns the task,
+                representation, runtime scale, NFE, and scheduler shifts.
+            lightx_manifest: explicit manifest for ``lightx_path``; omitted native adapters retain
+                the existing FL2VA Turbo 8-step v1.0 default.
+            turbo: make the reduced-step schedule the default for calls using this pipeline.
         """
         from .load import (
             load_audio_vae,
@@ -160,9 +248,22 @@ class MiniMaxH3Pipeline:
             load_video_vae_config,
             inspect_checkpoint_format,
         )
-        from .text_encoder import MiniMaxH3TextEncoder
-
         root = Path(checkpoint_dir)
+        if lora_path is not None and lightx_path is not None:
+            raise ValueError("pass either lora_path or lightx_path, not both")
+        if lightx_manifest is not None and lightx_manifest.task == TASK_REF2VA:
+            # Validate the dedicated partition before any encoder/transformer stage.  The route is
+            # intentionally followed by a stop because reference conditioning is out of scope.
+            resolve_manifest_transformer(lightx_manifest, root, explicit_transformer_dir=transformer_dir)
+            raise RuntimeError(REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED)
+        if lightx_path is not None:
+            # Header-only LightX admission belongs before text encoding or any other generation
+            # stage.  The transformer stage repeats registration lazily without reading payloads.
+            load_lightx_safetensors(
+                lightx_path,
+                variant=lightx_manifest or LIGHTX_FL2VA_TURBO_8STEP_V1_0,
+                scale=lora_scale,
+            )
         dit_path = Path(transformer_dir) if transformer_dir else root / "transformer"
         format_info = inspect_checkpoint_format(dit_path)
         if format_info.checkpoint_format == "derived" and keep_adaln:
@@ -174,6 +275,21 @@ class MiniMaxH3Pipeline:
         dit_config = DiTConfig.from_json(dit_path / "config.json")
         video_vae_config = load_video_vae_config(root / "video_vae")
         audio_vae_config = load_audio_vae_config(root / "audio_vae")
+
+        loaded_conditioning_artifact = None
+        if conditioning_artifact is not None:
+            loaded_conditioning_artifact = (
+                conditioning_artifact
+                if isinstance(conditioning_artifact, LoadedConditioningArtifact)
+                else load_conditioning_artifact(conditioning_artifact)
+            )
+            validate_conditioning_artifact(
+                loaded_conditioning_artifact,
+                checkpoint_root=root,
+                text_dim=dit_config.text_dim,
+            )
+            if load_vision:
+                raise ValueError("artifact replay cannot load the Qwen vision tower")
 
         def step(label, fn):
             started = time.perf_counter()
@@ -190,9 +306,21 @@ class MiniMaxH3Pipeline:
 
         if verbose:
             print(f"loading MiniMax-H3 from {root}")
-        text_encoder = step(
-            "text encoder", lambda: MiniMaxH3TextEncoder(root / "text_encoder", dtype=dtype, load_vision=load_vision)
-        )
+        if loaded_conditioning_artifact is None:
+            # Keep this import inside the live-prompt branch.  Artifact replay
+            # must not even construct the Qwen class or load its tokenizer.
+            from .text_encoder import MiniMaxH3TextEncoder
+
+            text_encoder = step(
+                "text encoder",
+                lambda: MiniMaxH3TextEncoder(root / "text_encoder", dtype=dtype, load_vision=load_vision),
+            )
+        else:
+            text_encoder = None
+            if verbose:
+                print("conditioning source: artifact", flush=True)
+                print(f"artifact identity: {loaded_conditioning_artifact.artifact_identity}", flush=True)
+                print("Qwen/text encoder construction: skipped (artifact replay)", flush=True)
 
         # Stage 2 is deliberately represented as factories.  Constructing the pipeline must not
         # map or evaluate any generation component before the request has been encoded and the
@@ -213,6 +341,13 @@ class MiniMaxH3Pipeline:
             dit_config=dit_config,
             video_vae_config=video_vae_config,
             audio_vae_config=audio_vae_config,
+            lora_path=lora_path,
+            lightx_path=lightx_path,
+            lightx_manifest=lightx_manifest,
+            lora_scale=lora_scale,
+            turbo=turbo,
+            turbo_steps=turbo_steps,
+            conditioning_artifact=loaded_conditioning_artifact,
         )
 
     def _timed_stage(self, label: str, fn: Callable[[], object], verbose: bool):
@@ -239,12 +374,30 @@ class MiniMaxH3Pipeline:
             print(f"  text encoder release: {time.perf_counter() - started:.1f}s", flush=True)
             print(f"  [memory] after text encoder release: {_memory_snapshot()}", flush=True)
 
-    def _prepare_conditioning(self, prompt: str, images: list | None, verbose: bool):
+    def _prepare_conditioning(self, prompt: str | None, images: list | None, verbose: bool):
+        if self._conditioning_artifact is not None:
+            if images:
+                raise ValueError("artifact replay is text-only; image/VAE conditioning is outside this artifact")
+            validate_conditioning_artifact(self._conditioning_artifact, prompt=prompt)
+            prompt_embeds = self._conditioning_artifact.conditioning_mlx(mx)
+            text_token_tags = np.array(self._conditioning_artifact.text_token_tags, copy=True)
+            if verbose:
+                print("  conditioning source: artifact", flush=True)
+                print(f"  artifact identity: {self._conditioning_artifact.artifact_identity}", flush=True)
+                print(
+                    "  artifact conditioning: "
+                    f"shape={self._conditioning_artifact.conditioning_shape} dtype=bfloat16 "
+                    f"checksum={self._conditioning_artifact.tensor_checksum}",
+                    flush=True,
+                )
+            return prompt_embeds, text_token_tags
         if self.text_encoder is None:
             raise RuntimeError(
                 "This staged pipeline has already released its text encoder and is one-shot. "
                 "Use --keep-text-encoder when repeated generation is required."
             )
+        if prompt is None:
+            raise ValueError("a live-prompt generation requires a prompt")
         started = time.perf_counter()
         prompt_embeds, text_token_tags = self.text_encoder.encode(prompt, images)
         # `encode` evaluates today, but this boundary is intentional: it protects the lifetime
@@ -337,6 +490,7 @@ class MiniMaxH3Pipeline:
         if attr == "dit":
             self._cache = None
             self._cache_timesteps = None
+            self._cache_lora_identity = None
         if purge_reason is None:
             purge_reason = {
                 "dit": "transformer-release",
@@ -358,7 +512,27 @@ class MiniMaxH3Pipeline:
             )
 
     def _load_transformer(self, verbose: bool):
-        return self._load_component("dit", "transformer", verbose)
+        if self._lightx_manifest is not None and self._lightx_manifest.task == TASK_REF2VA:
+            raise RuntimeError(REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED)
+        if self._lora_registry is None and self._lightx_path is not None:
+            self._lora_registry = load_lightx_safetensors(
+                self._lightx_path,
+                variant=self._lightx_manifest or LIGHTX_FL2VA_TURBO_8STEP_V1_0,
+                scale=self._lora_scale,
+            )
+        dit = self._load_component("dit", "transformer", verbose)
+        if self._lora_registry is None and self._lora_path is not None:
+            self._lora_registry = load_lora_safetensors(
+                self._lora_path,
+                scale=self._lora_scale,
+            )
+        if self._lora_registry is not None:
+            setter = getattr(dit, "set_lora_registry", None)
+            if callable(setter):
+                setter(self._lora_registry)
+            else:
+                setattr(dit, "_lora_registry", self._lora_registry)
+        return dit
 
     def _load_video_vae(self, verbose: bool):
         return self._load_component("video_vae", "video VAE", verbose)
@@ -374,11 +548,47 @@ class MiniMaxH3Pipeline:
 
     # -- schedule -----------------------------------------------------------------------------
 
-    def _build_schedules(self, num_inference_steps: int):
-        video = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video)
-        audio = MiniMaxH3Scheduler(shift=self.config.sigma_shift_audio)
-        video.set_timesteps(num_inference_steps)
-        audio.set_timesteps(num_inference_steps)
+    @property
+    def lightx_manifest(self) -> LightX2VManifest | None:
+        """The explicit native LightX configuration admitted by this pipeline, if any."""
+        return self._lightx_manifest
+
+    def _build_schedules(
+        self,
+        num_inference_steps: int,
+        turbo_schedule: TurboSchedule | None = None,
+    ):
+        if self._lightx_manifest is not None:
+            expected_nfe = self._lightx_manifest.nfe
+            if int(num_inference_steps) != expected_nfe:
+                raise ValueError(
+                    "native LightX production NFE is fixed by the manifest at "
+                    f"{expected_nfe}"
+                )
+            if turbo_schedule is None:
+                turbo_schedule = TurboSchedule(expected_nfe)
+            elif turbo_schedule.steps != expected_nfe:
+                raise ValueError(
+                    "native LightX production Turbo schedule is fixed by the manifest at "
+                    f"{expected_nfe} NFE"
+                )
+        video_shift = (
+            self._lightx_manifest.video_shift
+            if self._lightx_manifest is not None
+            else self.config.sigma_shift_video
+        )
+        audio_shift = (
+            self._lightx_manifest.audio_shift
+            if self._lightx_manifest is not None
+            else self.config.sigma_shift_audio
+        )
+        video = MiniMaxH3Scheduler(shift=video_shift)
+        audio = MiniMaxH3Scheduler(shift=audio_shift)
+        if turbo_schedule is None:
+            video.set_timesteps(num_inference_steps)
+            audio.set_timesteps(num_inference_steps)
+        else:
+            turbo_schedule.configure(video, audio)
         return video, audio
 
     def _uses_streamed_adaln(self) -> bool:
@@ -409,7 +619,12 @@ class MiniMaxH3Pipeline:
 
     def _ensure_cache(self, timesteps: mx.array, drop_adaln: bool, verbose: bool):
         key = tuple(round(float(v), 9) for v in timesteps.tolist())
-        if self._cache is not None and self._cache_timesteps == key:
+        lora_identity = None if self._lora_registry is None else self._lora_registry.cache_identity
+        if (
+            self._cache is not None
+            and self._cache_timesteps == key
+            and self._cache_lora_identity == lora_identity
+        ):
             return
         if self.dit is None:
             raise RuntimeError("Cannot build the AdaLN cache before the transformer is loaded.")
@@ -426,8 +641,14 @@ class MiniMaxH3Pipeline:
         started = time.perf_counter()
         if verbose:
             print(f"  [memory] before AdaLN cache construction: {_memory_snapshot()}", flush=True)
-        self._cache = ModulationCache.build(self.dit, timesteps, dtype=mx.bfloat16)
+        self._cache = ModulationCache.build(
+            self.dit,
+            timesteps,
+            dtype=mx.bfloat16,
+            lora_registry=self._lora_registry,
+        )
         self._cache_timesteps = key
+        self._cache_lora_identity = self._cache.lora_identity
         self._cache.materialize()
         if verbose:
             print(f"  adaln cache: {len(key)} timesteps, {self._cache.nbytes() / 1e6:.0f} MB "
@@ -498,11 +719,11 @@ class MiniMaxH3Pipeline:
 
     def __call__(
         self,
-        prompt: str,
+        prompt: str | None = None,
         duration_seconds: float = 5.0,
         aspect: tuple[int, int] = (16, 9),
         megapixels: float | None = None,
-        num_inference_steps: int = 16,
+        num_inference_steps: int | None = None,
         seed: int = 0,
         images: list | None = None,
         keyframe_anchors: tuple[str, ...] = (),
@@ -510,12 +731,15 @@ class MiniMaxH3Pipeline:
         width: int | None = None,
         drop_adaln: bool = True,
         verbose: bool = True,
+        turbo: bool | None = None,
+        turbo_steps: int | None = None,
     ) -> GenerationResult:
         """Generate a clip.
 
         Args:
             duration_seconds: 5 to 15; snapped up to the ``17n + 5`` frame grid the VAE encodes.
-            num_inference_steps: the weights are CFG-distilled, so each step is one forward.
+            num_inference_steps: the weights are CFG-distilled, so each step is one forward. The
+                normal default is 16; Turbo defaults to 8.
             keyframe_anchors: ``"first"`` / ``"last"`` per conditioning keyframe, in packed order.
             height, width: override the canvas ``aspect`` would resolve to. Both must be multiples
                 of 32. H3 was released for a 768-pixel short edge only, so anything else is
@@ -524,6 +748,59 @@ class MiniMaxH3Pipeline:
         run_started = time.perf_counter()
         self._adaln_purge_attempts = 0
         self._adaln_purge_status = "not-run"
+        if self._lightx_manifest is not None and turbo is False:
+            raise ValueError("native LightX production requires its manifest-bound Turbo schedule")
+        turbo_enabled = True if self._lightx_manifest is not None else (
+            self._turbo if turbo is None else bool(turbo)
+        )
+        if turbo_enabled and self._lora_registry is None and self._lora_path is None and self._lightx_path is None:
+            raise RuntimeError("Turbo generation requires an attached Turbo LoRA safetensors adapter")
+        turbo_schedule = None
+        if turbo_enabled:
+            requested_turbo_steps = turbo_steps if turbo_steps is not None else self._turbo_steps
+            if self._lightx_manifest is not None:
+                expected_nfe = self._lightx_manifest.nfe
+                if (
+                    requested_turbo_steps is not None
+                    and int(requested_turbo_steps) != expected_nfe
+                ) or (
+                    num_inference_steps is not None
+                    and int(num_inference_steps) != expected_nfe
+                ):
+                    raise ValueError(
+                        "native LightX production NFE is fixed by the manifest at "
+                        f"{expected_nfe}"
+                    )
+                requested_turbo_steps = expected_nfe
+            if (
+                requested_turbo_steps is not None
+                and num_inference_steps is not None
+                and int(requested_turbo_steps) != int(num_inference_steps)
+            ):
+                raise ValueError(
+                    "num_inference_steps and turbo_steps disagree; pass one Turbo step count"
+                )
+            if requested_turbo_steps is None and num_inference_steps is not None:
+                requested_turbo_steps = int(num_inference_steps)
+            turbo_schedule = TurboSchedule.from_registry(
+                self._lora_registry,
+                steps=requested_turbo_steps,
+            )
+        if verbose and self._lightx_manifest is not None:
+            manifest = self._lightx_manifest
+            print(
+                "  LightX2V configuration: "
+                f"variant={manifest.variant_id} task={manifest.task} "
+                f"representation={manifest.representation} rank={manifest.rank} alpha={manifest.alpha:g} "
+                f"runtime_scale={manifest.runtime_scale_default:g} NFE={manifest.nfe} "
+                f"video_shift={manifest.video_shift:g} audio_shift={manifest.audio_shift:g}",
+                flush=True,
+            )
+        effective_steps = turbo_schedule.steps if turbo_schedule is not None else (
+            int(num_inference_steps) if num_inference_steps is not None else 16
+        )
+        if effective_steps < 2:
+            raise ValueError(f"num_inference_steps must be at least 2, got {effective_steps}")
 
         # 1. Stage-one conditioning. Keyframe vision blocks come back tagged as *video* rows.
         prompt_embeds, text_token_tags = self._prepare_conditioning(prompt, images, verbose)
@@ -598,7 +875,7 @@ class MiniMaxH3Pipeline:
             if condition_rows is not None:
                 video_rows = mx.concatenate([condition_rows, video_rows])
 
-            video_sched, audio_sched = self._build_schedules(num_inference_steps)
+            video_sched, audio_sched = self._build_schedules(effective_steps, turbo_schedule)
             streamed_adaln = self._uses_streamed_adaln()
             if streamed_adaln:
                 if not drop_adaln:

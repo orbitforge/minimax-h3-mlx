@@ -31,6 +31,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import MODALITY_NUM, DiTConfig
+from .lora import LoRARegistry, linear_with_lora
 
 
 RESIDENT_CONSTRUCTION = "resident"
@@ -85,8 +86,19 @@ class TimestepEmbedder(nn.Module):
         self.proj_in = nn.Linear(config.timestep_input_dim, config.time_embed_hidden_size, bias=True)
         self.proj_out = nn.Linear(config.time_embed_hidden_size, config.time_embed_dim, bias=True)
 
-    def __call__(self, sinusoid: mx.array) -> mx.array:
-        return self.proj_out(nn.silu(self.proj_in(sinusoid)))
+    def __call__(self, sinusoid: mx.array, lora_registry: LoRARegistry | None = None) -> mx.array:
+        hidden = linear_with_lora(
+            self.proj_in,
+            sinusoid,
+            "time_embedder.proj_in",
+            lora_registry,
+        )
+        return linear_with_lora(
+            self.proj_out,
+            nn.silu(hidden),
+            "time_embedder.proj_out",
+            lora_registry,
+        )
 
 
 class RotaryPosEmbed3D:
@@ -150,10 +162,17 @@ class Attention(nn.Module):
         x: mx.array,
         rotary: tuple[mx.array, mx.array] | None = None,
         mask: mx.array | None = None,
+        lora_registry: LoRARegistry | None = None,
+        target_prefix: str | None = None,
     ) -> mx.array:
         B, S, _ = x.shape
         # Raw-checkpoint QKV rows are per-head interleaved: (..., heads, 3, head_dim).
-        qkv = self.qkv_proj(x).reshape(B, S, self.heads, 3, self.head_dim)
+        qkv = linear_with_lora(
+            self.qkv_proj,
+            x,
+            f"{target_prefix}.qkv_proj" if target_prefix else "attn.qkv_proj",
+            lora_registry,
+        ).reshape(B, S, self.heads, 3, self.head_dim)
         q, k, v = qkv[:, :, :, 0], qkv[:, :, :, 1], qkv[:, :, :, 2]
 
         q = self.q_norm(q).transpose(0, 2, 1, 3)
@@ -166,7 +185,12 @@ class Attention(nn.Module):
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.heads * self.head_dim)
-        return self.out_proj(out.astype(x.dtype))
+        return linear_with_lora(
+            self.out_proj,
+            out.astype(x.dtype),
+            f"{target_prefix}.out_proj" if target_prefix else "attn.out_proj",
+            lora_registry,
+        )
 
 
 class FeedForward(nn.Module):
@@ -178,10 +202,25 @@ class FeedForward(nn.Module):
         self.fc2 = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=False)
         self._ffn = config.ffn_hidden_size
 
-    def __call__(self, x: mx.array) -> mx.array:
-        fused = self.fc1(x)
+    def __call__(
+        self,
+        x: mx.array,
+        lora_registry: LoRARegistry | None = None,
+        target_prefix: str | None = None,
+    ) -> mx.array:
+        fused = linear_with_lora(
+            self.fc1,
+            x,
+            f"{target_prefix}.fc1" if target_prefix else "mlp.fc1",
+            lora_registry,
+        )
         gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
-        return self.fc2(nn.silu(gate) * value)
+        return linear_with_lora(
+            self.fc2,
+            nn.silu(gate) * value,
+            f"{target_prefix}.fc2" if target_prefix else "mlp.fc2",
+            lora_registry,
+        )
 
 
 class AdaLayerNormModulation(nn.Module):
@@ -202,10 +241,22 @@ class AdaLayerNormModulation(nn.Module):
         self.hidden_size = config.hidden_size
         self.linear = nn.Linear(config.time_embed_dim, config.adaln_out_features, bias=True)
 
-    def __call__(self, temb: mx.array) -> tuple[mx.array, ...]:
+    def __call__(
+        self,
+        temb: mx.array,
+        lora_registry: LoRARegistry | None = None,
+        target_prefix: str = "adaln_proj",
+        transient_lora: bool = False,
+    ) -> tuple[mx.array, ...]:
         # Activate at `temb`'s own (float32) precision, cast to the projection's dtype after.
         h = nn.silu(temb).astype(param_dtype(self.linear))
-        h = self.linear(h).reshape(-1, 6 * self.hidden_size)
+        h = linear_with_lora(
+            self.linear,
+            h,
+            f"{target_prefix}.linear",
+            lora_registry,
+            transient=transient_lora,
+        ).reshape(-1, 6 * self.hidden_size)
         return tuple(h[..., i * self.hidden_size : (i + 1) * self.hidden_size] for i in range(6))
 
 
@@ -251,8 +302,19 @@ class FinalLayer(nn.Module):
         self.audio_out = nn.Linear(config.hidden_size, config.audio_latents_dim, bias=True)
         self.hidden_size = config.hidden_size
 
-    def norm_out(self, x: mx.array, temb: mx.array, timestep_indices: mx.array) -> mx.array:
-        h = self.adaln_proj.linear(nn.silu(temb).astype(param_dtype(self.adaln_proj.linear)))
+    def norm_out(
+        self,
+        x: mx.array,
+        temb: mx.array,
+        timestep_indices: mx.array,
+        lora_registry: LoRARegistry | None = None,
+    ) -> mx.array:
+        h = linear_with_lora(
+            self.adaln_proj.linear,
+            nn.silu(temb).astype(param_dtype(self.adaln_proj.linear)),
+            "final_layer.adaln_proj.linear",
+            lora_registry,
+        )
         shift, scale = h[..., : self.hidden_size], h[..., self.hidden_size :]
         x = self.norm(x)
         return x * (1.0 + scale[timestep_indices]) + shift[timestep_indices]
@@ -268,9 +330,22 @@ class TokenRefinerBlock(nn.Module):
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = FeedForward(config)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = x + self.attn(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
+    def __call__(
+        self,
+        x: mx.array,
+        lora_registry: LoRARegistry | None = None,
+        target_prefix: str | None = None,
+    ) -> mx.array:
+        x = x + self.attn(
+            self.norm1(x),
+            lora_registry=lora_registry,
+            target_prefix=f"{target_prefix}.attn" if target_prefix else None,
+        )
+        return x + self.mlp(
+            self.norm2(x),
+            lora_registry=lora_registry,
+            target_prefix=f"{target_prefix}.mlp" if target_prefix else None,
+        )
 
 
 class TokenRefiner(nn.Module):
@@ -279,9 +354,13 @@ class TokenRefiner(nn.Module):
         self.blocks = [TokenRefinerBlock(config) for _ in range(config.token_refiner_num_layers)]
         self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.final_norm_eps)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        for block in self.blocks:
-            x = block(x)
+    def __call__(self, x: mx.array, lora_registry: LoRARegistry | None = None) -> mx.array:
+        for index, block in enumerate(self.blocks):
+            x = block(
+                x,
+                lora_registry=lora_registry,
+                target_prefix=f"token_refiner.blocks.{index}",
+            )
         return self.final_norm(x)
 
 
@@ -308,16 +387,28 @@ class TransformerBlock(nn.Module):
         adaln_indices: mx.array,
         rotary: tuple[mx.array, mx.array],
         mask: mx.array | None = None,
+        lora_registry: LoRARegistry | None = None,
+        target_prefix: str | None = None,
     ) -> mx.array:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
 
         h = self.norm1(x)
         h = h * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
-        x = x + gate_msa[adaln_indices] * self.attn(h, rotary, mask)
+        x = x + gate_msa[adaln_indices] * self.attn(
+            h,
+            rotary,
+            mask,
+            lora_registry=lora_registry,
+            target_prefix=f"{target_prefix}.attn" if target_prefix else None,
+        )
 
         h = self.norm2(x)
         h = h * (1.0 + scale_mlp[adaln_indices]) + shift_mlp[adaln_indices]
-        return x + gate_mlp[adaln_indices] * self.mlp(h)
+        return x + gate_mlp[adaln_indices] * self.mlp(
+            h,
+            lora_registry=lora_registry,
+            target_prefix=f"{target_prefix}.mlp" if target_prefix else None,
+        )
 
 
 class MiniMaxH3DiT(nn.Module):
@@ -333,6 +424,7 @@ class MiniMaxH3DiT(nn.Module):
             raise ValueError(f"unsupported transformer construction mode: {construction_mode!r}")
         self.config = config
         self.construction_mode = construction_mode
+        self._lora_registry: LoRARegistry | None = None
 
         # 1. Per-modality input projections.
         self.video_patch_proj = nn.Linear(config.video_patch_dim, config.hidden_size, bias=True)
@@ -372,6 +464,7 @@ class MiniMaxH3DiT(nn.Module):
         text_indices: mx.array,
         modulation_cache: "ModulationCache | None" = None,
         mask: mx.array | None = None,
+        lora_registry: LoRARegistry | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Predict the video and audio velocity for one packed sequence.
 
@@ -411,14 +504,38 @@ class MiniMaxH3DiT(nn.Module):
                 f"{token_tags.shape} and {timestep_indices.shape} for seq_len={seq_len}."
             )
 
+        if lora_registry is None:
+            lora_registry = self._lora_registry
+        if modulation_cache is not None:
+            registry_identity = None if lora_registry is None else lora_registry.cache_identity
+            cache_identity = getattr(modulation_cache, "lora_identity", None)
+            if cache_identity != registry_identity:
+                raise ValueError(
+                    "modulation cache LoRA identity does not match the transformer registry"
+                )
         rotary = self.rope(position_ids)
 
         # 1. Project each modality and scatter the rows into the packed buffer. The text stream
         #    sets the dtype of the packed sequence.
-        video_embeds = self.video_patch_proj(video_latents.astype(param_dtype(self.video_patch_proj)))
-        audio_embeds = self.audio_patch_proj(audio_latents.astype(param_dtype(self.audio_patch_proj)))
-        text = self.condition_proj(text_embeds.astype(param_dtype(self.condition_proj)))
-        text = self.token_refiner(text)
+        video_embeds = linear_with_lora(
+            self.video_patch_proj,
+            video_latents.astype(param_dtype(self.video_patch_proj)),
+            "video_patch_proj",
+            lora_registry,
+        )
+        audio_embeds = linear_with_lora(
+            self.audio_patch_proj,
+            audio_latents.astype(param_dtype(self.audio_patch_proj)),
+            "audio_patch_proj",
+            lora_registry,
+        )
+        text = linear_with_lora(
+            self.condition_proj,
+            text_embeds.astype(param_dtype(self.condition_proj)),
+            "condition_proj",
+            lora_registry,
+        )
+        text = self.token_refiner(text, lora_registry=lora_registry)
 
         B = text.shape[0]
         x = mx.zeros((B, seq_len, text.shape[-1]), dtype=text.dtype)
@@ -427,7 +544,10 @@ class MiniMaxH3DiT(nn.Module):
         x[:, audio_indices] = audio_embeds.astype(text.dtype)
 
         # 2. One timestep embedding per distinct noise level, shared by all AdaLN projections.
-        temb = self.time_embedder(timestep_embedding(timestep, self.config.timestep_input_dim))
+        temb = self.time_embedder(
+            timestep_embedding(timestep, self.config.timestep_input_dim),
+            lora_registry=lora_registry,
+        )
 
         # 3. Row -> AdaLN table row. `maximum(tags, 0)` mirrors the reference clamp: padding rows
         #    carry tag -1 and must not index backwards. They never reach the outputs.
@@ -435,12 +555,47 @@ class MiniMaxH3DiT(nn.Module):
 
         for i, block in enumerate(self.blocks):
             modulation = (
-                modulation_cache.get(i) if modulation_cache is not None else block.adaln_proj(temb)
+                modulation_cache.get(i)
+                if modulation_cache is not None
+                else block.adaln_proj(
+                    temb,
+                    lora_registry=lora_registry,
+                    target_prefix=f"blocks.{i}.adaln_proj",
+                )
             )
-            x = block(x, modulation, adaln_indices, rotary, mask)
+            x = block(
+                x,
+                modulation,
+                adaln_indices,
+                rotary,
+                mask,
+                lora_registry=lora_registry,
+                target_prefix=f"blocks.{i}",
+            )
 
         # 4. Both heads run over every row, then each modality's rows are selected.
-        x = self.final_layer.norm_out(x, temb, timestep_indices)
-        video_out = self.final_layer.video_out(x.astype(param_dtype(self.final_layer.video_out)))
-        audio_out = self.final_layer.audio_out(x.astype(param_dtype(self.final_layer.audio_out)))
+        x = self.final_layer.norm_out(
+            x,
+            temb,
+            timestep_indices,
+            lora_registry=lora_registry,
+        )
+        video_out = linear_with_lora(
+            self.final_layer.video_out,
+            x.astype(param_dtype(self.final_layer.video_out)),
+            "final_layer.video_out",
+            lora_registry,
+        )
+        audio_out = linear_with_lora(
+            self.final_layer.audio_out,
+            x.astype(param_dtype(self.final_layer.audio_out)),
+            "final_layer.audio_out",
+            lora_registry,
+        )
         return video_out[:, video_indices], audio_out[:, audio_indices]
+
+    def set_lora_registry(self, registry: LoRARegistry | None) -> None:
+        """Attach adapters without placing them in the checkpoint parameter tree."""
+        if registry is not None and not isinstance(registry, LoRARegistry):
+            raise TypeError(f"expected LoRARegistry or None, got {type(registry).__name__}")
+        self._lora_registry = registry

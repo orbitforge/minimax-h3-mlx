@@ -10,11 +10,19 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.render_lab.resolutions import RESOLUTION_PRESETS, authoritative_dimensions, preset_payload
+from tools.render_lab.resolutions import (
+    MAX_RESOLUTION,
+    MIN_RESOLUTION,
+    RESOLUTION_STEP,
+    RESOLUTION_PRESETS,
+    authoritative_dimensions,
+    preset_payload,
+)
 from tools.render_lab.runner import (
     FIRST_LAST,
     I2V,
     T2V,
+    RenderController,
     RenderFileLock,
     RenderRequest,
     RenderValidationError,
@@ -128,6 +136,154 @@ class RenderLabContractTests(unittest.TestCase):
             first_last_command = build_generation_command(first_last, python="python")
             anchors = [first_last_command[index + 1] for index, value in enumerate(first_last_command) if value == "--anchor"]
             self.assertEqual(anchors, ["first", "last"])
+
+    def test_independent_dimensions_accept_square_landscape_and_portrait(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for width, height in ((512, 512), (768, 512), (512, 768)):
+                with self.subTest(width=width, height=height):
+                    validated = validate_render_request(
+                        request(root, resolution_id=None, width=width, height=height),
+                        repo_root=ROOT,
+                        check_images=False,
+                        verify_runtime_geometry=False,
+                    )
+                    self.assertEqual((validated.width, validated.height), (width, height))
+                    command = build_generation_command(validated, python="python")
+                    self.assertEqual(command[command.index("--width") + 1], str(width))
+                    self.assertEqual(command[command.index("--height") + 1], str(height))
+
+    def test_invalid_dimensions_fail_closed_with_positive_and_alignment_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid = (
+                ({"width": 500, "height": 512}, "Width must be divisible by 32"),
+                ({"width": 512, "height": 514}, "Height must be divisible by 32"),
+                ({"width": 0, "height": 512}, "Width must be positive"),
+                ({"width": -32, "height": 512}, "Width must be positive"),
+            )
+            for changes, message in invalid:
+                with self.subTest(changes=changes), self.assertRaisesRegex(RenderValidationError, message):
+                    validate_render_request(
+                        request(root, resolution_id=None, **changes),
+                        repo_root=ROOT,
+                        check_images=False,
+                        verify_runtime_geometry=False,
+                    )
+
+    def test_dimension_contract_bounds_and_slider_step_are_exposed(self) -> None:
+        controller = RenderController(ROOT)
+        payload = controller.config_payload()
+        self.assertEqual(
+            payload["resolution_contract"],
+            {
+                "min_dimension": MIN_RESOLUTION,
+                "max_dimension": MAX_RESOLUTION,
+                "step": RESOLUTION_STEP,
+                "positive": True,
+                "source": "tools/render_lab/resolutions.py:independent-dimensions-v1",
+            },
+        )
+        self.assertIn('id="width-range" type="range" min="128" max="1344" step="32"', PAGE)
+        self.assertIn('id="height-range" type="range" min="128" max="1344" step="32"', PAGE)
+        self.assertIn("form.set('width', $('width').value); form.set('height', $('height').value);", PAGE)
+
+    def test_lora_controls_are_optional_and_map_to_runtime_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            disabled = validate_render_request(
+                request(
+                    root,
+                    resolution_id=None,
+                    width=512,
+                    height=512,
+                    lora_enabled=False,
+                    lora_path=root / "not-used.safetensors",
+                    lora_scale=-99,
+                ),
+                repo_root=ROOT,
+                check_images=False,
+                verify_runtime_geometry=False,
+            )
+            disabled_command = build_generation_command(disabled, python="python")
+            self.assertNotIn("--lora", disabled_command)
+            self.assertNotIn("--lora-scale", disabled_command)
+
+            enabled = validate_render_request(
+                request(
+                    root,
+                    resolution_id=None,
+                    width=512,
+                    height=512,
+                    lora_enabled=True,
+                    lora_path=root / "adapter.safetensors",
+                    lora_scale=0.5,
+                ),
+                repo_root=ROOT,
+                check_images=False,
+                verify_runtime_geometry=False,
+            )
+            enabled_command = build_generation_command(enabled, python="python")
+            self.assertEqual(
+                Path(enabled_command[enabled_command.index("--lora") + 1]),
+                (root / "adapter.safetensors").resolve(),
+            )
+            self.assertEqual(enabled_command[enabled_command.index("--lora-scale") + 1], "0.5")
+
+    def test_lora_enabled_requires_path_and_finite_nonnegative_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = dict(
+                resolution_id=None,
+                width=512,
+                height=512,
+                lora_enabled=True,
+                lora_path=root / "adapter.safetensors",
+            )
+            with self.assertRaisesRegex(RenderValidationError, "no adapter path"):
+                validate_render_request(
+                    request(root, **(base | {"lora_path": None})),
+                    repo_root=ROOT,
+                    check_images=False,
+                    verify_runtime_geometry=False,
+                )
+            for scale in (-0.1, float("nan"), float("inf")):
+                with self.subTest(scale=scale), self.assertRaisesRegex(RenderValidationError, "finite nonnegative"):
+                    validate_render_request(
+                        request(root, **(base | {"lora_scale": scale})),
+                        repo_root=ROOT,
+                        check_images=False,
+                        verify_runtime_geometry=False,
+                    )
+
+    def test_turbo_requires_matching_ordinary_and_turbo_steps_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            changes = {
+                "resolution_id": None,
+                "width": 512,
+                "height": 512,
+                "lora_enabled": True,
+                "lora_path": root / "adapter.safetensors",
+                "turbo_enabled": True,
+                "turbo_steps": 8,
+            }
+            with self.assertRaisesRegex(RenderValidationError, "ordinary inference steps and Turbo steps"):
+                validate_render_request(
+                    request(root, steps=16, **changes),
+                    repo_root=ROOT,
+                    check_images=False,
+                    verify_runtime_geometry=False,
+                )
+            validated = validate_render_request(
+                request(root, steps=8, **changes),
+                repo_root=ROOT,
+                check_images=False,
+                verify_runtime_geometry=False,
+            )
+            command = build_generation_command(validated, python="python")
+            self.assertIn("--turbo", command)
+            self.assertEqual(command[command.index("--turbo-steps") + 1], "8")
 
     def test_known_resolution_presets_match_authoritative_runtime_helper(self) -> None:
         for preset in RESOLUTION_PRESETS:

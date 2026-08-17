@@ -57,6 +57,7 @@ h1 { margin: 0 0 4px; font-size: 26px; } h2 { font-size: 17px; margin: 0 0 14px;
 .subtitle, .note, .meta { color: #68707b; font-size: 13px; }
 label { display: block; margin: 13px 0 6px; font-weight: 650; }
 textarea, input, select { box-sizing: border-box; width: 100%; border: 1px solid #c9cdd4; border-radius: 9px; padding: 10px 12px; font: inherit; background: white; color: inherit; }
+input[type="checkbox"] { width: auto; padding: 0; }
 textarea { min-height: 120px; resize: vertical; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -100,17 +101,41 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
     <div id="image2-slot" class="image-slot hidden"><label for="image2">Last image</label><input id="image2" type="file" accept="image/*"></div>
   </div>
   <div class="grid three">
-    <div><label for="resolution">Resolution</label><select id="resolution"></select><div id="geometry" class="meta"></div></div>
-    <div><label for="steps">Inference steps</label><input id="steps" type="number" min="2" max="40" step="1"></div>
-    <div><label for="duration">Duration (seconds)</label><input id="duration" type="number" min="5" max="15" step="1"></div>
+    <div class="dimension-control">
+      <label for="width">Width (pixels)</label>
+      <input id="width-range" type="range" min="128" max="1344" step="32" aria-label="Width slider">
+      <input id="width" type="number" min="128" max="1344" step="1" inputmode="numeric" aria-describedby="width-error">
+      <div id="width-error" class="meta"></div>
+    </div>
+    <div class="dimension-control">
+      <label for="height">Height (pixels)</label>
+      <input id="height-range" type="range" min="128" max="1344" step="32" aria-label="Height slider">
+      <input id="height" type="number" min="128" max="1344" step="1" inputmode="numeric" aria-describedby="height-error">
+      <div id="height-error" class="meta"></div>
+    </div>
+    <div><label>Geometry</label><div id="geometry" class="meta">Width and height are independently selectable.</div></div>
   </div>
   <div class="grid three">
+    <div><label for="steps">Inference steps</label><input id="steps" type="number" min="2" max="40" step="1"></div>
+    <div><label for="duration">Duration (seconds)</label><input id="duration" type="number" min="5" max="15" step="1"></div>
     <div><label for="seed">Seed</label><input id="seed" type="number" step="1"></div>
+  </div>
+  <div class="grid three">
+    <div><label for="turbo-preset">Turbo preset</label><select id="turbo-preset"></select><div id="turbo-preset-details" class="meta"></div></div>
+    <div><label><input id="lora-enabled" type="checkbox"> Enable reference LoRA</label><div class="small">Manual adapter behavior is retained only for None / Reference.</div></div>
+    <div><label for="lora-path">Reference LoRA path</label><input id="lora-path" type="text" spellcheck="false" placeholder="/path/to/adapter.safetensors"></div>
+  </div>
+  <div class="grid three">
+    <div><label for="lora-scale">Reference LoRA scale</label><input id="lora-scale" type="number" min="0" step="0.01" value="1.0"><div class="small">Curated Turbo presets use their validated fixed scale.</div></div>
+    <div class="meta">Selecting a Turbo preset owns its adapter family, runtime variant, scheduler shifts, and NFE.</div>
+    <div class="meta">The effective configuration is shown here before launch and persisted in the run record.</div>
+  </div>
+  <div class="grid three">
     <div><label for="output-root">Output root</label><input id="output-root" spellcheck="false"></div>
     <div><label for="output-name">Output name</label><input id="output-name" value="render.mp4" spellcheck="false"></div>
   </div>
   <div class="actions"><button id="render" onclick="renderJob()">Render</button><span id="status">Ready</span></div>
-  <p class="note">Resolution choices come from one canonical preset source and are revalidated against the runtime resolver before launch.</p>
+  <p class="note">Width and height must each be positive, between 128 and 1344 pixels, and divisible by 32. Sliders are snapped to 32-pixel increments; numeric entries are validated before launch.</p>
 </section>
 
 <section class="card">
@@ -136,24 +161,115 @@ let statusPollTimer = null;
 let statusPollInFlight = false;
 
 function setStatus(text, bad=false) { $('status').textContent = text; $('status').style.color = bad ? '#b42318' : ''; }
-function selectedResolution() { return (config.resolutions || []).find(item => item.id === $('resolution').value); }
+function dimensionContract() {
+  return config.resolution_contract || {min_dimension: 128, max_dimension: 1344, step: 32};
+}
+function validateDimension(axis) {
+  const value = Number($(axis).value);
+  const contract = dimensionContract();
+  let error = '';
+  if (!Number.isInteger(value)) error = `${axis} must be an integer`;
+  else if (value <= 0) error = `${axis} must be positive`;
+  else if (value < contract.min_dimension || value > contract.max_dimension) error = `${axis} must be between ${contract.min_dimension} and ${contract.max_dimension}`;
+  else if (value % contract.step !== 0) error = `${axis} must be divisible by ${contract.step}`;
+  $(`${axis}-error`).textContent = error;
+  return {value, error};
+}
+function syncDimensionFromSlider(axis) {
+  $(axis).value = $(`${axis}-range`).value;
+  validateDimension(axis);
+  updateGeometry();
+}
+function syncDimensionFromNumber(axis) {
+  const result = validateDimension(axis);
+  if (!result.error) $(`${axis}-range`).value = result.value;
+  updateGeometry();
+}
 function updateGeometry() {
-  const item = selectedResolution();
-  if (!item) return;
+  const width = validateDimension('width');
+  const height = validateDimension('height');
+  if (width.error || height.error) {
+    $('geometry').textContent = 'Enter valid width and height values.';
+    return;
+  }
   const g = config.geometry_contract;
   const ratio = g.spatial_compression_ratio;
   const patch = g.dit_patch_size;
-  const runtimeHeight = item.runtime_height || item.height;
-  const runtimeWidth = item.runtime_width || item.width;
-  const runtimeNote = runtimeHeight === item.height && runtimeWidth === item.width ? '' : ` · H3 canvas ${runtimeWidth} × ${runtimeHeight}`;
-  const lh = runtimeHeight / ratio, lw = runtimeWidth / ratio;
+  const lh = height.value / ratio, lw = width.value / ratio;
   const tokens = Number.isInteger(lh) && Number.isInteger(lw) ? (lh / patch[1]) * (lw / patch[2]) : null;
-  $('geometry').textContent = `${item.width} × ${item.height}${runtimeNote}` + (tokens ? ` · latent grid ${lh} × ${lw} · ${tokens} spatial tokens/frame` : '');
+  $('geometry').textContent = `${width.value} × ${height.value}` + (tokens ? ` · latent grid ${lh} × ${lw} · ${tokens} spatial tokens/frame` : '');
 }
 function updateMode() {
   const mode = $('mode').value;
   $('image1-slot').classList.toggle('hidden', mode === 'T2V');
   $('image2-slot').classList.toggle('hidden', mode !== 'FIRST_LAST');
+}
+
+let referenceControlState = null;
+function selectedTurboPreset() {
+  const id = $('turbo-preset').value;
+  return (config.turbo_presets || []).find(item => item.id === id) || null;
+}
+function updateTurboPresetDetails() {
+  const preset = selectedTurboPreset();
+  if (!preset || preset.id === 'none') {
+    $('turbo-preset-details').textContent = 'None / Reference · existing normal Render Lab behavior.';
+    return;
+  }
+  const variant = preset.runtime_variant ? ` · ${preset.runtime_variant}` : '';
+  const geometry = preset.recommended_geometry ? ` · ${preset.recommended_geometry}` : '';
+  const scheduler = preset.scheduler ? ` · scheduler ${preset.scheduler.video_shift}/${preset.scheduler.audio_shift}` : '';
+  const scale = preset.default_scale == null ? '' : ` · fixed scale ${preset.default_scale}`;
+  const asset = preset.logical_asset ? ` · asset ${preset.logical_asset}` : '';
+  $('turbo-preset-details').textContent = `${preset.label} · ${preset.summary}${asset}${scale}${scheduler}${variant}${geometry}`;
+}
+function updateReferenceLoraControls() {
+  const enabled = $('lora-enabled').checked;
+  $('lora-path').disabled = !enabled;
+  $('lora-scale').disabled = !enabled;
+}
+function updateTurboPresetControls() {
+  const preset = selectedTurboPreset();
+  const selected = Boolean(preset && preset.id !== 'none');
+  if (selected && referenceControlState === null) {
+    referenceControlState = {
+      loraEnabled: $('lora-enabled').checked,
+      loraPath: $('lora-path').value,
+      loraScale: $('lora-scale').value,
+      steps: $('steps').value,
+    };
+  }
+  if (selected) {
+    $('lora-enabled').checked = true;
+    $('lora-enabled').disabled = true;
+    $('lora-path').value = preset.adapter_asset_path || '';
+    $('lora-path').disabled = true;
+    $('lora-scale').value = preset.default_scale;
+    $('lora-scale').disabled = true;
+    $('steps').value = preset.nfe;
+    $('steps').disabled = true;
+  } else {
+    if (referenceControlState !== null) {
+      $('lora-enabled').checked = referenceControlState.loraEnabled;
+      $('lora-path').value = referenceControlState.loraPath;
+      $('lora-scale').value = referenceControlState.loraScale;
+      $('steps').value = referenceControlState.steps;
+      referenceControlState = null;
+    }
+    $('lora-enabled').disabled = false;
+    $('steps').disabled = false;
+    updateReferenceLoraControls();
+  }
+  updateTurboPresetDetails();
+}
+function validateDimensionsBeforeLaunch() {
+  const width = validateDimension('width');
+  const height = validateDimension('height');
+  if (width.error || height.error) {
+    setStatus(width.error || height.error, true);
+    return false;
+  }
+  return true;
 }
 function renderBenchmark(benchmark) {
   if (!benchmark || !benchmark.run_id) return '';
@@ -221,10 +337,18 @@ async function refreshHistory() {
 }
 async function renderJob() {
   const mode = $('mode').value;
+  if (!validateDimensionsBeforeLaunch()) return;
   const form = new FormData();
-  form.set('mode', mode); form.set('prompt', $('prompt').value); form.set('resolution_id', $('resolution').value);
+  form.set('mode', mode); form.set('prompt', $('prompt').value);
+  form.set('width', $('width').value); form.set('height', $('height').value);
   form.set('steps', $('steps').value); form.set('duration_seconds', $('duration').value); form.set('seed', $('seed').value);
   form.set('output_root', $('output-root').value); form.set('output_name', $('output-name').value);
+  form.set('turbo_preset_id', $('turbo-preset').value);
+  form.set('lora_enabled', String($('lora-enabled').checked));
+  form.set('lora_path', $('lora-path').value);
+  form.set('lora_scale', $('lora-scale').value);
+  form.set('turbo_enabled', 'false');
+  form.set('turbo_steps', '');
   if (mode !== 'T2V' && $('image1').files[0]) form.append('image1', $('image1').files[0]);
   if (mode === 'FIRST_LAST' && $('image2').files[0]) form.append('image2', $('image2').files[0]);
   $('render').disabled = true; setStatus('Admitting…');
@@ -239,12 +363,32 @@ async function renderJob() {
 async function boot() {
   config = await (await fetch('/api/config')).json();
   $('mode').innerHTML = config.modes.map(item => `<option value="${item.id}">${item.label}</option>`).join('');
-  $('resolution').innerHTML = config.resolutions.map(item => `<option value="${item.id}">${item.label}</option>`).join('');
+  $('turbo-preset').innerHTML = (config.turbo_presets || []).map(item => `<option value="${item.id}">${item.label}</option>`).join('');
+  $('turbo-preset').value = config.defaults.turbo_preset_id || 'none';
+  const bounds = config.resolution_contract || {min_dimension: 128, max_dimension: 1344, step: 32};
+  for (const axis of ['width', 'height']) {
+    $(`${axis}-range`).min = bounds.min_dimension;
+    $(`${axis}-range`).max = bounds.max_dimension;
+    $(`${axis}-range`).step = bounds.step;
+    $(axis).min = bounds.min_dimension;
+    $(axis).max = bounds.max_dimension;
+    $(axis).value = config.defaults[axis];
+    $(`${axis}-range`).value = config.defaults[axis];
+    $(`${axis}-range`).oninput = () => syncDimensionFromSlider(axis);
+    $(axis).oninput = () => syncDimensionFromNumber(axis);
+  }
   $('steps').value = config.defaults.steps; $('duration').value = config.defaults.duration_seconds; $('seed').value = config.defaults.seed;
+  $('lora-enabled').checked = Boolean(config.defaults.lora_enabled);
+  $('lora-path').value = config.defaults.lora_path || '';
+  $('lora-scale').value = config.defaults.lora_scale;
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
-  $('mode').onchange = updateMode; $('resolution').onchange = updateGeometry; updateMode(); updateGeometry();
+  $('mode').onchange = updateMode;
+  $('lora-enabled').onchange = updateReferenceLoraControls;
+  $('turbo-preset').onchange = updateTurboPresetControls;
+  updateTurboPresetControls(); updateMode(); updateGeometry();
   $('runtime').textContent = `Checkpoint: ${config.runtime.checkpoint_root} · Transformer: ${config.runtime.transformer_path || 'from checkpoint'} · generator: ${config.runtime.generator}`;
   if (!config.runtime.checkpoint_exists || !config.runtime.transformer_exists) { $('runtime-warning').textContent = 'Configured checkpoint or transformer path is not currently readable. Set H3_CHECKPOINT_ROOT and H3_TRANSFORMER before rendering.'; $('runtime-warning').classList.remove('hidden'); }
+  else if (config.runtime.transformer_mode !== config.runtime.transformer_required_mode) { $('runtime-warning').textContent = `Render Lab requires ${config.runtime.transformer_required_mode}; the configured transformer is not admitted.`; $('runtime-warning').classList.remove('hidden'); }
   startStatusPolling(); refreshHistory();
 }
 boot();
@@ -399,12 +543,20 @@ class Handler(BaseHTTPRequestHandler):
             request = RenderRequest(
                 mode=fields.get("mode", ""),
                 prompt=fields.get("prompt", ""),
-                resolution_id=fields.get("resolution_id", ""),
+                resolution_id=fields.get("resolution_id") or None,
                 steps=int(fields.get("steps", "")),
                 duration_seconds=float(fields.get("duration_seconds", "")),
                 seed=int(fields.get("seed", "")),
                 output_root=fields.get("output_root", str(DEFAULT_OUTPUT_ROOT.relative_to(REPO_ROOT))),
                 output_name=fields.get("output_name", "render.mp4"),
+                width=fields.get("width") or None,
+                height=fields.get("height") or None,
+                lora_enabled=fields.get("lora_enabled", "false"),
+                lora_path=fields.get("lora_path") or None,
+                lora_scale=fields.get("lora_scale", "1.0"),
+                turbo_enabled=fields.get("turbo_enabled", "false"),
+                turbo_steps=fields.get("turbo_steps") or None,
+                turbo_preset_id=fields.get("turbo_preset_id") or None,
             )
             namespace = CONTROLLER.start(request, uploads=uploads)
             send_json(self, {"ok": True, "run_id": namespace.run_id, "run_directory": str(namespace.run_dir)}, 202)

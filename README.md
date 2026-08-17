@@ -636,8 +636,38 @@ H3_CHECKPOINT_ROOT=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/checkpoi
 H3_TRANSFORMER=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit
 ```
 
-After this slice is checkpointed, **Turbo LoRA** is the next active implementation stream. ConvRot
-research remains a separate, explicitly excluded workstream.
+### Turbo LoRA adapters
+
+The generic adapter path is additive and target-indexed. It accepts the common
+`lora_A`/`lora_B` and `lora_down`/`lora_up` safetensors layouts, keeps adapter
+weights outside the checkpoint parameter tree, and applies each delta around
+the callable projection. That includes MLX quantized projections: the packed
+base weight is left untouched and the low-rank path uses the projection's
+activation dtype.
+
+Resident H3 core and token-refiner targets use their local module paths, for
+example `blocks.0.attn.qkv_proj` and
+`token_refiner.blocks.0.mlp.fc2`. Block AdaLN adapters use
+`blocks.<index>.adaln_proj.linear`; the same target is applied while a streamed
+sidecar is reconstructed. `final_layer.adaln_proj.linear` is applied at the
+final norm, so a single registry covers resident and streamed execution.
+
+Turbo is opt-in and defaults to an eight-sigma schedule. A metadata-advertised
+step count or explicit `--turbo-steps` override may select another validated
+count. The CLI wiring is:
+
+```bash
+./.venv/bin/python scripts/generate.py \
+  "a red fox leaps over a mossy log" \
+  --turbo-lora /path/to/turbo.safetensors \
+  --turbo-steps 8 \
+  -o fox-turbo.mp4
+```
+
+The first real render remains an operator-run Apple-Silicon gate; this
+implementation slice does not execute H3.
+
+ConvRot research remains a separate, explicitly excluded workstream.
 
 ### Validation
 
@@ -691,6 +721,8 @@ the last ulp from 16 latent frames onwards.
 minimax_h3_mlx/
   config.py      DiTConfig / PipelineConfig, original checkpoint field names
   dit.py         the 33B diffusion transformer
+  lora.py        generic LoRA registry, safetensors loader, projection math
+  turbo.py       explicit reduced-step Turbo schedule selection
   adaln.py       ModulationCache, drop_adaln_weights
   scheduler.py   rectified-flow Euler with exponential sigma shift
   packing.py     packed-sequence geometry, patchify/unpatchify, row timesteps

@@ -14,6 +14,7 @@ run() {
 }
 
 $PY tests/test_dit_smoke.py || fail=1
+$PY tests/test_lora_contract.py || fail=1
 $PY tests/test_cache_only_loader.py || fail=1
 $PY tests/test_streamed_adaln.py || fail=1
 run tests/test_dit_parity.py

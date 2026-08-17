@@ -24,6 +24,7 @@ from .checkpoint_forge.topology import BLOCK_COUNT, FORMAT_IDENTIFIER
 from .config import MODALITY_NUM
 from .dit import CACHE_ONLY_CONSTRUCTION, timestep_embedding
 from .load import CheckpointFormatInfo, SUPPORTED_DERIVED_SCHEMA_VERSION
+from .lora import LoRARegistry
 
 
 SIDECAR_ROLES = ("packed_weight", "scales", "quantization_biases", "learned_bias")
@@ -387,6 +388,7 @@ def build_streamed_modulation_cache(
     timesteps: mx.array,
     *,
     dtype: mx.Dtype = mx.bfloat16,
+    lora_registry: LoRARegistry | None = None,
     sidecar_loader: Callable[[str], Mapping[str, mx.array]] | None = None,
     projection_executor: Callable[[mx.array, mx.array, mx.array, mx.array, mx.array], mx.array] | None = None,
     telemetry: Callable[[str, Mapping[str, Any]], None] | None = None,
@@ -434,7 +436,13 @@ def build_streamed_modulation_cache(
 
     try:
         shared_started = time.perf_counter()
-        temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+        if lora_registry is None:
+            lora_registry = getattr(dit, "_lora_registry", None)
+        sinusoid = timestep_embedding(timesteps, dit.config.timestep_input_dim)
+        if lora_registry is None:
+            temb = dit.time_embedder(sinusoid)
+        else:
+            temb = dit.time_embedder(sinusoid, lora_registry=lora_registry)
         mx.eval(temb)
         adaln_activation = nn.silu(temb)
         mx.eval(adaln_activation)
@@ -463,6 +471,7 @@ def build_streamed_modulation_cache(
             projected = None
             activation = reshaped = None
             table = None
+            delta = None
             after_modulation = None
             block_failed = False
             block_sidecar_io_and_reconstruction_elapsed = 0.0
@@ -500,6 +509,19 @@ def build_streamed_modulation_cache(
                 projection_compute_started = time.perf_counter()
                 activation = adaln_activation.astype(scales.dtype)
                 projected = executor(activation, packed_weight, scales, quantization_biases, learned_bias)
+                if lora_registry is not None:
+                    delta = lora_registry.delta(
+                        f"blocks.{block_index}.adaln_proj.linear",
+                        activation,
+                        transient=True,
+                    )
+                    if delta is not None:
+                        if tuple(delta.shape) != tuple(projected.shape):
+                            raise ValueError(
+                                f"LoRA block {block_index} AdaLN delta shape {delta.shape} "
+                                f"does not match streamed projection {projected.shape}"
+                            )
+                        projected = projected + delta.astype(projected.dtype)
                 expected_projected_shape = (len(values), int(dit.config.adaln_out_features))
                 if tuple(projected.shape) != expected_projected_shape:
                     raise ValueError(
@@ -555,7 +577,7 @@ def build_streamed_modulation_cache(
                 loaded = None
                 packed_weight = scales = quantization_biases = learned_bias = None
                 projected = None
-                activation = reshaped = None
+                activation = reshaped = delta = None
                 table = None
                 lifecycle.mark_payload_released()
                 if block_failed:
@@ -634,7 +656,7 @@ def build_streamed_modulation_cache(
             current_sidecar_path = None
 
         cache_finalize_started = time.perf_counter()
-        cache = ModulationCache(tables, timesteps)
+        cache = ModulationCache(tables, timesteps, lora_registry=lora_registry)
         cache.materialize()
         final_cache_bytes = cache.nbytes()
         cache_finalize_materialization_elapsed = time.perf_counter() - cache_finalize_started

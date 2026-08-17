@@ -27,6 +27,7 @@ import mlx.nn as nn
 
 from .config import MODALITY_NUM
 from .dit import timestep_embedding
+from .lora import LoRARegistry, linear_with_lora
 
 
 def _stable_timestep_values(values: mx.array) -> list[float]:
@@ -57,9 +58,19 @@ class ModulationCache:
     packed sequence's ``timestep_indices`` index into exactly this array.
     """
 
-    def __init__(self, tables: list[tuple[mx.array, ...]], timesteps: mx.array):
+    def __init__(
+        self,
+        tables: list[tuple[mx.array, ...]],
+        timesteps: mx.array,
+        lora_registry: LoRARegistry | None = None,
+        lora_identity: str | None = None,
+    ):
         self.tables = tables
         self.timesteps = timesteps
+        self.lora_registry = lora_registry
+        self.lora_identity = (
+            lora_registry.cache_identity if lora_identity is None and lora_registry is not None else lora_identity
+        )
 
     def get(self, block_index: int) -> tuple[mx.array, ...]:
         return self.tables[block_index]
@@ -158,6 +169,7 @@ class ModulationCache:
         dit,
         timesteps: mx.array,
         dtype: mx.Dtype = mx.bfloat16,
+        lora_registry: LoRARegistry | None = None,
     ) -> "ModulationCache":
         """Precompute the modulation table for every block.
 
@@ -167,26 +179,56 @@ class ModulationCache:
             dtype: storage dtype of the cache. bfloat16 halves the footprint and matches the
                 precision the modulation is consumed at inside the block stack.
         """
-        temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+        if lora_registry is None:
+            lora_registry = getattr(dit, "_lora_registry", None)
+        sinusoid = timestep_embedding(timesteps, dit.config.timestep_input_dim)
+        if lora_registry is None:
+            temb = dit.time_embedder(sinusoid)
+        else:
+            temb = dit.time_embedder(sinusoid, lora_registry=lora_registry)
         mx.eval(temb)
 
         tables: list[tuple[mx.array, ...]] = []
-        for block in dit.blocks:
-            table = tuple(t.astype(dtype) for t in block.adaln_proj(temb))
+        for block_index, block in enumerate(dit.blocks):
+            table = tuple(
+                t.astype(dtype)
+                for t in block.adaln_proj(
+                    temb,
+                    lora_registry=lora_registry,
+                    target_prefix=f"blocks.{block_index}.adaln_proj",
+                    transient_lora=True,
+                )
+            )
             mx.eval(table)
             tables.append(table)
-        return cls(tables, timesteps)
+        return cls(tables, timesteps, lora_registry=lora_registry)
 
 
-def final_layer_modulation(dit, timesteps: mx.array, dtype: mx.Dtype = mx.bfloat16):
+def final_layer_modulation(
+    dit,
+    timesteps: mx.array,
+    dtype: mx.Dtype = mx.bfloat16,
+    lora_registry: LoRARegistry | None = None,
+):
     """Precompute the output layer's ``shift``/``scale`` table.
 
     ``final_layer.adaln_proj`` is only ``[10752, 2688]`` (~29M params), so caching it is about
     avoiding a redundant projection per step rather than about memory.
     """
-    temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+    if lora_registry is None:
+        lora_registry = getattr(dit, "_lora_registry", None)
+    sinusoid = timestep_embedding(timesteps, dit.config.timestep_input_dim)
+    if lora_registry is None:
+        temb = dit.time_embedder(sinusoid)
+    else:
+        temb = dit.time_embedder(sinusoid, lora_registry=lora_registry)
     linear = dit.final_layer.adaln_proj.linear
-    h = linear(nn.silu(temb).astype(linear.weight.dtype))
+    h = linear_with_lora(
+        linear,
+        nn.silu(temb).astype(linear.weight.dtype),
+        "final_layer.adaln_proj.linear",
+        lora_registry,
+    )
     hidden = dit.config.hidden_size
     shift, scale = h[..., :hidden], h[..., hidden:]
     shift, scale = shift.astype(dtype), scale.astype(dtype)

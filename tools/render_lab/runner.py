@@ -24,12 +24,26 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .resolutions import (
+    INDEPENDENT_DIMENSION_RULE_ID,
+    INDEPENDENT_DIMENSION_SOURCE_ID,
     PROJECT_RESOLUTION_SOURCE_ID,
     RUNTIME_RESOLUTION_RULE_ID,
+    MAX_RESOLUTION,
+    MIN_RESOLUTION,
+    RESOLUTION_STEP,
     ResolutionPreset,
+    explicit_resolution_preset,
     preset_by_id,
     preset_payload,
     validate_preset_against_runtime,
+)
+from .turbo_presets import (
+    HOST_ASSET_MANIFEST_NOTE,
+    HOST_ASSET_MANIFEST_STATUS,
+    REFERENCE_TURBO_PRESET_ID,
+    TurboPreset,
+    turbo_preset_by_id,
+    turbo_preset_payload,
 )
 
 
@@ -37,6 +51,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = REPO_ROOT / "scripts" / "generate.py"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "out" / "render-lab"
 DEFAULT_OUTPUT_NAME = "render.mp4"
+CANONICAL_TRANSFORMER_NAME = "minimax-h3-mlx-6bit-streamed-adaln"
+CANONICAL_TRANSFORMER_MODE = "streamed-adaln-q6"
+FORBIDDEN_TRANSFORMER_NAME = "minimax-h3-mlx-6bit"
 
 T2V = "T2V"
 I2V = "I2V"
@@ -54,13 +71,14 @@ MAX_INFERENCE_STEPS = 40
 DEFAULT_DURATION_SECONDS = 5.0
 DEFAULT_INFERENCE_STEPS = 16
 DEFAULT_SEED = 0
+DEFAULT_RESOLUTION_ID = "canonical-128-square-v05d"
 
 # Display-only geometry derived from the current H3 VAE/DiT source contract.  Resolution
 # admission itself is delegated to ``resolve_canvas_size`` through resolutions.py.
 H3_SPATIAL_COMPRESSION_RATIO = 16
 H3_DIT_PATCH_SIZE = (1, 2, 2)
 
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 3
 BENCHMARK_SCHEMA_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 RUN_ID_PATTERN = re.compile(r"^run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
@@ -81,7 +99,7 @@ class RenderBusyError(RuntimeError):
 class RenderRequest:
     mode: str
     prompt: str
-    resolution_id: str
+    resolution_id: str | None = DEFAULT_RESOLUTION_ID
     steps: int = DEFAULT_INFERENCE_STEPS
     duration_seconds: float = DEFAULT_DURATION_SECONDS
     seed: int = DEFAULT_SEED
@@ -90,19 +108,41 @@ class RenderRequest:
     image_paths: tuple[str | Path, ...] = ()
     checkpoint_root: str | Path = field(default_factory=lambda: default_checkpoint_root())
     transformer_path: str | Path | None = field(default_factory=lambda: default_transformer_path())
+    width: int | str | None = None
+    height: int | str | None = None
+    lora_enabled: bool = False
+    lora_path: str | Path | None = None
+    lora_scale: float = 1.0
+    turbo_enabled: bool = False
+    turbo_steps: int | str | None = None
+    turbo_preset_id: str | None = None
 
     def normalized(self) -> "RenderRequest":
         return replace(
             self,
             mode=str(self.mode).upper(),
             prompt=str(self.prompt),
-            resolution_id=str(self.resolution_id),
+            resolution_id=(
+                None
+                if self.resolution_id is None or not str(self.resolution_id).strip()
+                else str(self.resolution_id)
+            ),
             output_root=Path(self.output_root).expanduser(),
             output_name=str(self.output_name),
             image_paths=tuple(Path(value).expanduser() for value in self.image_paths),
             checkpoint_root=Path(self.checkpoint_root).expanduser(),
             transformer_path=(
                 None if self.transformer_path is None else Path(self.transformer_path).expanduser()
+            ),
+            lora_path=(
+                None
+                if self.lora_path is None or not str(self.lora_path).strip()
+                else Path(self.lora_path).expanduser()
+            ),
+            turbo_preset_id=(
+                None
+                if self.turbo_preset_id is None or not str(self.turbo_preset_id).strip()
+                else str(self.turbo_preset_id)
             ),
         )
 
@@ -118,6 +158,7 @@ class ValidatedRequest:
     image_paths: tuple[Path, ...]
     checkpoint_root: Path
     transformer_path: Path | None
+    turbo_preset: TurboPreset | None
 
 
 @dataclass(frozen=True)
@@ -185,21 +226,18 @@ def _first_existing(candidates: Iterable[Path]) -> Path | None:
 
 def default_checkpoint_root(repo_root: Path = REPO_ROOT) -> Path:
     env_value = os.environ.get("H3_CHECKPOINT_ROOT")
-    candidates = [
-        Path(env_value).expanduser() if env_value else Path("/Volumes/models/MiniMax-H3/FL2VA"),
-        repo_root.parent / "checkpoints" / "minimax-h3-fl2va",
-        repo_root.parent / "models" / "minimax-h3-fl2va",
-    ]
+    local_checkpoint = repo_root.parent / "checkpoints" / "minimax-h3-fl2va"
+    candidates = [Path(env_value).expanduser()] if env_value else []
+    candidates.extend([local_checkpoint, repo_root.parent / "models" / "minimax-h3-fl2va"])
     return _first_existing(candidates) or candidates[0]
 
 
 def default_transformer_path(repo_root: Path = REPO_ROOT) -> Path | None:
     env_value = os.environ.get("H3_TRANSFORMER")
-    checkpoint = default_checkpoint_root(repo_root)
     candidates = [
-        Path(env_value).expanduser() if env_value else Path("/Volumes/models/minimax-h3-mlx-6bit"),
-        repo_root.parent / "models" / "minimax-h3-mlx-6bit",
-        checkpoint / "transformer",
+        Path(env_value).expanduser()
+        if env_value
+        else repo_root.parent / "models" / CANONICAL_TRANSFORMER_NAME,
     ]
     return _first_existing(candidates) or candidates[0]
 
@@ -228,6 +266,187 @@ def anchors_for_mode(mode: str, image_count: int) -> tuple[str, ...]:
     if str(mode).upper() == I2V:
         return ("first",)
     return ("first", "last")
+
+
+def _coerce_bool(value: object, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "yes"}:
+            return True
+        if normalized in {"0", "false", "off", "no", ""}:
+            return False
+    raise RenderValidationError(f"{label} must be a boolean")
+
+
+def _coerce_integer(value: object, label: str, *, allow_none: bool = True) -> int | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise RenderValidationError(f"{label} must be an integer")
+    if allow_none and isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        raise RenderValidationError(f"{label} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    raise RenderValidationError(f"{label} must be an integer")
+
+
+def _validate_dimension(value: object, label: str) -> int:
+    dimension = _coerce_integer(value, label, allow_none=False)
+    assert dimension is not None
+    if dimension <= 0:
+        raise RenderValidationError(f"{label} must be positive; got {dimension}")
+    if not MIN_RESOLUTION <= dimension <= MAX_RESOLUTION:
+        raise RenderValidationError(
+            f"{label} must be between {MIN_RESOLUTION} and {MAX_RESOLUTION} pixels; got {dimension}"
+        )
+    if dimension % RESOLUTION_STEP:
+        raise RenderValidationError(
+            f"{label} must be divisible by {RESOLUTION_STEP} pixels; got {dimension}"
+        )
+    return dimension
+
+
+def _validate_optional_dimensions(request: RenderRequest) -> tuple[int | None, int | None]:
+    width = _coerce_integer(request.width, "Width")
+    height = _coerce_integer(request.height, "Height")
+    if (width is None) != (height is None):
+        raise RenderValidationError("Width and height must be provided together")
+    if width is None or height is None:
+        return None, None
+    return _validate_dimension(width, "Width"), _validate_dimension(height, "Height")
+
+
+def _validate_lora_controls(
+    request: RenderRequest,
+    *,
+    check_runtime_paths: bool,
+) -> tuple[bool, Path | None, float, bool, int | None]:
+    lora_enabled = _coerce_bool(request.lora_enabled, "LoRA enabled")
+    turbo_enabled = _coerce_bool(request.turbo_enabled, "Turbo enabled")
+    if not lora_enabled:
+        if turbo_enabled:
+            raise RenderValidationError("Turbo mode requires LoRA to be enabled with an adapter path")
+        return False, None, 1.0, False, None
+
+    if request.lora_path is None or not str(request.lora_path).strip():
+        raise RenderValidationError("LoRA is enabled but no adapter path was provided")
+    try:
+        lora_path = Path(request.lora_path).expanduser().resolve(strict=False)
+    except (OSError, ValueError) as exc:
+        raise RenderValidationError("LoRA adapter path is not a valid filesystem path") from exc
+    if check_runtime_paths and (not lora_path.is_file() or not os.access(lora_path, os.R_OK)):
+        raise RenderValidationError(f"LoRA adapter path is not a readable file: {lora_path}")
+
+    if isinstance(request.lora_scale, bool):
+        raise RenderValidationError("LoRA scale must be a finite nonnegative number")
+    try:
+        lora_scale = float(request.lora_scale)
+    except (TypeError, ValueError) as exc:
+        raise RenderValidationError("LoRA scale must be a finite nonnegative number") from exc
+    if not math.isfinite(lora_scale) or lora_scale < 0:
+        raise RenderValidationError("LoRA scale must be a finite nonnegative number")
+
+    turbo_steps = _coerce_integer(request.turbo_steps, "Turbo steps") if turbo_enabled else None
+    if turbo_enabled:
+        if turbo_steps is not None and not MIN_INFERENCE_STEPS <= turbo_steps <= MAX_INFERENCE_STEPS:
+            raise RenderValidationError(
+                f"Turbo steps must be between {MIN_INFERENCE_STEPS} and {MAX_INFERENCE_STEPS}"
+            )
+        if turbo_steps is not None and turbo_steps != request.steps:
+            raise RenderValidationError(
+                "Turbo mode requires ordinary inference steps and Turbo steps to agree"
+            )
+    return True, lora_path, lora_scale, turbo_enabled, turbo_steps
+
+
+def _validate_turbo_preset(
+    request: RenderRequest,
+    *,
+    repo_root: Path,
+    check_runtime_paths: bool,
+) -> tuple[TurboPreset | None, Path | None]:
+    try:
+        turbo_preset = turbo_preset_by_id(request.turbo_preset_id)
+    except ValueError as exc:
+        raise RenderValidationError(str(exc)) from exc
+    if turbo_preset is None:
+        return None, None
+
+    if request.steps != turbo_preset.nfe:
+        raise RenderValidationError(
+            f"Turbo preset {turbo_preset.label!r} owns {turbo_preset.nfe} NFE; "
+            f"manual inference steps were {request.steps}"
+        )
+    requested_turbo_steps = _coerce_integer(request.turbo_steps, "Turbo steps")
+    if requested_turbo_steps is not None and requested_turbo_steps != turbo_preset.nfe:
+        raise RenderValidationError(
+            f"Turbo preset {turbo_preset.label!r} owns {turbo_preset.nfe} NFE; "
+            f"manual Turbo steps were {requested_turbo_steps}"
+        )
+    if isinstance(request.lora_scale, bool):
+        raise RenderValidationError("Turbo preset scale is fixed at its validated runtime default")
+    try:
+        requested_scale = float(request.lora_scale)
+    except (TypeError, ValueError) as exc:
+        raise RenderValidationError("Turbo preset scale is fixed at its validated runtime default") from exc
+    if not math.isfinite(requested_scale) or not math.isclose(
+        requested_scale,
+        turbo_preset.default_scale,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RenderValidationError(
+            f"Turbo preset {turbo_preset.label!r} fixes LoRA scale at "
+            f"{turbo_preset.default_scale:g}"
+        )
+
+    asset_path = turbo_preset.resolve_asset_path(repo_root)
+    if check_runtime_paths and (not asset_path.is_file() or not os.access(asset_path, os.R_OK)):
+        raise RenderValidationError(
+            f"Turbo preset asset is not a readable file: {asset_path} "
+            f"(logical asset {turbo_preset.logical_asset})"
+        )
+    return turbo_preset, asset_path
+
+
+def _transformer_mode(transformer_path: Path | None) -> str:
+    if transformer_path is not None and transformer_path.name == CANONICAL_TRANSFORMER_NAME:
+        return CANONICAL_TRANSFORMER_MODE
+    return "unspecified-or-custom"
+
+
+def _validate_transformer_safety(
+    transformer_path: Path | None,
+    *,
+    check_runtime_paths: bool,
+) -> None:
+    if transformer_path is None:
+        if check_runtime_paths:
+            raise RenderValidationError(
+                f"Render Lab requires the canonical {CANONICAL_TRANSFORMER_NAME} transformer"
+            )
+        return
+    resolved = transformer_path.expanduser().resolve(strict=False)
+    if Path("/Volumes/models") == resolved or Path("/Volumes/models") in resolved.parents:
+        raise RenderValidationError(
+            "Render Lab rejects stale /Volumes/models transformer paths; configure the local streamed-AdaLN Q6 asset"
+        )
+    if transformer_path.name == FORBIDDEN_TRANSFORMER_NAME:
+        raise RenderValidationError(
+            f"Render Lab rejects the non-streamed {FORBIDDEN_TRANSFORMER_NAME} transformer; "
+            f"use {CANONICAL_TRANSFORMER_NAME}"
+        )
+    if check_runtime_paths and transformer_path.name != CANONICAL_TRANSFORMER_NAME:
+        raise RenderValidationError(
+            f"Render Lab requires the canonical {CANONICAL_TRANSFORMER_NAME} transformer; "
+            f"got {transformer_path.name}"
+        )
 
 
 def _validate_number_fields(request: RenderRequest) -> None:
@@ -323,18 +542,43 @@ def validate_render_request(
 ) -> ValidatedRequest:
     request = request.normalized()
     _validate_number_fields(request)
+    width, height = _validate_optional_dimensions(request)
+    turbo_preset, turbo_asset_path = _validate_turbo_preset(
+        request,
+        repo_root=repo_root,
+        check_runtime_paths=check_runtime_paths,
+    )
+    if turbo_preset is None:
+        lora_enabled, lora_path, lora_scale, turbo_enabled, turbo_steps = _validate_lora_controls(
+            request,
+            check_runtime_paths=check_runtime_paths,
+        )
+    else:
+        lora_enabled = True
+        lora_path = turbo_asset_path
+        lora_scale = turbo_preset.default_scale
+        turbo_enabled = True
+        turbo_steps = turbo_preset.nfe
     image_paths = tuple(Path(value) for value in request.image_paths)
     anchors = anchors_for_mode(request.mode, len(image_paths))
-    try:
-        preset = (
-            validate_preset_against_runtime(request.resolution_id)
-            if verify_runtime_geometry
-            else preset_by_id(request.resolution_id)
-        )
-    except RenderValidationError:
-        raise
-    except Exception as exc:
-        raise RenderValidationError(str(exc)) from exc
+    explicit_dimensions = width is not None and height is not None
+    if explicit_dimensions:
+        preset = explicit_resolution_preset(width, height)
+        runtime_height, runtime_width = height, width
+    else:
+        if request.resolution_id is None:
+            raise RenderValidationError("Choose a resolution preset or provide both width and height")
+        try:
+            preset = (
+                validate_preset_against_runtime(request.resolution_id)
+                if verify_runtime_geometry
+                else preset_by_id(request.resolution_id)
+            )
+        except RenderValidationError:
+            raise
+        except Exception as exc:
+            raise RenderValidationError(str(exc)) from exc
+        runtime_height, runtime_width = preset.runtime_dimensions
     output_root = resolve_output_root(request.output_root, repo_root)
     output_name = validate_output_name(request.output_name)
     if check_images:
@@ -343,27 +587,42 @@ def validate_render_request(
     transformer_path = (
         None if request.transformer_path is None else Path(request.transformer_path).expanduser().resolve(strict=False)
     )
+    _validate_transformer_safety(transformer_path, check_runtime_paths=check_runtime_paths)
     if check_runtime_paths:
         if not checkpoint_root.is_dir() or not (checkpoint_root / "model_index.json").is_file():
             raise RenderValidationError(
                 f"Checkpoint root is not a usable H3 release directory: {checkpoint_root}"
             )
-        effective_transformer = transformer_path or checkpoint_root / "transformer"
+        effective_transformer = transformer_path
+        assert effective_transformer is not None
         if not effective_transformer.is_dir() or not (effective_transformer / "config.json").is_file():
             raise RenderValidationError(
                 f"Transformer path is not a usable H3 transformer directory: {effective_transformer}"
             )
         transformer_path = effective_transformer
+    normalized_request = replace(
+        request,
+        resolution_id=preset.preset_id if explicit_dimensions else request.resolution_id,
+        width=runtime_width,
+        height=runtime_height,
+        lora_enabled=lora_enabled,
+        lora_path=lora_path,
+        lora_scale=lora_scale,
+        turbo_enabled=turbo_enabled,
+        turbo_steps=turbo_steps,
+        turbo_preset_id=turbo_preset.preset_id if turbo_preset is not None else None,
+    )
     return ValidatedRequest(
-        request=replace(request, output_name=output_name),
+        request=replace(normalized_request, output_name=output_name),
         preset=preset,
-        height=preset.runtime_dimensions[0],
-        width=preset.runtime_dimensions[1],
+        height=runtime_height,
+        width=runtime_width,
         anchors=anchors,
         output_root=output_root,
         image_paths=image_paths,
         checkpoint_root=checkpoint_root,
         transformer_path=transformer_path,
+        turbo_preset=turbo_preset,
     )
 
 
@@ -371,14 +630,20 @@ def _format_float(value: float) -> str:
     return format(float(value), ".6g")
 
 
-def build_generation_command(validated: ValidatedRequest, *, python: str | Path = sys.executable) -> list[str]:
+def build_generation_command(
+    validated: ValidatedRequest,
+    *,
+    python: str | Path = sys.executable,
+) -> list[str]:
     """Construct the only H3 command the Render Lab is allowed to launch."""
     request = validated.request
     command = [
         str(python),
         "-u",
         str(GENERATOR),
-        request.prompt,
+    ]
+    command.append(request.prompt)
+    command.extend([
         "--checkpoint",
         str(validated.checkpoint_root),
         "--duration",
@@ -393,11 +658,33 @@ def build_generation_command(validated: ValidatedRequest, *, python: str | Path 
         str(validated.width),
         "--output",
         str(validated.output_root / "<run-directory>" / request.output_name),
-    ]
+    ])
     if validated.transformer_path is not None:
         command.extend(["--transformer", str(validated.transformer_path)])
     for image_path, anchor in zip(validated.image_paths, validated.anchors):
         command.extend(["--image", str(image_path), "--anchor", anchor])
+    if validated.turbo_preset is not None:
+        preset = validated.turbo_preset
+        command.extend([
+            preset.adapter_flag,
+            str(request.lora_path),
+            "--lora-scale",
+            _format_float(preset.default_scale),
+        ])
+        if preset.runtime_variant is not None:
+            command.extend(["--lightx-variant", preset.runtime_variant])
+        command.extend(["--turbo-steps", str(preset.nfe)])
+    elif request.lora_enabled:
+        command.extend([
+            "--lora",
+            str(request.lora_path),
+            "--lora-scale",
+            _format_float(request.lora_scale),
+        ])
+        if request.turbo_enabled:
+            command.append("--turbo")
+            if request.turbo_steps is not None:
+                command.extend(["--turbo-steps", str(request.turbo_steps)])
     return command
 
 
@@ -406,6 +693,7 @@ def build_generation_command_for_namespace(validated: ValidatedRequest, namespac
     output_marker = str(validated.output_root / "<run-directory>" / validated.request.output_name)
     command[command.index(output_marker)] = str(namespace.output_path)
     return command
+
 
 
 def sha256_file(path: Path) -> str:
@@ -453,13 +741,20 @@ def _file_identity(path: Path) -> dict[str, Any]:
 
 def runtime_identity(validated: ValidatedRequest, repo_root: Path = REPO_ROOT) -> dict[str, Any]:
     transformer = validated.transformer_path or validated.checkpoint_root / "transformer"
+    explicit_dimensions = validated.preset.evidence_class == "explicit-independent-dimensions"
     return {
         "generation_entrypoint": _file_identity(GENERATOR),
         "checkpoint_model_index": _file_identity(validated.checkpoint_root / "model_index.json"),
         "transformer_config": _file_identity(transformer / "config.json"),
         "transformer_quant_config": _file_identity(transformer / "quant_config.json"),
-        "resolution_source_id": PROJECT_RESOLUTION_SOURCE_ID,
-        "runtime_resolution_rule_id": RUNTIME_RESOLUTION_RULE_ID,
+        "transformer_mode": _transformer_mode(validated.transformer_path),
+        "transformer_name": transformer.name,
+        "resolution_source_id": INDEPENDENT_DIMENSION_SOURCE_ID if explicit_dimensions else PROJECT_RESOLUTION_SOURCE_ID,
+        "runtime_resolution_rule_id": INDEPENDENT_DIMENSION_RULE_ID if explicit_dimensions else RUNTIME_RESOLUTION_RULE_ID,
+        "host_asset_manifest": {
+            "status": HOST_ASSET_MANIFEST_STATUS,
+            "note": HOST_ASSET_MANIFEST_NOTE,
+        },
         "runtime_branch_and_head": _git_identity(repo_root),
     }
 
@@ -474,6 +769,69 @@ def _read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, A
     except (OSError, json.JSONDecodeError):
         return {} if default is None else default
     return value if isinstance(value, dict) else ({} if default is None else default)
+
+
+def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
+    request = validated.request
+    preset = validated.turbo_preset
+    if preset is not None:
+        return {
+            "selected": True,
+            "preset_id": preset.preset_id,
+            "label": preset.label,
+            "role": preset.role,
+            "family": preset.family,
+            "logical_asset": preset.logical_asset,
+            "adapter_asset": {
+                "flag": preset.adapter_flag,
+                "path": str(request.lora_path),
+                "logical_asset": preset.logical_asset,
+            },
+            "effective_nfe": preset.nfe,
+            "runtime_variant": preset.runtime_variant,
+            "runtime_contract": preset.runtime_contract,
+            "effective_scale": preset.default_scale,
+            "effective_scheduler": {
+                "video_shift": preset.video_shift,
+                "audio_shift": preset.audio_shift,
+                "source": "LightX2V manifest" if preset.family == "LightX2V" else "H3 PipelineConfig defaults",
+            },
+            "recommended_geometry": preset.recommended_geometry,
+            "asset_manifest": {
+                "status": HOST_ASSET_MANIFEST_STATUS,
+                "note": HOST_ASSET_MANIFEST_NOTE,
+            },
+        }
+
+    effective_nfe = request.turbo_steps if request.turbo_enabled and request.turbo_steps is not None else request.steps
+    return {
+        "selected": False,
+        "preset_id": None,
+        "label": "None / Reference",
+        "role": "Reference",
+        "family": None,
+        "logical_asset": None,
+        "adapter_asset": {
+            "flag": "--lora" if request.lora_enabled else None,
+            "path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
+            "logical_asset": None,
+        },
+        "effective_nfe": effective_nfe,
+        "runtime_variant": None,
+        "runtime_contract": "existing non-Turbo / manual LoRA behavior",
+        "effective_scale": request.lora_scale if request.lora_enabled else None,
+        "effective_scheduler": {
+            "video_shift": 12.0,
+            "audio_shift": 3.0,
+            "source": "H3 PipelineConfig defaults",
+        },
+        "recommended_geometry": None,
+        "asset_manifest": {
+            "status": HOST_ASSET_MANIFEST_STATUS,
+            "note": HOST_ASSET_MANIFEST_NOTE,
+        },
+    }
+
 
 
 def _status_record(namespace: RunNamespace, status: str, **extra: Any) -> dict[str, Any]:
@@ -563,8 +921,27 @@ def build_render_config(
         "seed": request.seed,
         "duration_seconds_requested": float(request.duration_seconds),
         "inference_steps_requested": request.steps,
+        "resolution_id": request.resolution_id,
         "width": validated.width,
         "height": validated.height,
+        "requested_width": request.width,
+        "requested_height": request.height,
+        "lora_enabled": request.lora_enabled,
+        "lora_path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
+        "lora_scale": float(request.lora_scale) if request.lora_enabled else None,
+        "turbo_enabled": request.turbo_enabled,
+        "turbo_steps": request.turbo_steps,
+        "turbo_preset_id": request.turbo_preset_id,
+        "lora": {
+            "enabled": request.lora_enabled,
+            "path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
+            "scale": float(request.lora_scale) if request.lora_enabled else None,
+        },
+        "turbo": {
+            **_turbo_evidence(validated),
+            "enabled": request.turbo_enabled,
+            "steps": request.turbo_steps,
+        },
         "resolution": {
             "preset_id": validated.preset.preset_id,
             "preset_label": validated.preset.label,
@@ -576,8 +953,16 @@ def build_render_config(
             "runtime_height": validated.height,
             "runtime_validated": True,
             "project_approved": validated.preset.project_approved,
-            "runtime_rule_id": RUNTIME_RESOLUTION_RULE_ID,
-            "project_source_id": PROJECT_RESOLUTION_SOURCE_ID,
+            "runtime_rule_id": (
+                INDEPENDENT_DIMENSION_RULE_ID
+                if validated.preset.evidence_class == "explicit-independent-dimensions"
+                else RUNTIME_RESOLUTION_RULE_ID
+            ),
+            "project_source_id": (
+                INDEPENDENT_DIMENSION_SOURCE_ID
+                if validated.preset.evidence_class == "explicit-independent-dimensions"
+                else PROJECT_RESOLUTION_SOURCE_ID
+            ),
             "evidence_class": validated.preset.evidence_class,
             "evidence_reference": validated.preset.evidence_reference,
         },
@@ -589,6 +974,7 @@ def build_render_config(
         "output_path": str(namespace.output_path),
         "checkpoint_root": str(validated.checkpoint_root),
         "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
+        "transformer_mode": _transformer_mode(validated.transformer_path),
         "git": _git_identity(repo_root),
         "runtime_identity": runtime_identity(validated, repo_root),
         "command": list(command),
@@ -864,6 +1250,7 @@ def _artifact_record(artifact: Path | None) -> dict[str, Any] | None:
     return record
 
 
+
 def execute_run(
     namespace: RunNamespace,
     command: Sequence[str],
@@ -1082,7 +1469,15 @@ class RenderController:
                     verify_runtime_geometry=False,
                 )
                 command = build_generation_command_for_namespace(validated, namespace)
-                initialize_run(namespace, build_render_config(validated, namespace, command, repo_root=self.repo_root))
+                initialize_run(
+                    namespace,
+                    build_render_config(
+                        validated,
+                        namespace,
+                        command,
+                        repo_root=self.repo_root,
+                    ),
+                )
             except Exception as exc:
                 if namespace is not None:
                     if not namespace.config_path.exists():
@@ -1095,8 +1490,30 @@ class RenderController:
                             "seed": request.seed,
                             "duration_seconds_requested": float(request.duration_seconds),
                             "inference_steps_requested": request.steps,
+                            "resolution_id": request.resolution_id,
                             "width": validated.width,
                             "height": validated.height,
+                            "requested_width": validated.width,
+                            "requested_height": validated.height,
+                            "lora_enabled": validated.request.lora_enabled,
+                            "lora_path": (
+                                str(validated.request.lora_path)
+                                if validated.request.lora_enabled and validated.request.lora_path
+                                else None
+                            ),
+                            "lora_scale": (
+                                float(validated.request.lora_scale)
+                                if validated.request.lora_enabled
+                                else None
+                            ),
+                            "turbo_enabled": validated.request.turbo_enabled,
+                            "turbo_steps": validated.request.turbo_steps,
+                            "turbo_preset_id": validated.request.turbo_preset_id,
+                            "turbo": {
+                                **_turbo_evidence(validated),
+                                "enabled": validated.request.turbo_enabled,
+                                "steps": validated.request.turbo_steps,
+                            },
                             "resolution": {
                                 "preset_id": validated.preset.preset_id,
                                 "width": validated.width,
@@ -1115,6 +1532,7 @@ class RenderController:
                             "output_path": str(namespace.output_path),
                             "checkpoint_root": str(validated.checkpoint_root),
                             "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
+                            "transformer_mode": _transformer_mode(validated.transformer_path),
                             "git": _git_identity(self.repo_root),
                             "admission_failure": str(exc),
                         })
@@ -1165,21 +1583,45 @@ class RenderController:
         return {
             "modes": [{"id": mode, "label": MODE_LABELS[mode], "image_count": expected_image_count(mode)} for mode in (T2V, I2V, FIRST_LAST)],
             "resolutions": preset_payload(),
+            "turbo_presets": turbo_preset_payload(self.repo_root),
             "defaults": {
                 "output_root": str(DEFAULT_OUTPUT_ROOT.relative_to(self.repo_root)),
                 "output_name": DEFAULT_OUTPUT_NAME,
                 "duration_seconds": DEFAULT_DURATION_SECONDS,
                 "steps": DEFAULT_INFERENCE_STEPS,
                 "seed": DEFAULT_SEED,
+                "resolution_id": DEFAULT_RESOLUTION_ID,
+                "width": 128,
+                "height": 128,
+                "lora_enabled": False,
+                "lora_path": "",
+                "lora_scale": 1.0,
+                "turbo_enabled": False,
+                "turbo_steps": 8,
+                "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
+            },
+            "resolution_contract": {
+                "min_dimension": MIN_RESOLUTION,
+                "max_dimension": MAX_RESOLUTION,
+                "step": RESOLUTION_STEP,
+                "positive": True,
+                "source": "tools/render_lab/resolutions.py:independent-dimensions-v1",
             },
             "runtime": {
                 "checkpoint_root": str(checkpoint),
                 "transformer_path": str(transformer) if transformer else None,
+                "transformer_name": transformer.name if transformer else None,
+                "transformer_mode": _transformer_mode(transformer),
+                "transformer_required_mode": CANONICAL_TRANSFORMER_MODE,
                 "checkpoint_exists": checkpoint.is_dir() and (checkpoint / "model_index.json").is_file(),
                 "transformer_exists": bool(
                     transformer and transformer.is_dir() and (transformer / "config.json").is_file()
                 ),
                 "generator": str(GENERATOR),
+                "host_asset_manifest": {
+                    "status": HOST_ASSET_MANIFEST_STATUS,
+                    "note": HOST_ASSET_MANIFEST_NOTE,
+                },
             },
             "geometry_contract": {
                 "spatial_compression_ratio": H3_SPATIAL_COMPRESSION_RATIO,
