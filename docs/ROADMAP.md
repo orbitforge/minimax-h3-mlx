@@ -1,6 +1,6 @@
 # MiniMax H3 MLX Runtime Roadmap
 
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-18
 
 ## Purpose
 
@@ -36,6 +36,8 @@ The existing LoRA registry already supports additive multiple-adapter deltas int
 # Near-Term Roadmap
 
 ## Slice 021A - Turbo + Auxiliary LoRA Stack Core
+
+**Status:** Complete.
 
 ### Objective
 
@@ -99,6 +101,8 @@ No expensive host render required.
 
 ## Slice 021B - Render Lab Additional LoRAs
 
+**Status:** Complete.
+
 ### Objective
 
 Expose the runtime stacking capability cleanly in Render Lab.
@@ -131,6 +135,8 @@ No live acceptance render is required for this slice unless needed to resolve a 
 ---
 
 ## Slice 021C - Host LoRA Stack Acceptance
+
+**Status:** Complete — host accepted. See [the Slice 021C closeout](slice-021c-host-lora-stack-acceptance-closeout.md).
 
 ### Objective
 
@@ -172,6 +178,8 @@ Visual quality is judged by the operator. Numerical metrics are diagnostic evide
 ---
 
 ## Slice 022 - LoRA Render Lab UX and Evidence Polish
+
+**Status:** Next development slice.
 
 Only after stacking is proven.
 
