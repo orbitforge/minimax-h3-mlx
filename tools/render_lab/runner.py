@@ -55,6 +55,11 @@ from .turbo_presets import (
     turbo_preset_by_id,
     turbo_preset_payload,
 )
+from minimax_h3_mlx.conditioning_artifact import (
+    ConditioningArtifactError,
+    load_conditioning_artifact,
+    validate_conditioning_artifact,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -89,7 +94,7 @@ DEFAULT_RESOLUTION_ID = "canonical-128-square-v05d"
 H3_SPATIAL_COMPRESSION_RATIO = 16
 H3_DIT_PATCH_SIZE = (1, 2, 2)
 
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 BENCHMARK_SCHEMA_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 RUN_ID_PATTERN = re.compile(r"^run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
@@ -112,6 +117,17 @@ class AdditionalLoRA:
 
     path: str | Path | None
     scale: object = 1.0
+
+
+@dataclass(frozen=True)
+class ConditioningArtifactEvidence:
+    """Immutable replay identity retained after Render Lab admission."""
+
+    path: Path
+    artifact_identity: str
+    token_count: int
+    conditioning_shape: tuple[int, ...]
+    tensor_checksum: str
 
 
 def parse_additional_loras_payload(value: object) -> tuple[AdditionalLoRA, ...]:
@@ -166,6 +182,7 @@ class RenderRequest:
     turbo_steps: int | str | None = None
     turbo_preset_id: str | None = None
     text_encoder_id: str = CANONICAL_ENCODER_ID
+    conditioning_artifact_path: str | Path | None = None
 
     def normalized(self) -> "RenderRequest":
         return replace(
@@ -210,6 +227,11 @@ class RenderRequest:
                 if self.text_encoder_id is None or not str(self.text_encoder_id).strip()
                 else str(self.text_encoder_id).strip()
             ),
+            conditioning_artifact_path=(
+                None
+                if self.conditioning_artifact_path is None or not str(self.conditioning_artifact_path).strip()
+                else Path(str(self.conditioning_artifact_path).strip()).expanduser()
+            ),
         )
 
 
@@ -228,6 +250,8 @@ class ValidatedRequest:
     scheduling_adapter_path: Path | None
     additional_loras: tuple[AdditionalLoRA, ...]
     heretic_assets: Any | None = None
+    conditioning_artifact_path: Path | None = None
+    conditioning_artifact_evidence: ConditioningArtifactEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -665,6 +689,50 @@ def validate_image_path(value: str | Path) -> Path:
     return resolved
 
 
+def _validate_conditioning_artifact(
+    request: RenderRequest,
+    checkpoint_root: Path,
+) -> tuple[Path | None, ConditioningArtifactEvidence | None]:
+    """Admit one external canonical artifact without constructing Qwen or MLX."""
+    raw_path = request.conditioning_artifact_path
+    if raw_path is None:
+        return None, None
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError) as exc:
+        raise RenderValidationError("Conditioning artifact path is not a valid filesystem path") from exc
+    if not resolved.is_file() or not os.access(resolved, os.R_OK):
+        raise RenderValidationError(f"Conditioning artifact is not a readable file: {resolved}")
+
+    try:
+        artifact = load_conditioning_artifact(resolved)
+        encoder = artifact.metadata.get("encoder", {})
+        if (
+            not isinstance(encoder, Mapping)
+            or encoder.get("family") != "qwen3_vl"
+            or encoder.get("encoder_id") is not None
+            or encoder.get("experimental") is True
+        ):
+            raise ConditioningArtifactError(
+                "external conditioning replay requires Canonical Qwen3-VL artifact provenance"
+            )
+        validate_conditioning_artifact(
+            artifact,
+            checkpoint_root=checkpoint_root,
+            prompt=request.prompt,
+        )
+    except (ConditioningArtifactError, OSError, TypeError, ValueError) as exc:
+        raise RenderValidationError(str(exc)) from exc
+
+    return resolved, ConditioningArtifactEvidence(
+        path=resolved,
+        artifact_identity=artifact.artifact_identity,
+        token_count=artifact.token_count,
+        conditioning_shape=artifact.conditioning_shape,
+        tensor_checksum=artifact.tensor_checksum,
+    )
+
+
 def validate_render_request(
     request: RenderRequest,
     *,
@@ -674,6 +742,13 @@ def validate_render_request(
     verify_runtime_geometry: bool = True,
 ) -> ValidatedRequest:
     request = request.normalized()
+    if request.conditioning_artifact_path is not None:
+        if request.mode != T2V:
+            raise RenderValidationError("External conditioning artifact replay is currently T2V-only")
+        if request.text_encoder_id != CANONICAL_ENCODER_ID:
+            raise RenderValidationError(
+                "External conditioning artifact replay requires Canonical Qwen3-VL"
+            )
     try:
         heretic_assets = validate_text_encoder_selection(
             request.text_encoder_id,
@@ -753,6 +828,10 @@ def validate_render_request(
                 f"Transformer path is not a usable H3 transformer directory: {effective_transformer}"
             )
         transformer_path = effective_transformer
+    conditioning_artifact_path, conditioning_artifact_evidence = _validate_conditioning_artifact(
+        request,
+        checkpoint_root,
+    )
     normalized_request = replace(
         request,
         resolution_id=preset.preset_id if explicit_dimensions else request.resolution_id,
@@ -765,6 +844,7 @@ def validate_render_request(
         turbo_enabled=turbo_enabled,
         turbo_steps=turbo_steps,
         turbo_preset_id=turbo_preset.preset_id if turbo_preset is not None else None,
+        conditioning_artifact_path=conditioning_artifact_path,
     )
     return ValidatedRequest(
         request=replace(normalized_request, output_name=output_name),
@@ -780,6 +860,8 @@ def validate_render_request(
         scheduling_adapter_path=scheduling_adapter_path,
         additional_loras=additional_loras,
         heretic_assets=heretic_assets,
+        conditioning_artifact_path=conditioning_artifact_path,
+        conditioning_artifact_evidence=conditioning_artifact_evidence,
     )
 
 
@@ -795,12 +877,16 @@ def build_generation_command(
 ) -> list[str]:
     """Construct the only H3 command the Render Lab is allowed to launch."""
     request = validated.request
+    canonical_artifact_replay = (
+        request.text_encoder_id == CANONICAL_ENCODER_ID
+        and validated.conditioning_artifact_path is not None
+    )
     command = [
         str(python),
         "-u",
         str(GENERATOR),
     ]
-    if request.text_encoder_id != HERETIC_ENCODER_ID:
+    if request.text_encoder_id != HERETIC_ENCODER_ID and not canonical_artifact_replay:
         command.append(request.prompt)
     command.extend([
         "--checkpoint",
@@ -821,6 +907,8 @@ def build_generation_command(
     if request.text_encoder_id == HERETIC_ENCODER_ID:
         artifact_path = conditioning_artifact or validated.output_root / "<run-directory>" / "conditioning-artifact.npz"
         command.extend(["--conditioning-artifact", str(artifact_path)])
+    elif canonical_artifact_replay:
+        command.extend(["--conditioning-artifact", str(validated.conditioning_artifact_path)])
     if validated.transformer_path is not None:
         command.extend(["--transformer", str(validated.transformer_path)])
     for image_path, anchor in zip(validated.image_paths, validated.anchors):
@@ -1078,6 +1166,25 @@ def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
     }
 
 
+def _conditioning_source(validated: ValidatedRequest) -> str:
+    if validated.request.text_encoder_id == CANONICAL_ENCODER_ID:
+        return "artifact-replay" if validated.conditioning_artifact_evidence is not None else "live-encoder"
+    return "heretic-internal-artifact"
+
+
+def _conditioning_artifact_payload(validated: ValidatedRequest) -> dict[str, Any] | None:
+    evidence = validated.conditioning_artifact_evidence
+    if evidence is None:
+        return None
+    return {
+        "path": str(evidence.path),
+        "artifact_identity": evidence.artifact_identity,
+        "token_count": evidence.token_count,
+        "conditioning_shape": list(evidence.conditioning_shape),
+        "tensor_checksum": evidence.tensor_checksum,
+    }
+
+
 def _text_encoder_evidence(validated: ValidatedRequest, namespace: RunNamespace) -> dict[str, Any]:
     request = validated.request
     if request.text_encoder_id == CANONICAL_ENCODER_ID:
@@ -1086,7 +1193,8 @@ def _text_encoder_evidence(validated: ValidatedRequest, namespace: RunNamespace)
             "label": "Canonical Qwen3-VL",
             "experimental": False,
             "mode_contract": "T2V, I2V, FIRST_LAST",
-            "conditioning_artifact": None,
+            "conditioning_source": _conditioning_source(validated),
+            "conditioning_artifact": _conditioning_artifact_payload(validated),
             "h3_launch_after_encoder_exit": None,
         }
     assets = validated.heretic_assets or probe_heretic_assets(REPO_ROOT)
@@ -1095,6 +1203,7 @@ def _text_encoder_evidence(validated: ValidatedRequest, namespace: RunNamespace)
         "label": "Heretic 35B-A3B · Experimental",
         "experimental": True,
         "mode_contract": "T2V only",
+        "conditioning_source": _conditioning_source(validated),
         "hint": "Experimental text-only encoder using state 28 + learned H3 conditioning bridge.",
         "source_model": {
             "path": str(assets.model_path),
@@ -1289,10 +1398,16 @@ def build_render_config(
         "transformer_mode": _transformer_mode(validated.transformer_path),
         "text_encoder_id": request.text_encoder_id,
         "text_encoder": _text_encoder_evidence(validated, namespace),
+        "conditioning_source": _conditioning_source(validated),
+        "conditioning_artifact": _conditioning_artifact_payload(validated),
         "conditioning_artifact_path": (
-            str(namespace.conditioning_artifact_path)
-            if request.text_encoder_id == HERETIC_ENCODER_ID
-            else None
+            str(validated.conditioning_artifact_path)
+            if validated.conditioning_artifact_path is not None
+            else (
+                str(namespace.conditioning_artifact_path)
+                if request.text_encoder_id == HERETIC_ENCODER_ID
+                else None
+            )
         ),
         "encoder_command": list(encoder_command) if encoder_command is not None else None,
         "git": _git_identity(repo_root),
@@ -2021,6 +2136,17 @@ class RenderController:
                             "transformer_mode": _transformer_mode(validated.transformer_path),
                             "text_encoder_id": request.text_encoder_id,
                             "text_encoder": _text_encoder_evidence(validated, namespace),
+                            "conditioning_source": _conditioning_source(validated),
+                            "conditioning_artifact": _conditioning_artifact_payload(validated),
+                            "conditioning_artifact_path": (
+                                str(validated.conditioning_artifact_path)
+                                if validated.conditioning_artifact_path is not None
+                                else (
+                                    str(namespace.conditioning_artifact_path)
+                                    if request.text_encoder_id == HERETIC_ENCODER_ID
+                                    else None
+                                )
+                            ),
                             "git": _git_identity(self.repo_root),
                             "admission_failure": str(exc),
                         })
@@ -2099,6 +2225,7 @@ class RenderController:
                 "turbo_steps": 8,
                 "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
                 "text_encoder_id": CANONICAL_ENCODER_ID,
+                "conditioning_artifact_path": "",
             },
             "resolution_contract": {
                 "min_dimension": MIN_RESOLUTION,

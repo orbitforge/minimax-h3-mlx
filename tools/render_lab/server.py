@@ -104,6 +104,9 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
   <label for="text-encoder">Text encoder</label>
   <select id="text-encoder"></select>
   <div id="text-encoder-hint" class="meta">Canonical Qwen3-VL is the default H3 conditioning path.</div>
+  <label for="conditioning-artifact">Conditioning artifact (optional)</label>
+  <input id="conditioning-artifact" type="text" spellcheck="false" placeholder="/path/to/conditioning-artifact.npz">
+  <div class="meta">Replay is currently T2V-only. The artifact must match the visible prompt and the selected Canonical Qwen3-VL encoder/checkpoint identity. Leave blank to encode with the live text encoder.</div>
   <div class="grid">
     <div id="image1-slot" class="image-slot hidden"><label for="image1">First image</label><input id="image1" type="file" accept="image/*"></div>
     <div id="image2-slot" class="image-slot hidden"><label for="image2">Last image</label><input id="image2" type="file" accept="image/*"></div>
@@ -391,6 +394,8 @@ async function renderJob() {
   const form = new FormData();
   form.set('mode', mode); form.set('prompt', $('prompt').value);
   form.set('text_encoder_id', $('text-encoder').value);
+  const conditioningArtifactPath = $('conditioning-artifact').value.trim();
+  if (conditioningArtifactPath) form.set('conditioning_artifact_path', conditioningArtifactPath);
   form.set('width', $('width').value); form.set('height', $('height').value);
   form.set('steps', $('steps').value); form.set('duration_seconds', $('duration').value); form.set('seed', $('seed').value);
   form.set('output_root', $('output-root').value); form.set('output_name', $('output-name').value);
@@ -431,6 +436,7 @@ async function boot() {
   $('steps').value = config.defaults.steps; $('duration').value = config.defaults.duration_seconds; $('seed').value = config.defaults.seed;
   additionalLoras = (config.defaults.additional_loras || []).map(row => ({path: row.path || '', scale: row.scale ?? '1.0'}));
   renderAdditionalLoraRows();
+  $('conditioning-artifact').value = config.defaults.conditioning_artifact_path || '';
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
   $('mode').onchange = updateMode;
   $('text-encoder').onchange = updateTextEncoderControls;
@@ -496,6 +502,31 @@ def _submission(handler: BaseHTTPRequestHandler) -> tuple[dict[str, object], lis
     if not isinstance(value, dict):
         raise RenderValidationError("Request body must be an object")
     return {str(key): item for key, item in value.items()}, []
+
+
+def _render_request_from_fields(fields: dict[str, object]) -> RenderRequest:
+    """Convert browser/JSON fields into the shared request model."""
+    return RenderRequest(
+        mode=fields.get("mode", ""),
+        prompt=fields.get("prompt") or "",
+        text_encoder_id=fields.get("text_encoder_id", "canonical-qwen3-vl"),
+        conditioning_artifact_path=fields.get("conditioning_artifact_path") or None,
+        resolution_id=fields.get("resolution_id") or None,
+        steps=int(fields.get("steps", "")),
+        duration_seconds=float(fields.get("duration_seconds", "")),
+        seed=int(fields.get("seed", "")),
+        output_root=fields.get("output_root", str(DEFAULT_OUTPUT_ROOT.relative_to(REPO_ROOT))),
+        output_name=fields.get("output_name", "render.mp4"),
+        width=fields.get("width") or None,
+        height=fields.get("height") or None,
+        lora_enabled=fields.get("lora_enabled", "false"),
+        lora_path=fields.get("lora_path") or None,
+        lora_scale=fields.get("lora_scale", "1.0"),
+        additional_loras=parse_additional_loras_payload(fields.get("additional_loras")),
+        turbo_enabled=fields.get("turbo_enabled", "false"),
+        turbo_steps=fields.get("turbo_steps") or None,
+        turbo_preset_id=fields.get("turbo_preset_id") or None,
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -590,26 +621,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             fields, uploads = _submission(self)
-            request = RenderRequest(
-                mode=fields.get("mode", ""),
-                prompt=fields.get("prompt", ""),
-                text_encoder_id=fields.get("text_encoder_id", "canonical-qwen3-vl"),
-                resolution_id=fields.get("resolution_id") or None,
-                steps=int(fields.get("steps", "")),
-                duration_seconds=float(fields.get("duration_seconds", "")),
-                seed=int(fields.get("seed", "")),
-                output_root=fields.get("output_root", str(DEFAULT_OUTPUT_ROOT.relative_to(REPO_ROOT))),
-                output_name=fields.get("output_name", "render.mp4"),
-                width=fields.get("width") or None,
-                height=fields.get("height") or None,
-                lora_enabled=fields.get("lora_enabled", "false"),
-                lora_path=fields.get("lora_path") or None,
-                lora_scale=fields.get("lora_scale", "1.0"),
-                additional_loras=parse_additional_loras_payload(fields.get("additional_loras")),
-                turbo_enabled=fields.get("turbo_enabled", "false"),
-                turbo_steps=fields.get("turbo_steps") or None,
-                turbo_preset_id=fields.get("turbo_preset_id") or None,
-            )
+            request = _render_request_from_fields(fields)
             namespace = CONTROLLER.start(request, uploads=uploads)
             send_json(self, {"ok": True, "run_id": namespace.run_id, "run_directory": str(namespace.run_dir)}, 202)
         except RenderBusyError as exc:
