@@ -42,7 +42,14 @@ class TurboSchedule:
     @classmethod
     def from_registry(cls, registry: Any = None, steps: int | None = None) -> "TurboSchedule":
         advertised = None if registry is None else getattr(registry, "turbo_steps", None)
-        metadata = {} if registry is None else getattr(registry, "metadata", {})
+        if registry is None:
+            metadata = {}
+        elif hasattr(registry, "scheduling_metadata"):
+            # A composed registry may carry many auxiliary sources.  Only the explicitly bound
+            # scheduling owner is allowed to advertise NFE or a custom sigma grid.
+            metadata = getattr(registry, "scheduling_metadata") or {}
+        else:
+            metadata = getattr(registry, "metadata", {})
         raw_sigmas = metadata.get("turbo_sigmas", metadata.get("sigmas"))
         sigmas = None
         if raw_sigmas is not None:

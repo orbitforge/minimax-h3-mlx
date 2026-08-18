@@ -45,6 +45,7 @@ from .lora import (
     LIGHTX_FL2VA_TURBO_8STEP_V1_0,
     LightX2VManifest,
     LoRARegistry,
+    LoRAStack,
     load_lightx_safetensors,
     load_lora_safetensors,
 )
@@ -141,6 +142,8 @@ class MiniMaxH3Pipeline:
         lightx_path: str | Path | None = None,
         lightx_manifest: LightX2VManifest | None = None,
         lora_scale: float = 1.0,
+        additional_lora_paths: tuple[str | Path, ...] | list[str | Path] | None = None,
+        additional_lora_scales: tuple[float, ...] | list[float] | None = None,
         turbo: bool = False,
         turbo_steps: int | None = None,
         conditioning_artifact: LoadedConditioningArtifact | None = None,
@@ -161,6 +164,34 @@ class MiniMaxH3Pipeline:
             raise ValueError("pass either lora_registry, lora_path, or lightx_path, not more than one")
         if lora_path is not None and lightx_path is not None:
             raise ValueError("pass either lora_path or lightx_path, not both")
+        scheduling_path = (
+            lightx_path if lightx_path is not None else (lora_path if turbo else None)
+        )
+        if isinstance(additional_lora_paths, (str, Path)):
+            raise ValueError("additional_lora_paths must be a repeated sequence")
+        auxiliary_paths = list(additional_lora_paths or ())
+        if additional_lora_scales is None:
+            auxiliary_scales = None
+        elif isinstance(additional_lora_scales, (str, bytes)):
+            raise ValueError("additional_lora_scales must be a repeated numeric sequence")
+        else:
+            try:
+                auxiliary_scales = list(additional_lora_scales)
+            except TypeError as exc:
+                raise ValueError("additional_lora_scales must be a repeated numeric sequence") from exc
+        if not auxiliary_scales:
+            auxiliary_scales = [1.0] * len(auxiliary_paths)
+        if lora_path is not None and not turbo:
+            # Preserve the legacy ordinary --lora path while representing it as the first model-
+            # delta entry in the effective auxiliary stack.
+            auxiliary_paths.insert(0, lora_path)
+            auxiliary_scales.insert(0, lora_scale)
+        self._lora_stack = LoRAStack.from_sources(
+            scheduling_path=scheduling_path,
+            scheduling_scale=lora_scale,
+            auxiliary_paths=tuple(auxiliary_paths),
+            auxiliary_scales=(None if auxiliary_scales is None else tuple(auxiliary_scales)),
+        )
         inferred_lightx_manifest = lightx_manifest
         if inferred_lightx_manifest is None and lora_registry is not None:
             inferred_lightx_manifest = getattr(lora_registry, "lightx_manifest", None)
@@ -174,6 +205,7 @@ class MiniMaxH3Pipeline:
         if inferred_lightx_manifest is not None and inferred_lightx_manifest.task == TASK_REF2VA:
             raise RuntimeError(REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED)
         self._lora_registry = lora_registry
+        self._lora_stack_sources_loaded = lora_registry is not None and not self._lora_stack.ordered_entries
         self._lora_path = Path(lora_path) if lora_path is not None else None
         self._lightx_path = Path(lightx_path) if lightx_path is not None else None
         self._lightx_manifest = inferred_lightx_manifest
@@ -221,6 +253,8 @@ class MiniMaxH3Pipeline:
         lightx_path: str | Path | None = None,
         lightx_manifest: LightX2VManifest | None = None,
         lora_scale: float = 1.0,
+        additional_lora_paths: tuple[str | Path, ...] | list[str | Path] | None = None,
+        additional_lora_scales: tuple[float, ...] | list[float] | None = None,
         turbo: bool = False,
         turbo_steps: int | None = None,
         conditioning_artifact: str | Path | LoadedConditioningArtifact | None = None,
@@ -240,6 +274,10 @@ class MiniMaxH3Pipeline:
                 representation, runtime scale, NFE, and scheduler shifts.
             lightx_manifest: explicit manifest for ``lightx_path``; omitted native adapters retain
                 the existing FL2VA Turbo 8-step v1.0 default.
+            additional_lora_paths: ordered generic/style LoRA sources that contribute model deltas
+                without owning scheduling semantics.
+            additional_lora_scales: one independent finite scale per additional source; omitted
+                values default to 1.0.
             turbo: make the reduced-step schedule the default for calls using this pipeline.
         """
         from .load import (
@@ -347,6 +385,8 @@ class MiniMaxH3Pipeline:
             lightx_path=lightx_path,
             lightx_manifest=lightx_manifest,
             lora_scale=lora_scale,
+            additional_lora_paths=additional_lora_paths,
+            additional_lora_scales=additional_lora_scales,
             turbo=turbo,
             turbo_steps=turbo_steps,
             conditioning_artifact=loaded_conditioning_artifact,
@@ -516,17 +556,45 @@ class MiniMaxH3Pipeline:
     def _load_transformer(self, verbose: bool):
         if self._lightx_manifest is not None and self._lightx_manifest.task == TASK_REF2VA:
             raise RuntimeError(REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED)
-        if self._lora_registry is None and self._lightx_path is not None:
-            self._lora_registry = load_lightx_safetensors(
-                self._lightx_path,
-                variant=self._lightx_manifest or LIGHTX_FL2VA_TURBO_8STEP_V1_0,
-                scale=self._lora_scale,
-            )
-        if self._lora_registry is None and self._lora_path is not None:
-            self._lora_registry = load_lora_safetensors(
-                self._lora_path,
-                scale=self._lora_scale,
-            )
+        registry = self._lora_registry
+        if not self._lora_stack_sources_loaded:
+            # Load the legacy primary source first.  Its role is explicit: LightX always owns
+            # scheduling; generic --lora owns scheduling only when the legacy Turbo flag is active.
+            if registry is None and self._lightx_path is not None:
+                registry = load_lightx_safetensors(
+                    self._lightx_path,
+                    variant=self._lightx_manifest or LIGHTX_FL2VA_TURBO_8STEP_V1_0,
+                    scale=self._lora_scale,
+                )
+            elif registry is None and self._lora_path is not None:
+                registry = load_lora_safetensors(
+                    self._lora_path,
+                    scale=self._lora_scale,
+                    scheduling_owner=self._lora_stack.scheduling is not None,
+                )
+
+            # Admit every auxiliary source independently before merging it.  This preserves the
+            # H3 zero-compatible rejection even when a scheduling source in the same effective
+            # registry has compatible targets of its own.  The merge itself reuses the existing
+            # additive target-indexed registry and keeps tensor references header-first.
+            for index, entry in enumerate(self._lora_stack.auxiliary):
+                is_legacy_primary = self._lora_path is not None and not self._turbo and index == 0
+                if is_legacy_primary:
+                    continue
+                auxiliary_registry = load_lora_safetensors(
+                    entry.source,
+                    scale=entry.scale,
+                    adapter_name_prefix=f"auxiliary-{index}",
+                    scheduling_owner=False,
+                )
+                validate_h3_lora_compatibility(auxiliary_registry, adapter_path=entry.source)
+                if registry is None:
+                    registry = auxiliary_registry
+                else:
+                    registry.merge(auxiliary_registry)
+
+            self._lora_stack_sources_loaded = True
+            self._lora_registry = registry
         if self._lora_registry is not None:
             self._h3_lora_compatibility = validate_h3_lora_compatibility(
                 self._lora_registry,
@@ -571,6 +639,11 @@ class MiniMaxH3Pipeline:
     def lightx_manifest(self) -> LightX2VManifest | None:
         """The explicit native LightX configuration admitted by this pipeline, if any."""
         return self._lightx_manifest
+
+    @property
+    def lora_stack(self) -> LoRAStack:
+        """The normalized scheduling/auxiliary source stack admitted by this pipeline."""
+        return self._lora_stack
 
     def _build_schedules(
         self,
@@ -774,6 +847,18 @@ class MiniMaxH3Pipeline:
         )
         if turbo_enabled and self._lora_registry is None and self._lora_path is None and self._lightx_path is None:
             raise RuntimeError("Turbo generation requires an attached Turbo LoRA safetensors adapter")
+        if (
+            turbo_enabled
+            and self._lora_registry is not None
+            and self._lora_path is None
+            and self._lightx_path is None
+            and self._lora_stack.auxiliary
+            and getattr(self._lora_registry, "scheduling_metadata", None) is None
+        ):
+            raise RuntimeError(
+                "Turbo generation requires a bound scheduling adapter; "
+                "auxiliary LoRAs are model deltas only"
+            )
         turbo_schedule = None
         if turbo_enabled:
             requested_turbo_steps = turbo_steps if turbo_steps is not None else self._turbo_steps

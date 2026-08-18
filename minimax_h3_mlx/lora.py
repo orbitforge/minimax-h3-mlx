@@ -31,6 +31,121 @@ class LoRAError(ValueError):
     """Raised when an adapter is malformed or cannot match a projection."""
 
 
+def normalize_lora_source_path(path: str | Path) -> Path:
+    """Normalize one adapter source for stack-level duplicate detection.
+
+    Header admission remains responsible for proving that the path is a readable safetensors
+    source.  This helper only establishes a deterministic path identity early enough to reject
+    duplicate stack entries before the transformer owns any runtime state.
+    """
+    if isinstance(path, Path):
+        raw = str(path)
+    elif isinstance(path, str):
+        raw = path.strip()
+    else:
+        raise LoRAError(f"LoRA source path must be a string or Path, got {type(path).__name__}")
+    if not raw:
+        raise LoRAError("LoRA source path must be non-empty")
+    try:
+        normalized = Path(raw).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise LoRAError(f"could not normalize LoRA source path {raw!r}") from exc
+    if not normalized.is_absolute():
+        raise LoRAError(f"LoRA source path did not resolve to an absolute path: {raw!r}")
+    return normalized
+
+
+@dataclass(frozen=True)
+class LoRAStackEntry:
+    """One ordered adapter source and its independent runtime strength."""
+
+    source: Path
+    scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", normalize_lora_source_path(self.source))
+        try:
+            numeric_scale = float(self.scale)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise LoRAError(f"LoRA source {self.source} scale must be numeric and finite") from exc
+        if isinstance(self.scale, bool) or not math.isfinite(numeric_scale):
+            raise LoRAError(f"LoRA source {self.source} scale must be finite")
+        object.__setattr__(self, "scale", numeric_scale)
+
+
+@dataclass(frozen=True)
+class LoRAStack:
+    """Normalized scheduling-owner plus ordered auxiliary source representation.
+
+    The registry owns numerical additive composition.  This value object owns only the bounded
+    source/scale contract that is shared by the CLI and production pipeline admission.
+    """
+
+    scheduling: LoRAStackEntry | None = None
+    auxiliary: tuple[LoRAStackEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.scheduling is not None and not isinstance(self.scheduling, LoRAStackEntry):
+            raise LoRAError("scheduling adapter must be a LoRAStackEntry or None")
+        auxiliary = tuple(self.auxiliary)
+        if any(not isinstance(entry, LoRAStackEntry) for entry in auxiliary):
+            raise LoRAError("auxiliary adapters must be LoRAStackEntry values")
+        object.__setattr__(self, "auxiliary", auxiliary)
+
+        seen: dict[Path, str] = {}
+        if self.scheduling is not None:
+            seen[self.scheduling.source] = "scheduling"
+        for index, entry in enumerate(auxiliary):
+            previous = seen.get(entry.source)
+            if previous is not None:
+                if previous == "scheduling":
+                    raise LoRAError(
+                        "scheduling adapter source is duplicated as an auxiliary source: "
+                        f"{entry.source}"
+                    )
+                raise LoRAError(
+                    "duplicate normalized auxiliary LoRA source: "
+                    f"{entry.source} (entries {previous} and auxiliary-{index})"
+                )
+            seen[entry.source] = f"auxiliary-{index}"
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        scheduling_path: str | Path | None = None,
+        scheduling_scale: float = 1.0,
+        auxiliary_paths: tuple[str | Path, ...] | list[str | Path] = (),
+        auxiliary_scales: tuple[float, ...] | list[float] | None = None,
+    ) -> "LoRAStack":
+        if isinstance(auxiliary_paths, (str, Path)):
+            raise LoRAError("auxiliary paths must be a repeated sequence, not one scalar path")
+        paths = tuple(auxiliary_paths)
+        if auxiliary_scales is None:
+            scales = (1.0,) * len(paths)
+        else:
+            if isinstance(auxiliary_scales, (str, bytes)):
+                raise LoRAError("auxiliary scales must be a repeated numeric sequence")
+            scales = tuple(auxiliary_scales)
+            if len(scales) != len(paths):
+                raise LoRAError(
+                    "auxiliary LoRA path/scale cardinality mismatch: "
+                    f"{len(paths)} paths but {len(scales)} scales"
+                )
+        scheduling = (
+            None
+            if scheduling_path is None
+            else LoRAStackEntry(scheduling_path, scheduling_scale)
+        )
+        auxiliary = tuple(LoRAStackEntry(path, scale) for path, scale in zip(paths, scales))
+        return cls(scheduling=scheduling, auxiliary=auxiliary)
+
+    @property
+    def ordered_entries(self) -> tuple[LoRAStackEntry, ...]:
+        """Return the effective scheduling-first, auxiliary-in-input-order stack."""
+        return (() if self.scheduling is None else (self.scheduling,)) + self.auxiliary
+
+
 def _is_mlx_array(value: Any) -> bool:
     module = type(value).__module__
     return bool(getattr(value, "__mlx_array__", False)) or module.startswith("mlx.")
@@ -1038,12 +1153,21 @@ class LoRARegistry:
         representation_identity: str | None = None,
     ) -> None:
         self._adapters: dict[str, dict[str, LoRAAdapter]] = defaultdict(dict)
+        self._registration_order: list[LoRAAdapter] = []
         self._aliases: dict[str, str] = {}
         self.metadata: dict[str, Any] = dict(metadata or {})
         self._sources: dict[str, LoRASafetensorsSource] = {}
+        self._source_paths: dict[Path, str] = {}
         self._representation_identity = representation_identity
         self._lightx_manifest: LightX2VManifest | None = None
         self._lightx_report: Any = None
+        # Constructor metadata is the legacy single-owner schedule metadata surface.  A registry
+        # built from auxiliary sources starts with no owner, so auxiliary metadata cannot select
+        # Turbo NFE or scheduler behavior after it is merged into a composed registry.
+        self._scheduling_metadata: dict[str, Any] | None = (
+            dict(metadata) if metadata is not None else None
+        )
+        self._scheduling_source_identity: str | None = None
         if adapters:
             for name, adapter in adapters.items():
                 self.register(
@@ -1107,11 +1231,24 @@ class LoRARegistry:
         )
         if adapter_name in self._adapters[target] and not replace:
             raise LoRAError(f"duplicate LoRA adapter {adapter_name!r} for target {target!r}")
+        previous = self._adapters[target].get(adapter_name)
+        if previous is not None:
+            self._registration_order = [item for item in self._registration_order if item is not previous]
         self._adapters[target][adapter_name] = adapter
+        self._registration_order.append(adapter)
         return adapter
 
     def _register_source(self, source: LoRASafetensorsSource) -> None:
+        normalized_path = normalize_lora_source_path(source.path)
+        if source.identity in self._sources:
+            raise LoRAError(f"duplicate LoRA source identity: {source.path}")
+        if normalized_path in self._source_paths:
+            raise LoRAError(
+                "duplicate normalized LoRA source: "
+                f"{source.path} (already registered as {self._source_paths[normalized_path]})"
+            )
         self._sources[source.identity] = source
+        self._source_paths[normalized_path] = source.identity
 
     @property
     def representation_identity(self) -> str | None:
@@ -1125,6 +1262,76 @@ class LoRARegistry:
                 "cannot combine LoRA adapters with different representation identities"
             )
         self._representation_identity = identity
+
+    @property
+    def scheduling_source_identity(self) -> str | None:
+        return self._scheduling_source_identity
+
+    @property
+    def scheduling_metadata(self) -> Mapping[str, Any] | None:
+        """Metadata owned by the one scheduling adapter, if one was explicitly bound."""
+        return None if self._scheduling_metadata is None else dict(self._scheduling_metadata)
+
+    def bind_scheduling_owner(
+        self,
+        *,
+        source_identity: str | None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Bind the single scheduling owner without letting auxiliary metadata control Turbo."""
+        if self._scheduling_metadata is not None:
+            if self._scheduling_source_identity != source_identity:
+                raise LoRAError("more than one scheduling adapter is not supported")
+            return
+        self._scheduling_source_identity = source_identity
+        self._scheduling_metadata = dict(metadata or {})
+
+    def merge(self, other: "LoRARegistry") -> "LoRARegistry":
+        """Merge another lazily registered stack into this registry.
+
+        Adapter tensor references remain header-first and are appended in the source registry's
+        registration order.  The operation validates all source, adapter-name, representation,
+        and scheduling-owner collisions before mutating this registry.
+        """
+        if not isinstance(other, LoRARegistry):
+            raise TypeError(f"expected LoRARegistry, got {type(other).__name__}")
+        if other is self:
+            raise LoRAError("cannot merge a LoRA registry into itself")
+        if (
+            self._representation_identity is not None
+            and other._representation_identity is not None
+            and self._representation_identity != other._representation_identity
+        ):
+            raise LoRAError("cannot combine LoRA adapters with different representation identities")
+        if self._scheduling_metadata is not None and other._scheduling_metadata is not None:
+            raise LoRAError("more than one scheduling adapter is not supported")
+
+        for source in other.sources:
+            normalized_path = normalize_lora_source_path(source.path)
+            if source.identity in self._sources or normalized_path in self._source_paths:
+                raise LoRAError(f"duplicate LoRA source while merging: {source.path}")
+        for adapter in other._registration_order:
+            if adapter.adapter_name in self._adapters.get(adapter.target, {}):
+                raise LoRAError(
+                    f"duplicate LoRA adapter {adapter.adapter_name!r} for target {adapter.target!r}"
+                )
+
+        if self._representation_identity is None:
+            self._representation_identity = other._representation_identity
+        for source in other.sources:
+            self._register_source(source)
+        for adapter in other._registration_order:
+            self._adapters[adapter.target][adapter.adapter_name] = adapter
+            self._registration_order.append(adapter)
+        self._aliases.update(other._aliases)
+        self.metadata.update(other.metadata)
+        if self._scheduling_metadata is None and other._scheduling_metadata is not None:
+            self._scheduling_source_identity = other._scheduling_source_identity
+            self._scheduling_metadata = dict(other._scheduling_metadata)
+        if self._lightx_manifest is None:
+            self._lightx_manifest = other._lightx_manifest
+            self._lightx_report = other._lightx_report
+        return self
 
     @property
     def lightx_manifest(self) -> LightX2VManifest | None:
@@ -1238,18 +1445,16 @@ class LoRARegistry:
         """Stable identity of adapter sources, stack order, and strengths for cache validation."""
         if not self._adapters:
             return None
-        entries: list[Any] = []
-        for target in sorted(self._adapters):
-            # Preserve insertion order within each target: stacked adapter ordering is part of the
-            # runtime contract even though ordinary real-valued addition is usually commutative.
-            for adapter in self._adapters[target].values():
-                entries.append(adapter.runtime_identity)
-        identity_payload: Any = entries
-        if self._representation_identity is not None:
-            identity_payload = {
-                "representation_identity": self._representation_identity,
-                "adapters": entries,
-            }
+        # Preserve global registration order, including sources that affect disjoint targets.
+        # Ordering is part of the effective stack contract even where ordinary addition is
+        # mathematically commutative, because output transforms and future target seams may not be.
+        entries = [adapter.runtime_identity for adapter in self._registration_order]
+        identity_payload: Any = {
+            "representation_identity": self._representation_identity,
+            "scheduling_source_identity": self._scheduling_source_identity,
+            "scheduling_metadata": self._scheduling_metadata,
+            "adapters": entries,
+        }
         encoded = json.dumps(identity_payload, separators=(",", ":"), sort_keys=False, default=str).encode()
         return hashlib.sha256(encoded).hexdigest()
 
@@ -1284,8 +1489,14 @@ class LoRARegistry:
 
     @property
     def turbo_steps(self) -> int | None:
+        # Only an explicitly bound scheduling owner may advertise NFE.  The fallback to
+        # constructor metadata preserves the existing in-memory registry contract used by tests
+        # and programmatic callers; metadata learned from a loaded auxiliary source is not bound.
+        metadata = self._scheduling_metadata
+        if metadata is None:
+            return None
         for key in ("turbo_steps", "num_inference_steps", "steps"):
-            value = self.metadata.get(key)
+            value = metadata.get(key)
             if value is None:
                 continue
             try:
@@ -1584,6 +1795,7 @@ def load_lightx_safetensors(
     result.bind_representation_identity(variant.cache_identity)
     result._register_source(source)
     result.metadata.update(variant.metadata)
+    result.bind_scheduling_owner(source_identity=source.identity, metadata=variant.metadata)
     for spec, native_target, down, up in registrations:
         result.register(
             spec.local_target,
@@ -1627,17 +1839,26 @@ def load_lora_safetensors(
     scale: float | None = None,
     strict: bool = True,
     variant: LightX2VManifest | None = None,
+    adapter_name_prefix: str | None = None,
+    scheduling_owner: bool | None = None,
 ) -> LoRARegistry:
     """Load a generic LoRA ``.safetensors`` payload into a registry.
 
     Supported pair names are ``lora_A``/``lora_B`` and
     ``lora_down``/``lora_up`` with an optional ``.weight`` and optional adapter
-    name component. Unknown tensor keys fail in strict mode so a partially
-    loaded adapter cannot be mistaken for a complete one.
+    name component. ``adapter_name_prefix`` namespaces a source when several files
+    are merged into one registry. ``scheduling_owner`` controls whether source
+    metadata may advertise Turbo semantics; omitted standalone loads preserve
+    the legacy single-adapter behavior. Unknown tensor keys fail in strict mode
+    so a partially loaded adapter cannot be mistaken for a complete one.
     """
     if variant is not None:
         if tensor_loader is not None:
             raise LoRAError("native LightX normalization does not support a custom tensor loader")
+        if adapter_name_prefix is not None:
+            raise LoRAError("native LightX loading does not support an adapter-name prefix")
+        if scheduling_owner is False:
+            raise LoRAError("native LightX adapters always own scheduling semantics")
         return load_lightx_safetensors(
             path,
             variant=variant,
@@ -1663,11 +1884,34 @@ def load_lora_safetensors(
             "generic LoRA loading cannot assign its task or representation"
         )
 
+    created_registry = registry is None
     result = registry or LoRARegistry()
     if tensor_loader is None:
         result._register_source(source)
     result.metadata.update(metadata)
-    generic_scale = 1.0 if scale is None else float(scale)
+    if scheduling_owner is None:
+        # A standalone generic load retains the legacy metadata-driven Turbo behavior.  Pipeline
+        # stack callers pass False for auxiliary/ordinary sources and True only for the explicit
+        # scheduling owner.  Loading into an otherwise empty caller-provided registry is also
+        # treated as the legacy first-source case.
+        scheduling_owner = created_registry or (
+            not result._sources
+            and result.adapter_count == 0
+            and result.scheduling_metadata is None
+        )
+    if scheduling_owner:
+        source_identity = source.identity if tensor_loader is None else None
+        result.bind_scheduling_owner(source_identity=source_identity, metadata=metadata)
+    if adapter_name_prefix is not None:
+        if not isinstance(adapter_name_prefix, str) or not adapter_name_prefix.strip():
+            raise LoRAError("adapter name prefix must be a non-empty string")
+        adapter_name_prefix = adapter_name_prefix.strip()
+    try:
+        generic_scale = 1.0 if scale is None else float(scale)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise LoRAError("generic LoRA runtime scale must be numeric and finite") from exc
+    if isinstance(scale, bool) or not math.isfinite(generic_scale):
+        raise LoRAError("generic LoRA runtime scale must be finite")
     pairs: dict[tuple[str, str], dict[str, Any]] = defaultdict(dict)
     unrecognized: list[str] = []
     for key, tensor in payload.items():
@@ -1708,13 +1952,18 @@ def load_lora_safetensors(
         alpha = global_alpha
         for alpha_key in _ALPHA_MARKERS.intersection(pair):
             alpha = _scalar(_materialize_tensor(pair[alpha_key]), f"{target}.{alpha_key}")
+        registered_name = (
+            named_adapter
+            if adapter_name_prefix is None
+            else f"{adapter_name_prefix}:{named_adapter}"
+        )
         result.register(
             target,
             pair[next(iter(down_keys))],
             pair[next(iter(up_keys))],
             alpha=alpha,
             scale=generic_scale,
-            adapter_name=named_adapter,
+            adapter_name=registered_name,
             metadata=metadata,
             source_identity=(source.identity if tensor_loader is None else None),
         )

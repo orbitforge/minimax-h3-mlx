@@ -22,6 +22,8 @@ from minimax_h3_mlx.lora import (
     LIGHTX_DEFAULT_VARIANT,
     LIGHTX_TASK_REF2VA,
     LIGHTX_VARIANTS,
+    LoRAError,
+    LoRAStack,
 )
 from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
 from minimax_h3_mlx.transformer_routing import (
@@ -89,6 +91,21 @@ def main() -> int:
     )
     parser.add_argument("--lora-scale", type=float, default=1.0,
                         help="global LoRA multiplier (default: 1.0)")
+    parser.add_argument(
+        "--additional-lora",
+        dest="additional_lora_paths",
+        action="append",
+        default=[],
+        help="auxiliary generic/style LoRA source; repeat to build an ordered stack",
+    )
+    parser.add_argument(
+        "--additional-lora-scale",
+        dest="additional_lora_scales",
+        action="append",
+        type=float,
+        default=[],
+        help="independent scale for each --additional-lora, in the same order (default: 1.0)",
+    )
     parser.add_argument("--turbo", action="store_true",
                         help="use the Turbo schedule; requires an attached Turbo or LightX adapter")
     parser.add_argument("--turbo-steps", type=int, default=None,
@@ -137,6 +154,25 @@ def main() -> int:
     if turbo and lora_path is None and args.lightx_path is None:
         parser.error("--turbo requires --turbo-lora (or a generic --lora adapter)")
 
+    auxiliary_paths = list(args.additional_lora_paths)
+    auxiliary_scales = list(args.additional_lora_scales)
+    if not auxiliary_scales:
+        auxiliary_scales = [1.0] * len(auxiliary_paths)
+    if args.lora_path and not turbo:
+        auxiliary_paths.insert(0, args.lora_path)
+        auxiliary_scales.insert(0, args.lora_scale)
+    try:
+        LoRAStack.from_sources(
+            scheduling_path=(
+                args.lightx_path if args.lightx_path is not None else (lora_path if turbo else None)
+            ),
+            scheduling_scale=args.lora_scale,
+            auxiliary_paths=tuple(auxiliary_paths),
+            auxiliary_scales=(tuple(auxiliary_scales) if auxiliary_scales else None),
+        )
+    except (LoRAError, ValueError, TypeError) as exc:
+        parser.error(str(exc))
+
     if lightx_manifest is not None and lightx_manifest.task == LIGHTX_TASK_REF2VA:
         try:
             resolve_manifest_transformer(
@@ -169,6 +205,10 @@ def main() -> int:
         lightx_path=args.lightx_path,
         lightx_manifest=lightx_manifest,
         lora_scale=args.lora_scale,
+        additional_lora_paths=tuple(args.additional_lora_paths),
+        additional_lora_scales=(
+            tuple(args.additional_lora_scales) if args.additional_lora_scales else None
+        ),
         turbo=turbo,
         turbo_steps=args.turbo_steps,
         conditioning_artifact=args.conditioning_artifact,
