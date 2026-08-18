@@ -891,12 +891,36 @@ _TARGET_WRAPPER_SCOPES: tuple[tuple[str, ...], ...] = (
 )
 _MAX_TARGET_WRAPPER_SCOPES = len(_TARGET_WRAPPER_SCOPES)
 
+_FLATTENED_H3_TARGET = re.compile(
+    r"^lora_unet_blocks_(?P<index>0|[1-9]|[1-4]\d)_(?P<projection>"
+    r"attn_qkv_proj|attn_out_proj|mlp_fc1|mlp_fc2)$"
+)
+_FLATTENED_H3_PROJECTIONS = {
+    "attn_qkv_proj": "attn.qkv_proj",
+    "attn_out_proj": "attn.out_proj",
+    "mlp_fc1": "mlp.fc1",
+    "mlp_fc2": "mlp.fc2",
+}
+_H3_MAIN_BLOCK_COUNT = 50
+
 
 def _known_target_wrapper_scope(segments: list[str]) -> tuple[str, ...] | None:
     for scope in _TARGET_WRAPPER_SCOPES:
         if tuple(segments[: len(scope)]) == scope:
             return scope
     return None
+
+
+def _canonical_flattened_h3_target(target: str) -> str | None:
+    """Map only the bounded flattened H3MT/network exporter target grammar."""
+    match = _FLATTENED_H3_TARGET.fullmatch(target)
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    if index >= _H3_MAIN_BLOCK_COUNT:
+        return None
+    projection = _FLATTENED_H3_PROJECTIONS[match.group("projection")]
+    return f"blocks.{index}.{projection}"
 
 
 def canonical_target(target: str) -> str:
@@ -907,12 +931,19 @@ def canonical_target(target: str) -> str:
     therefore repeated only across the explicit, bounded wrapper set above; an
     unknown leading scope remains visible and is not silently stripped.  The
     exact ``transformer_blocks`` component is then mapped to the local ``blocks``
-    component.
+    component.  The H3MT/networks exporter also emits one exact flattened target
+    grammar; only its four demonstrated main-transformer projections in blocks
+    ``0..49`` are expanded to local H3 paths.
     """
     if not isinstance(target, str) or not target.strip():
         raise LoRAError(f"LoRA target must be a non-empty string, got {target!r}")
 
-    segments = target.strip().split(".")
+    normalized_target = target.strip()
+    flattened = _canonical_flattened_h3_target(normalized_target)
+    if flattened is not None:
+        return flattened
+
+    segments = normalized_target.split(".")
     for _ in range(_MAX_TARGET_WRAPPER_SCOPES):
         scope = _known_target_wrapper_scope(segments)
         if scope is None:

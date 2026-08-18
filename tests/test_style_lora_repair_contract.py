@@ -59,6 +59,42 @@ def test_diffusion_model_targets_canonicalize_to_local_h3_paths() -> None:
     assert canonical_target("diffusion_model.blocks.49.mlp.fc2") == "blocks.49.mlp.fc2"
 
 
+def test_flattened_h3_targets_canonicalize_only_exact_bounded_projections() -> None:
+    expected = {
+        "lora_unet_blocks_0_attn_qkv_proj": "blocks.0.attn.qkv_proj",
+        "lora_unet_blocks_3_attn_qkv_proj": "blocks.3.attn.qkv_proj",
+        "lora_unet_blocks_10_attn_out_proj": "blocks.10.attn.out_proj",
+        "lora_unet_blocks_25_mlp_fc1": "blocks.25.mlp.fc1",
+        "lora_unet_blocks_49_mlp_fc2": "blocks.49.mlp.fc2",
+    }
+    for flattened, local in expected.items():
+        assert canonical_target(flattened) == local
+        assert is_h3_compatible_target(flattened)
+
+    malformed = (
+        "lora_unet_blocks_10_attn_unknown",
+        "lora_unet_blocks_10_mlp_fc3",
+        "lora_unet_blocks_50_attn_qkv_proj",
+        "lora_unet_blocks_03_attn_qkv_proj",
+        "lora_unet_token_refiner_blocks_0_attn_qkv_proj",
+        "lora_unet_something_else",
+        "exporter_lora_unet_blocks_10_attn_qkv_proj",
+    )
+    for target in malformed:
+        assert canonical_target(target) == target
+        assert not is_h3_compatible_target(target)
+
+
+def test_flattened_h3_target_uses_generic_loader_and_h3_admission() -> None:
+    registry = load_lora_payload(_pair_payload("lora_unet_blocks_10_attn_qkv_proj"))
+
+    assert registry.targets == ("blocks.10.attn.qkv_proj",)
+    assert registry.has("blocks.10.attn.qkv_proj")
+    report = validate_h3_lora_compatibility(registry, adapter_path="/tmp/flattened.safetensors")
+    assert report.compatible_targets == ("blocks.10.attn.qkv_proj",)
+    assert report.incompatible_targets == ()
+
+
 def test_known_wrapper_composition_is_deterministic_and_bounded() -> None:
     expected = "blocks.3.mlp.fc1"
     for target in (
