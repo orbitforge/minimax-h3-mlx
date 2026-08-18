@@ -20,7 +20,7 @@ Current production capabilities include:
 
 - native Apple Silicon MLX MiniMax H3 runtime;
 - streamed-AdaLN Q6 transformer path;
-- canonical Qwen conditioning and conditioning-artifact replay;
+- canonical Qwen conditioning and the existing text-only conditioning-artifact replay boundary;
 - experimental Heretic state-28 text encoder path;
 - generic LoRA support;
 - LightX2V Turbo adapters;
@@ -177,9 +177,53 @@ Visual quality is judged by the operator. Numerical metrics are diagnostic evide
 
 ---
 
+## Slice 021D - Flattened H3 LoRA Exporter Compatibility
+
+**Status:** Complete — host accepted. See [the Slice 021D closeout](slice-021d-flattened-h3-lora-targets-closeout.md).
+
+### Objective
+
+Accept one proven, bounded flattened MiniMax-H3 LoRA exporter namespace at the
+existing H3 target-normalization seam. The accepted forms map the four main
+transformer projection targets for blocks `0..49` into the local `blocks.<n>`
+namespace and remain fail-closed for unknown forms.
+
+### Evidence
+
+- both real 188-target H3MT files passed the MLX-free admission proof with
+  `188/188` compatible targets and lazy A/B payload references;
+- both files completed successful host Render Lab T2V runs with four
+  transformer forwards; and
+- LightX 4-Step v0.1 remained the scheduling owner while each H3MT file was an
+  auxiliary model delta at scale `1.0` on the streamed-AdaLN path.
+
+This slice does not claim a complete 208-target topology, optimal scale,
+visual superiority, or mathematical equivalence between the two files.
+
+---
+
+## Slice 021E - Render Lab Conditioning Artifact Replay
+
+**Status:** Next bounded target.
+
+### Initial scope
+
+- optional manually entered conditioning-artifact `.npz` path;
+- Canonical Qwen T2V only;
+- validate the artifact against the prompt and checkpoint before H3 launch;
+- pass `--conditioning-artifact` to `generate.py`;
+- skip Qwen on valid replay; and
+- record artifact identity in run evidence.
+
+The managed conditioning-artifact library is future work, not part of Slice
+021E. It may later include a managed directory, `index.json` catalog,
+dropdown selection, automatic caching, and artifact auto-generation.
+
+---
+
 ## Slice 022 - LoRA Render Lab UX and Evidence Polish
 
-**Status:** Next development slice.
+**Status:** Next development slice after Slice 021E.
 
 Only after stacking is proven.
 
