@@ -223,6 +223,7 @@ class FakeModulationCache:
         self.events = events
         self.tables = [(mx.array([7.0]),)]
         self.timesteps = mx.array([0.0])
+        self.lora_identity = None
 
     def materialize(self) -> None:
         self.events.append("cache_materialize")
@@ -336,9 +337,9 @@ def run_fake_generation(images: bool, verbose: bool = False) -> list[str]:
             events.append("audio_decode")
             return np.zeros((2, 4), dtype=np.float32)
 
-        def release(attr, label, verbose):
+        def release(attr, label, verbose, purge_reason=None):
             events.append(f"{attr}_release")
-            return original_release(attr, label, verbose)
+            return original_release(attr, label, verbose, purge_reason)
 
         pipe._prepare_conditioning = prepare
         pipe._ensure_cache = cache
@@ -348,7 +349,7 @@ def run_fake_generation(images: bool, verbose: bool = False) -> list[str]:
         pipe._decode_video = decode_video
         pipe._decode_audio = decode_audio
         pipe._release_component = release
-        pipe._build_schedules = lambda steps: (FakeSchedule(), FakeSchedule())
+        pipe._build_schedules = lambda steps, turbo_schedule=None: (FakeSchedule(), FakeSchedule())
         pipe._row_timestep_plan = lambda *args: (
             mx.array([0.0]),
             [mx.zeros((4,), dtype=mx.int32), mx.zeros((4,), dtype=mx.int32)],
