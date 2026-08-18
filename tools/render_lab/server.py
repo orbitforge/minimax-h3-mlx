@@ -38,6 +38,7 @@ from tools.render_lab.runner import (  # noqa: E402
     T2V,
     UploadedImage,
     history_rows,
+    parse_additional_loras_payload,
     resolve_output_root,
 )
 
@@ -73,7 +74,11 @@ pre { min-height: 120px; max-height: 330px; overflow: auto; background: #17191d;
 video { width: min(100%, 720px); border-radius: 9px; background: #111; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { border-bottom: 1px solid #e3e6ea; padding: 9px 7px; text-align: left; vertical-align: top; }
 .small { font-size: 12px; } .warning { padding: 10px; border-radius: 9px; background: #fff2cc; color: #6e5200; margin-top: 12px; }
+.lora-row { display: grid; grid-template-columns: minmax(0, 1fr) 140px auto; gap: 10px; align-items: end; margin: 10px 0; }
+.lora-row label { margin: 0 0 6px; }
+.secondary { background: #e9edf2; color: #1d1f23; }
 @media (max-width: 700px) { .grid, .grid.three { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .lora-row { grid-template-columns: 1fr; } }
 @media (prefers-color-scheme: dark) {
  body { background: #16181b; color: #f4f5f7; } .card, input, select, textarea { background: #24272c; border-color: #424750; }
  .pill { background: #3a3e45; } .pill.ok { background: #164b27; color: #c9f4d3; } .pill.bad { background: #5c2222; color: #ffd4d4; }
@@ -125,13 +130,14 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
   </div>
   <div class="grid three">
     <div><label for="turbo-preset">Turbo preset</label><select id="turbo-preset"></select><div id="turbo-preset-details" class="meta"></div></div>
-    <div><label><input id="lora-enabled" type="checkbox"> Enable reference LoRA</label><div class="small">Manual adapter behavior is retained only for None / Reference.</div></div>
-    <div><label for="lora-path">Reference LoRA path</label><input id="lora-path" type="text" spellcheck="false" placeholder="/path/to/adapter.safetensors"></div>
+    <div class="meta">Turbo owns scheduling, adapter family, runtime variant, scheduler shifts, and NFE.</div>
+    <div class="meta">Additional LoRAs contribute model deltas only and keep their own scales.</div>
   </div>
-  <div class="grid three">
-    <div><label for="lora-scale">Reference LoRA scale</label><input id="lora-scale" type="number" min="0" step="0.01" value="1.0"><div class="small">Curated Turbo presets use their validated fixed scale.</div></div>
-    <div class="meta">Selecting a Turbo preset owns its adapter family, runtime variant, scheduler shifts, and NFE.</div>
-    <div class="meta">The effective configuration is shown here before launch and persisted in the run record.</div>
+  <div>
+    <label>Additional LoRAs</label>
+    <div id="additional-lora-rows"></div>
+    <button id="add-additional-lora" class="secondary" type="button" onclick="addAdditionalLora()">+ Add LoRA</button>
+    <div class="small">Rows are serialized in display order. Remove a row to omit it from the request.</div>
   </div>
   <div class="grid three">
     <div><label for="output-root">Output root</label><input id="output-root" spellcheck="false"></div>
@@ -233,7 +239,46 @@ function updateTextEncoderControls() {
     $('text-encoder-hint').textContent = selected ? selected.hint : 'Canonical Qwen3-VL is the default H3 conditioning path.';
   }
 }
-let referenceControlState = null;
+let additionalLoras = [];
+let normalStepsBeforeTurbo = null;
+function htmlEscape(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[character]));
+}
+function syncAdditionalLoraRows() {
+  for (const [index, row] of additionalLoras.entries()) {
+    const path = $(`additional-lora-path-${index}`);
+    const scale = $(`additional-lora-scale-${index}`);
+    if (path) row.path = path.value;
+    if (scale) row.scale = scale.value;
+  }
+}
+function renderAdditionalLoraRows() {
+  const container = $('additional-lora-rows');
+  container.innerHTML = additionalLoras.map((row, index) => `
+    <div class="lora-row" data-index="${index}">
+      <div><label for="additional-lora-path-${index}">Path</label><input id="additional-lora-path-${index}" type="text" spellcheck="false" placeholder="/path/to/style.safetensors" value="${htmlEscape(row.path)}"></div>
+      <div><label for="additional-lora-scale-${index}">Scale</label><input id="additional-lora-scale-${index}" type="number" min="0" step="0.01" value="${htmlEscape(row.scale)}"></div>
+      <button class="secondary remove-additional-lora" type="button" data-index="${index}">Remove</button>
+    </div>`).join('');
+  for (const button of container.querySelectorAll('.remove-additional-lora')) {
+    button.onclick = () => removeAdditionalLora(Number(button.dataset.index));
+  }
+}
+function addAdditionalLora() {
+  syncAdditionalLoraRows();
+  additionalLoras.push({path: '', scale: '1.0'});
+  renderAdditionalLoraRows();
+  $(`additional-lora-path-${additionalLoras.length - 1}`).focus();
+}
+function removeAdditionalLora(index) {
+  syncAdditionalLoraRows();
+  additionalLoras.splice(index, 1);
+  renderAdditionalLoraRows();
+}
+function selectedAdditionalLoras() {
+  syncAdditionalLoraRows();
+  return additionalLoras.map(row => ({path: row.path, scale: row.scale}));
+}
 function selectedTurboPreset() {
   const id = $('turbo-preset').value;
   return (config.turbo_presets || []).find(item => item.id === id) || null;
@@ -251,42 +296,19 @@ function updateTurboPresetDetails() {
   const asset = preset.logical_asset ? ` · asset ${preset.logical_asset}` : '';
   $('turbo-preset-details').textContent = `${preset.label} · ${preset.summary}${asset}${scale}${scheduler}${variant}${geometry}`;
 }
-function updateReferenceLoraControls() {
-  const enabled = $('lora-enabled').checked;
-  $('lora-path').disabled = !enabled;
-  $('lora-scale').disabled = !enabled;
-}
 function updateTurboPresetControls() {
   const preset = selectedTurboPreset();
   const selected = Boolean(preset && preset.id !== 'none');
-  if (selected && referenceControlState === null) {
-    referenceControlState = {
-      loraEnabled: $('lora-enabled').checked,
-      loraPath: $('lora-path').value,
-      loraScale: $('lora-scale').value,
-      steps: $('steps').value,
-    };
-  }
   if (selected) {
-    $('lora-enabled').checked = true;
-    $('lora-enabled').disabled = true;
-    $('lora-path').value = preset.adapter_asset_path || '';
-    $('lora-path').disabled = true;
-    $('lora-scale').value = preset.default_scale;
-    $('lora-scale').disabled = true;
+    if (normalStepsBeforeTurbo === null) normalStepsBeforeTurbo = $('steps').value;
     $('steps').value = preset.nfe;
     $('steps').disabled = true;
   } else {
-    if (referenceControlState !== null) {
-      $('lora-enabled').checked = referenceControlState.loraEnabled;
-      $('lora-path').value = referenceControlState.loraPath;
-      $('lora-scale').value = referenceControlState.loraScale;
-      $('steps').value = referenceControlState.steps;
-      referenceControlState = null;
+    if (normalStepsBeforeTurbo !== null) {
+      $('steps').value = normalStepsBeforeTurbo;
+      normalStepsBeforeTurbo = null;
     }
-    $('lora-enabled').disabled = false;
     $('steps').disabled = false;
-    updateReferenceLoraControls();
   }
   updateTurboPresetDetails();
 }
@@ -373,9 +395,7 @@ async function renderJob() {
   form.set('steps', $('steps').value); form.set('duration_seconds', $('duration').value); form.set('seed', $('seed').value);
   form.set('output_root', $('output-root').value); form.set('output_name', $('output-name').value);
   form.set('turbo_preset_id', $('turbo-preset').value);
-  form.set('lora_enabled', String($('lora-enabled').checked));
-  form.set('lora_path', $('lora-path').value);
-  form.set('lora_scale', $('lora-scale').value);
+  form.set('additional_loras', JSON.stringify(selectedAdditionalLoras()));
   form.set('turbo_enabled', 'false');
   form.set('turbo_steps', '');
   if (mode !== 'T2V' && $('image1').files[0]) form.append('image1', $('image1').files[0]);
@@ -409,13 +429,11 @@ async function boot() {
     $(axis).oninput = () => syncDimensionFromNumber(axis);
   }
   $('steps').value = config.defaults.steps; $('duration').value = config.defaults.duration_seconds; $('seed').value = config.defaults.seed;
-  $('lora-enabled').checked = Boolean(config.defaults.lora_enabled);
-  $('lora-path').value = config.defaults.lora_path || '';
-  $('lora-scale').value = config.defaults.lora_scale;
+  additionalLoras = (config.defaults.additional_loras || []).map(row => ({path: row.path || '', scale: row.scale ?? '1.0'}));
+  renderAdditionalLoraRows();
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
   $('mode').onchange = updateMode;
   $('text-encoder').onchange = updateTextEncoderControls;
-  $('lora-enabled').onchange = updateReferenceLoraControls;
   $('turbo-preset').onchange = updateTurboPresetControls;
   updateTurboPresetControls(); updateMode(); updateGeometry();
   $('runtime').textContent = `Checkpoint: ${config.runtime.checkpoint_root} · Transformer: ${config.runtime.transformer_path || 'from checkpoint'} · generator: ${config.runtime.generator}`;
@@ -441,7 +459,7 @@ def send_json(handler: BaseHTTPRequestHandler, payload: object, status: int = 20
     handler.wfile.write(body)
 
 
-def _submission(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], list[UploadedImage]]:
+def _submission(handler: BaseHTTPRequestHandler) -> tuple[dict[str, object], list[UploadedImage]]:
     content_type = handler.headers.get("Content-Type", "")
     length = int(handler.headers.get("Content-Length", "0"))
     if length > 100 * 1024 * 1024:
@@ -457,7 +475,7 @@ def _submission(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], list[U
             f"Content-Length: {length}\r\n\r\n"
         ).encode("utf-8") + body
         parsed = BytesParser(policy=email_default).parsebytes(envelope)
-        fields = {}
+        fields: dict[str, object] = {}
         uploads = []
         for item in parsed.iter_parts():
             name = item.get_param("name", header="content-disposition")
@@ -477,7 +495,7 @@ def _submission(handler: BaseHTTPRequestHandler) -> tuple[dict[str, str], list[U
         raise RenderValidationError("Request body is not valid JSON or multipart form data") from exc
     if not isinstance(value, dict):
         raise RenderValidationError("Request body must be an object")
-    return {str(key): str(item) for key, item in value.items()}, []
+    return {str(key): item for key, item in value.items()}, []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -587,6 +605,7 @@ class Handler(BaseHTTPRequestHandler):
                 lora_enabled=fields.get("lora_enabled", "false"),
                 lora_path=fields.get("lora_path") or None,
                 lora_scale=fields.get("lora_scale", "1.0"),
+                additional_loras=parse_additional_loras_payload(fields.get("additional_loras")),
                 turbo_enabled=fields.get("turbo_enabled", "false"),
                 turbo_steps=fields.get("turbo_steps") or None,
                 turbo_preset_id=fields.get("turbo_preset_id") or None,

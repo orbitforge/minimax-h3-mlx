@@ -65,6 +65,23 @@ semantics, and NFE. The Render Lab emits the matching `--steps` and `--turbo-ste
 rejects mismatched manual requests. The 768p preset displays `1344 × 768 native/recommended` but
 does not silently change geometry.
 
+### Additional LoRAs
+
+Turbo selection is independent from the browser's Additional LoRAs collection. The operator can
+add zero or more ordered rows, edit each path and scale, and remove rows before launch. `None /
+Reference` keeps the same collection available, and selecting a Turbo preset does not overwrite it.
+
+Each submitted row is emitted through the Slice 021A production contract as:
+
+```text
+--additional-lora PATH --additional-lora-scale SCALE
+```
+
+The flags repeat in row order. Removed rows are not emitted, and admission rejects empty paths,
+invalid or nonfinite scales, duplicate sources, and a scheduling source reused as an auxiliary
+source. Immutable run config records the ordered auxiliary paths/scales separately from the Turbo
+scheduling owner.
+
 The normal Render Lab transformer is the canonical streamed-AdaLN Q6 directory
 `minimax-h3-mlx-6bit-streamed-adaln`. The repository has no host asset manifest, so the five
 curated adapter paths resolve narrowly under the checkout's sibling `work/models` directory and

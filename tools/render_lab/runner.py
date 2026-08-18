@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -45,6 +46,7 @@ from .encoder_catalog import (
     text_encoder_payload,
     validate_text_encoder_selection,
 )
+from minimax_h3_mlx.lora import LoRAError, LoRAStack
 from .turbo_presets import (
     HOST_ASSET_MANIFEST_NOTE,
     HOST_ASSET_MANIFEST_STATUS,
@@ -105,6 +107,43 @@ class RenderBusyError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class AdditionalLoRA:
+    """One ordered, non-scheduling LoRA row submitted by Render Lab."""
+
+    path: str | Path | None
+    scale: object = 1.0
+
+
+def parse_additional_loras_payload(value: object) -> tuple[AdditionalLoRA, ...]:
+    """Decode the browser/API collection without applying runtime admission policy."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ()
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RenderValidationError("Additional LoRAs must be a JSON array") from exc
+    if not isinstance(value, (list, tuple)):
+        raise RenderValidationError("Additional LoRAs must be a JSON array")
+
+    entries: list[AdditionalLoRA] = []
+    for index, item in enumerate(value):
+        if isinstance(item, AdditionalLoRA):
+            entries.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            raise RenderValidationError(f"Additional LoRA row {index + 1} must be an object")
+        path = item.get("path")
+        if path is not None and not isinstance(path, (str, Path)):
+            raise RenderValidationError(f"Additional LoRA row {index + 1} path must be a string")
+        entries.append(AdditionalLoRA(path=path, scale=item.get("scale", 1.0)))
+    return tuple(entries)
+
+
+@dataclass(frozen=True)
 class RenderRequest:
     mode: str
     prompt: str
@@ -122,6 +161,7 @@ class RenderRequest:
     lora_enabled: bool = False
     lora_path: str | Path | None = None
     lora_scale: float = 1.0
+    additional_loras: tuple[AdditionalLoRA, ...] = ()
     turbo_enabled: bool = False
     turbo_steps: int | str | None = None
     turbo_preset_id: str | None = None
@@ -149,6 +189,17 @@ class RenderRequest:
                 if self.lora_path is None or not str(self.lora_path).strip()
                 else Path(self.lora_path).expanduser()
             ),
+            additional_loras=tuple(
+                replace(
+                    entry,
+                    path=(
+                        None
+                        if entry.path is None or not str(entry.path).strip()
+                        else Path(entry.path).expanduser()
+                    ),
+                )
+                for entry in parse_additional_loras_payload(self.additional_loras)
+            ),
             turbo_preset_id=(
                 None
                 if self.turbo_preset_id is None or not str(self.turbo_preset_id).strip()
@@ -174,6 +225,8 @@ class ValidatedRequest:
     checkpoint_root: Path
     transformer_path: Path | None
     turbo_preset: TurboPreset | None
+    scheduling_adapter_path: Path | None
+    additional_loras: tuple[AdditionalLoRA, ...]
     heretic_assets: Any | None = None
 
 
@@ -354,13 +407,14 @@ def _validate_lora_controls(
     request: RenderRequest,
     *,
     check_runtime_paths: bool,
+    turbo_preset_selected: bool,
 ) -> tuple[bool, Path | None, float, bool, int | None]:
     lora_enabled = _coerce_bool(request.lora_enabled, "LoRA enabled")
     turbo_enabled = _coerce_bool(request.turbo_enabled, "Turbo enabled")
     if not lora_enabled:
-        if turbo_enabled:
+        if turbo_enabled and not turbo_preset_selected:
             raise RenderValidationError("Turbo mode requires LoRA to be enabled with an adapter path")
-        return False, None, 1.0, False, None
+        return False, None, 1.0, turbo_enabled, None
 
     if request.lora_path is None or not str(request.lora_path).strip():
         raise RenderValidationError("LoRA is enabled but no adapter path was provided")
@@ -381,7 +435,7 @@ def _validate_lora_controls(
         raise RenderValidationError("LoRA scale must be a finite nonnegative number")
 
     turbo_steps = _coerce_integer(request.turbo_steps, "Turbo steps") if turbo_enabled else None
-    if turbo_enabled:
+    if turbo_enabled and not turbo_preset_selected:
         if turbo_steps is not None and not MIN_INFERENCE_STEPS <= turbo_steps <= MAX_INFERENCE_STEPS:
             raise RenderValidationError(
                 f"Turbo steps must be between {MIN_INFERENCE_STEPS} and {MAX_INFERENCE_STEPS}"
@@ -391,6 +445,57 @@ def _validate_lora_controls(
                 "Turbo mode requires ordinary inference steps and Turbo steps to agree"
             )
     return True, lora_path, lora_scale, turbo_enabled, turbo_steps
+
+
+def _resolve_lora_path(value: object, label: str, *, check_runtime_paths: bool) -> Path:
+    if value is None or not str(value).strip():
+        raise RenderValidationError(f"{label} is enabled but no adapter path was provided")
+    try:
+        resolved = Path(value).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError) as exc:
+        raise RenderValidationError(f"{label} path is not a valid filesystem path") from exc
+    if check_runtime_paths and (not resolved.is_file() or not os.access(resolved, os.R_OK)):
+        raise RenderValidationError(f"{label} path is not a readable file: {resolved}")
+    return resolved
+
+
+def _coerce_lora_scale(value: object, label: str) -> float:
+    if isinstance(value, bool):
+        raise RenderValidationError(f"{label} must be a finite nonnegative number")
+    try:
+        scale = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RenderValidationError(f"{label} must be a finite nonnegative number") from exc
+    if not math.isfinite(scale) or scale < 0:
+        raise RenderValidationError(f"{label} must be a finite nonnegative number")
+    return scale
+
+
+def _validate_additional_loras(
+    entries: Sequence[AdditionalLoRA],
+    *,
+    scheduling_path: Path | None,
+    check_runtime_paths: bool,
+) -> tuple[AdditionalLoRA, ...]:
+    validated: list[AdditionalLoRA] = []
+    for index, entry in enumerate(entries):
+        path = _resolve_lora_path(
+            entry.path,
+            f"Additional LoRA row {index + 1}",
+            check_runtime_paths=check_runtime_paths,
+        )
+        scale = _coerce_lora_scale(entry.scale, f"Additional LoRA row {index + 1} scale")
+        validated.append(AdditionalLoRA(path=path, scale=scale))
+
+    try:
+        LoRAStack.from_sources(
+            scheduling_path=scheduling_path,
+            auxiliary_paths=tuple(entry.path for entry in validated),
+            auxiliary_scales=tuple(float(entry.scale) for entry in validated),
+        )
+    except (LoRAError, ValueError, TypeError) as exc:
+        raise RenderValidationError(str(exc)) from exc
+    return tuple(validated)
 
 
 def _validate_turbo_preset(
@@ -585,17 +690,28 @@ def validate_render_request(
         repo_root=repo_root,
         check_runtime_paths=check_runtime_paths,
     )
-    if turbo_preset is None:
-        lora_enabled, lora_path, lora_scale, turbo_enabled, turbo_steps = _validate_lora_controls(
-            request,
-            check_runtime_paths=check_runtime_paths,
-        )
-    else:
-        lora_enabled = True
-        lora_path = turbo_asset_path
-        lora_scale = turbo_preset.default_scale
-        turbo_enabled = True
-        turbo_steps = turbo_preset.nfe
+    lora_enabled, lora_path, lora_scale, legacy_turbo_enabled, legacy_turbo_steps = _validate_lora_controls(
+        request,
+        check_runtime_paths=check_runtime_paths,
+        turbo_preset_selected=turbo_preset is not None,
+    )
+    legacy_lora_is_scheduling = turbo_preset is None and legacy_turbo_enabled
+    scheduling_adapter_path = turbo_asset_path if turbo_preset is not None else (
+        lora_path if legacy_lora_is_scheduling else None
+    )
+    additional_inputs = list(request.additional_loras)
+    if lora_enabled and not legacy_lora_is_scheduling:
+        # The old single ordinary-LoRA fields remain accepted as a compatibility bridge.  A
+        # selected Turbo preset turns that bridge into an auxiliary entry; the preset path above
+        # remains the sole scheduling owner.
+        additional_inputs.insert(0, AdditionalLoRA(path=lora_path, scale=lora_scale))
+    additional_loras = _validate_additional_loras(
+        additional_inputs,
+        scheduling_path=scheduling_adapter_path,
+        check_runtime_paths=check_runtime_paths,
+    )
+    turbo_enabled = turbo_preset is not None or legacy_turbo_enabled
+    turbo_steps = turbo_preset.nfe if turbo_preset is not None else legacy_turbo_steps
     image_paths = tuple(Path(value) for value in request.image_paths)
     anchors = anchors_for_mode(request.mode, len(image_paths))
     explicit_dimensions = width is not None and height is not None
@@ -645,6 +761,7 @@ def validate_render_request(
         lora_enabled=lora_enabled,
         lora_path=lora_path,
         lora_scale=lora_scale,
+        additional_loras=additional_loras,
         turbo_enabled=turbo_enabled,
         turbo_steps=turbo_steps,
         turbo_preset_id=turbo_preset.preset_id if turbo_preset is not None else None,
@@ -660,6 +777,8 @@ def validate_render_request(
         checkpoint_root=checkpoint_root,
         transformer_path=transformer_path,
         turbo_preset=turbo_preset,
+        scheduling_adapter_path=scheduling_adapter_path,
+        additional_loras=additional_loras,
         heretic_assets=heretic_assets,
     )
 
@@ -708,26 +827,49 @@ def build_generation_command(
         command.extend(["--image", str(image_path), "--anchor", anchor])
     if validated.turbo_preset is not None:
         preset = validated.turbo_preset
+        if validated.scheduling_adapter_path is None:
+            raise RenderValidationError("Turbo preset has no scheduling adapter path")
         command.extend([
             preset.adapter_flag,
-            str(request.lora_path),
+            str(validated.scheduling_adapter_path),
             "--lora-scale",
             _format_float(preset.default_scale),
         ])
         if preset.runtime_variant is not None:
             command.extend(["--lightx-variant", preset.runtime_variant])
         command.extend(["--turbo-steps", str(preset.nfe)])
+    elif request.turbo_enabled:
+        if not request.lora_enabled or validated.scheduling_adapter_path is None:
+            raise RenderValidationError("Turbo mode has no scheduling adapter path")
+        command.extend([
+            "--lora",
+            str(validated.scheduling_adapter_path),
+            "--lora-scale",
+            _format_float(request.lora_scale),
+        ])
+        command.append("--turbo")
+        if request.turbo_steps is not None:
+            command.extend(["--turbo-steps", str(request.turbo_steps)])
     elif request.lora_enabled:
+        # Preserve the pre-021B direct ordinary-LoRA route for callers that still construct the
+        # legacy RenderRequest fields.  Browser-created rows use the repeated auxiliary route.
         command.extend([
             "--lora",
             str(request.lora_path),
             "--lora-scale",
             _format_float(request.lora_scale),
         ])
-        if request.turbo_enabled:
-            command.append("--turbo")
-            if request.turbo_steps is not None:
-                command.extend(["--turbo-steps", str(request.turbo_steps)])
+
+    auxiliary_loras = validated.additional_loras
+    if request.lora_enabled and validated.turbo_preset is None and not request.turbo_enabled:
+        auxiliary_loras = auxiliary_loras[1:]
+    for entry in auxiliary_loras:
+        command.extend([
+            "--additional-lora",
+            str(entry.path),
+            "--additional-lora-scale",
+            _format_float(float(entry.scale)),
+        ])
     return command
 
 
@@ -846,10 +988,25 @@ def _read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, A
     return value if isinstance(value, dict) else ({} if default is None else default)
 
 
+def _additional_lora_evidence(validated: ValidatedRequest) -> list[dict[str, Any]]:
+    return [
+        {
+            "order": index,
+            "enabled": True,
+            "path": str(entry.path),
+            "scale": float(entry.scale),
+            "role": "auxiliary-model-delta",
+        }
+        for index, entry in enumerate(validated.additional_loras)
+    ]
+
+
 def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
     request = validated.request
     preset = validated.turbo_preset
     if preset is not None:
+        if validated.scheduling_adapter_path is None:
+            raise RenderValidationError("Turbo preset has no scheduling adapter evidence")
         return {
             "selected": True,
             "preset_id": preset.preset_id,
@@ -859,9 +1016,10 @@ def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
             "logical_asset": preset.logical_asset,
             "adapter_asset": {
                 "flag": preset.adapter_flag,
-                "path": str(request.lora_path),
+                "path": str(validated.scheduling_adapter_path),
                 "logical_asset": preset.logical_asset,
             },
+            "scheduling_owner": "turbo-preset",
             "effective_nfe": preset.nfe,
             "runtime_variant": preset.runtime_variant,
             "runtime_contract": preset.runtime_contract,
@@ -879,6 +1037,9 @@ def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
         }
 
     effective_nfe = request.turbo_steps if request.turbo_enabled and request.turbo_steps is not None else request.steps
+    if request.turbo_enabled and validated.scheduling_adapter_path is None:
+        raise RenderValidationError("Legacy Turbo has no scheduling adapter evidence")
+    legacy_turbo = bool(request.turbo_enabled)
     return {
         "selected": False,
         "preset_id": None,
@@ -886,15 +1047,24 @@ def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
         "role": "Reference",
         "family": None,
         "logical_asset": None,
-        "adapter_asset": {
-            "flag": "--lora" if request.lora_enabled else None,
-            "path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
-            "logical_asset": None,
-        },
+        "adapter_asset": (
+            {
+                "flag": "--lora",
+                "path": str(validated.scheduling_adapter_path),
+                "logical_asset": None,
+            }
+            if legacy_turbo
+            else None
+        ),
+        "scheduling_owner": "legacy-turbo-adapter" if legacy_turbo else "none-reference",
         "effective_nfe": effective_nfe,
         "runtime_variant": None,
-        "runtime_contract": "existing non-Turbo / manual LoRA behavior",
-        "effective_scale": request.lora_scale if request.lora_enabled else None,
+        "runtime_contract": (
+            "legacy manual Turbo scheduling behavior"
+            if legacy_turbo
+            else "existing non-Turbo / manual LoRA behavior"
+        ),
+        "effective_scale": float(request.lora_scale) if legacy_turbo else None,
         "effective_scheduler": {
             "video_shift": 12.0,
             "audio_shift": 3.0,
@@ -1042,6 +1212,7 @@ def build_render_config(
         }
         for path, anchor in zip(validated.image_paths, validated.anchors)
     ]
+    additional_loras = _additional_lora_evidence(validated)
     return {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_identifier": namespace.run_id,
@@ -1060,6 +1231,7 @@ def build_render_config(
         "lora_enabled": request.lora_enabled,
         "lora_path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
         "lora_scale": float(request.lora_scale) if request.lora_enabled else None,
+        "additional_loras": additional_loras,
         "turbo_enabled": request.turbo_enabled,
         "turbo_steps": request.turbo_steps,
         "turbo_preset_id": request.turbo_preset_id,
@@ -1067,6 +1239,15 @@ def build_render_config(
             "enabled": request.lora_enabled,
             "path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
             "scale": float(request.lora_scale) if request.lora_enabled else None,
+            "compatibility_surface": "legacy-single-adapter-fields",
+        },
+        "auxiliary_lora_stack": {
+            "ordered": additional_loras,
+            "scheduling_owner": (
+                "turbo-preset"
+                if validated.turbo_preset is not None
+                else ("legacy-turbo-adapter" if request.turbo_enabled else "none-reference")
+            ),
         },
         "turbo": {
             **_turbo_evidence(validated),
@@ -1798,6 +1979,7 @@ class RenderController:
                                 if validated.request.lora_enabled
                                 else None
                             ),
+                            "additional_loras": _additional_lora_evidence(validated),
                             "turbo_enabled": validated.request.turbo_enabled,
                             "turbo_steps": validated.request.turbo_steps,
                             "turbo_preset_id": validated.request.turbo_preset_id,
@@ -1805,6 +1987,18 @@ class RenderController:
                                 **_turbo_evidence(validated),
                                 "enabled": validated.request.turbo_enabled,
                                 "steps": validated.request.turbo_steps,
+                            },
+                            "auxiliary_lora_stack": {
+                                "ordered": _additional_lora_evidence(validated),
+                                "scheduling_owner": (
+                                    "turbo-preset"
+                                    if validated.turbo_preset is not None
+                                    else (
+                                        "legacy-turbo-adapter"
+                                        if validated.request.turbo_enabled
+                                        else "none-reference"
+                                    )
+                                ),
                             },
                             "resolution": {
                                 "preset_id": validated.preset.preset_id,
@@ -1900,6 +2094,7 @@ class RenderController:
                 "lora_enabled": False,
                 "lora_path": "",
                 "lora_scale": 1.0,
+                "additional_loras": [],
                 "turbo_enabled": False,
                 "turbo_steps": 8,
                 "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
