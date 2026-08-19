@@ -204,16 +204,26 @@ visual superiority, or mathematical equivalence between the two files.
 
 ## Slice 021E - Render Lab Conditioning Artifact Replay
 
-**Status:** Next bounded target.
+**Status:** Complete — host accepted. See [the Slice 021E closeout](slice-021e-conditioning-artifact-replay-closeout.md).
 
-### Initial scope
+### Delivered scope
 
 - optional manually entered conditioning-artifact `.npz` path;
 - Canonical Qwen T2V only;
-- validate the artifact against the prompt and checkpoint before H3 launch;
+- validate artifact, prompt, and checkpoint provenance before H3 launch;
 - pass `--conditioning-artifact` to `generate.py`;
-- skip Qwen on valid replay; and
-- record artifact identity in run evidence.
+- skip Qwen and live prompt encoding on valid replay; and
+- record artifact identity and tensor evidence in run evidence.
+
+### Evidence
+
+- focused MLX-free contracts passed `63/63`, with `py_compile`, embedded
+  browser JavaScript `node --check`, and implementation `git diff --check`
+  also passing;
+- the canonical `hidden_states[50]` artifact was replayed with identity and
+  tensor evidence preserved; and
+- the bounded host replay succeeded with four transformer forwards and
+  `SLICE_021E_HOST_ACCEPTANCE=PASS`.
 
 The managed conditioning-artifact library is future work, not part of Slice
 021E. It may later include a managed directory, `index.json` catalog,
@@ -221,9 +231,46 @@ dropdown selection, automatic caching, and artifact auto-generation.
 
 ---
 
+## Slice 021F - FL2V Storyboard Chain + Simple Card UI
+
+**Status:** Next implementation slice.
+
+### Phase-one intent
+
+- new Storyboard mode in Render Lab;
+- ordered image cards;
+- Finder image selection using the existing image-selection pattern;
+- drag/drop image input using the existing image-drop pattern;
+- thumbnail preview for each card;
+- obvious sequential numbering;
+- adjacent pair derivation (`1 -> 2`, `2 -> 3`, `3 -> 4`, and so on);
+- shared generation settings across all segments;
+- sequential FL2V rendering, one segment at a time;
+- hard runtime unload/release between segments;
+- per-segment outputs and evidence; and
+- simple overall storyboard progress/status.
+
+Phase-one exclusions:
+
+- per-transition duration;
+- per-transition prompts;
+- per-transition generation settings;
+- sophisticated timeline editor;
+- automatic final MP4 concatenation;
+- managed conditioning-artifact library;
+- artifact catalog/index implementation;
+- SQLite/database work;
+- automatic conditioning-artifact discovery; and
+- automatic conditioning-artifact generation.
+
+Card reordering may be considered only if it remains trivially bounded; it is
+not required for phase one.
+
+---
+
 ## Slice 022 - LoRA Render Lab UX and Evidence Polish
 
-**Status:** Next development slice after Slice 021E.
+**Status:** Later development slice after Slice 021F.
 
 Only after stacking is proven.
 
