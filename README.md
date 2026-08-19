@@ -633,8 +633,13 @@ The canonical local runtime paths are:
 
 ```text
 H3_CHECKPOINT_ROOT=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/checkpoints/minimax-h3-fl2va
-H3_TRANSFORMER=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit
+H3_TRANSFORMER=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln
 ```
+
+Normal/current Render Lab operation uses the streamed-AdaLN Q6 transformer
+shown above. Historical original-checkpoint paths elsewhere in this document
+remain source inputs for forge and probe examples, not the current canonical
+Render Lab transformer.
 
 ### Turbo LoRA adapters
 

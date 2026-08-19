@@ -233,22 +233,22 @@ dropdown selection, automatic caching, and artifact auto-generation.
 
 ## Slice 021F - FL2V Storyboard Chain + Simple Card UI
 
-**Status:** Next implementation slice.
+**Status:** Complete — host accepted. See [the Slice 021F closeout](slice-021f-fl2v-storyboard-closeout.md).
 
-### Phase-one intent
+### Delivered scope
 
-- new Storyboard mode in Render Lab;
-- ordered image cards;
-- Finder image selection using the existing image-selection pattern;
-- drag/drop image input using the existing image-drop pattern;
-- thumbnail preview for each card;
-- obvious sequential numbering;
-- adjacent pair derivation (`1 -> 2`, `2 -> 3`, `3 -> 4`, and so on);
-- shared generation settings across all segments;
-- sequential FL2V rendering, one segment at a time;
-- hard runtime unload/release between segments;
-- per-segment outputs and evidence; and
-- simple overall storyboard progress/status.
+- Storyboard mode in Render Lab with ordered image cards;
+- Finder/file-picker selection, drag/drop input, thumbnails, visible numbering,
+  and card removal;
+- exact adjacent-card derivation (`1 -> 2`, `2 -> 3`, `3 -> 4`, and so on);
+- shared global render settings across all segments;
+- sequential FL2V rendering with one independent child process per segment;
+- parent-local segment videos and evidence with unique internal child run IDs;
+- storyboard manifest, status, and simple overall progress evidence; and
+- live Canonical Qwen image/text conditioning on the streamed-AdaLN Q6 path.
+
+For `N` cards, the delivered workflow produces `N - 1` FL2V segments. Each
+child exits and finalizes its evidence before the next adjacent pair launches.
 
 Phase-one exclusions:
 
@@ -263,8 +263,30 @@ Phase-one exclusions:
 - automatic conditioning-artifact discovery; and
 - automatic conditioning-artifact generation.
 
-Card reordering may be considered only if it remains trivially bounded; it is
-not required for phase one.
+Card reordering was not part of the delivered phase-one contract.
+
+### Evidence and boundaries
+
+- Focused storyboard contracts passed `11/11`.
+- Surrounding Render Lab validation passed; changed-Python compilation,
+  embedded browser JavaScript syntax checking, and the implementation
+  whitespace check also passed.
+- The accepted host storyboard used live Canonical Qwen3-VL conditioning,
+  three cards, two sequential FL2V segments, 512 × 512 geometry, five
+  seconds per segment, seed `1701`, LightX FL2V Turbo 4-step, the streamed-
+  AdaLN Q6 transformer, no additional LoRAs, and no external conditioning
+  artifact replay.
+- Both segments succeeded with exit code `0`; the recorded evidence showed
+  four transformer forwards per segment and no observed overlap between the
+  sequential child runs.
+- Streamed-AdaLN Q6 remains canonical. A stale README path was reconciled to
+  that production path; the separate legacy local browser launcher still
+  references the removed resident transformer and remains deferred future
+  runtime-safety debt. It was not modified by this slice closeout.
+
+Deferred progress/logging polish remains future work. This slice does not add
+continuous live child-output streaming, explicit pending-segment records, or
+richer per-segment progress.
 
 ---
 
