@@ -74,10 +74,17 @@ FORBIDDEN_TRANSFORMER_NAME = "minimax-h3-mlx-6bit"
 T2V = "T2V"
 I2V = "I2V"
 FIRST_LAST = "FIRST_LAST"
+SINGLE_RENDER_WORKFLOW = "SINGLE_RENDER"
+FL2V_STORYBOARD_WORKFLOW = "FL2V_STORYBOARD"
+FL2V_STORYBOARD_SEGMENT_WORKFLOW = "FL2V_STORYBOARD_SEGMENT"
 MODE_LABELS = {
     T2V: "T2V — prompt only",
     I2V: "I2V — one image, first-frame anchor",
     FIRST_LAST: "First + last frame — two images",
+}
+WORKFLOW_LABELS = {
+    SINGLE_RENDER_WORKFLOW: "Single render",
+    FL2V_STORYBOARD_WORKFLOW: "FL2V storyboard",
 }
 
 MIN_DURATION_SECONDS = 5.0
@@ -159,6 +166,28 @@ def parse_additional_loras_payload(value: object) -> tuple[AdditionalLoRA, ...]:
     return tuple(entries)
 
 
+def parse_storyboard_card_paths(value: object) -> tuple[str | Path, ...]:
+    """Decode ordered storyboard card paths without applying filesystem admission policy."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ()
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RenderValidationError("Storyboard cards must be a JSON array") from exc
+    if not isinstance(value, (list, tuple)):
+        raise RenderValidationError("Storyboard cards must be a JSON array")
+    cards: list[str | Path] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, (str, Path)):
+            raise RenderValidationError(f"Storyboard card {index + 1} path must be a string")
+        cards.append(item)
+    return tuple(cards)
+
+
 @dataclass(frozen=True)
 class RenderRequest:
     mode: str
@@ -183,12 +212,15 @@ class RenderRequest:
     turbo_preset_id: str | None = None
     text_encoder_id: str = CANONICAL_ENCODER_ID
     conditioning_artifact_path: str | Path | None = None
+    workflow: str = SINGLE_RENDER_WORKFLOW
+    storyboard_card_paths: tuple[str | Path, ...] = ()
 
     def normalized(self) -> "RenderRequest":
         return replace(
             self,
             mode=str(self.mode).upper(),
             prompt=str(self.prompt),
+            workflow=(str(self.workflow or SINGLE_RENDER_WORKFLOW).strip().upper()),
             resolution_id=(
                 None
                 if self.resolution_id is None or not str(self.resolution_id).strip()
@@ -232,6 +264,10 @@ class RenderRequest:
                 if self.conditioning_artifact_path is None or not str(self.conditioning_artifact_path).strip()
                 else Path(str(self.conditioning_artifact_path).strip()).expanduser()
             ),
+            storyboard_card_paths=tuple(
+                Path(value).expanduser() if isinstance(value, (str, Path)) else value
+                for value in parse_storyboard_card_paths(self.storyboard_card_paths)
+            ),
         )
 
 
@@ -255,47 +291,75 @@ class ValidatedRequest:
 
 
 @dataclass(frozen=True)
+class ValidatedStoryboardRequest:
+    """Validated global settings plus the ordered cards for a phase-one storyboard."""
+
+    request: RenderRequest
+    card_paths: tuple[Path, ...]
+    shared: ValidatedRequest | None = None
+    card_source_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StoryboardSegmentJob:
+    """One sequential first/last-frame child job derived from adjacent cards."""
+
+    segment_index: int
+    start_card_index: int
+    end_card_index: int
+    start_path: Path
+    end_path: Path
+    request: RenderRequest
+
+
+@dataclass(frozen=True)
 class RunNamespace:
     run_id: str
     run_dir: Path
     output_path: Path
     created_at: str
+    artifact_prefix: str | None = None
+
+    def _artifact_path(self, prefixed_name: str, ordinary_name: str) -> Path:
+        return self.run_dir / (
+            f"{self.artifact_prefix}.{prefixed_name}" if self.artifact_prefix else ordinary_name
+        )
 
     @property
     def config_path(self) -> Path:
-        return self.run_dir / "render-config.json"
+        return self._artifact_path("config.json", "render-config.json")
 
     @property
     def benchmark_path(self) -> Path:
-        return self.run_dir / "benchmark.json"
+        return self._artifact_path("benchmark.json", "benchmark.json")
 
     @property
     def status_path(self) -> Path:
-        return self.run_dir / "run-status.json"
+        return self._artifact_path("status.json", "run-status.json")
 
     @property
     def stdout_path(self) -> Path:
-        return self.run_dir / "stdout.log"
+        return self._artifact_path("stdout.log", "stdout.log")
 
     @property
     def stderr_path(self) -> Path:
-        return self.run_dir / "stderr.log"
+        return self._artifact_path("stderr.log", "stderr.log")
 
     @property
     def telemetry_dir(self) -> Path:
-        return self.run_dir / "telemetry"
+        return self._artifact_path("telemetry", "telemetry")
 
     @property
     def conditioning_artifact_path(self) -> Path:
-        return self.run_dir / "conditioning-artifact.npz"
+        return self._artifact_path("conditioning-artifact.npz", "conditioning-artifact.npz")
 
     @property
     def encoder_evidence_path(self) -> Path:
-        return self.run_dir / "heretic-encoder-evidence.json"
+        return self._artifact_path("heretic-encoder-evidence.json", "heretic-encoder-evidence.json")
 
     @property
     def encoder_release_path(self) -> Path:
-        return self.run_dir / "heretic-release-evidence.json"
+        return self._artifact_path("heretic-release-evidence.json", "heretic-release-evidence.json")
 
 
 @dataclass(frozen=True)
@@ -742,6 +806,12 @@ def validate_render_request(
     verify_runtime_geometry: bool = True,
 ) -> ValidatedRequest:
     request = request.normalized()
+    if request.workflow != SINGLE_RENDER_WORKFLOW:
+        raise RenderValidationError(
+            "Storyboard requests must use validate_storyboard_request before child admission"
+        )
+    if request.storyboard_card_paths:
+        raise RenderValidationError("Single renders do not accept storyboard card paths")
     if request.conditioning_artifact_path is not None:
         if request.mode != T2V:
             raise RenderValidationError("External conditioning artifact replay is currently T2V-only")
@@ -862,6 +932,122 @@ def validate_render_request(
         heretic_assets=heretic_assets,
         conditioning_artifact_path=conditioning_artifact_path,
         conditioning_artifact_evidence=conditioning_artifact_evidence,
+    )
+
+
+def _normalize_storyboard_card_paths(value: object) -> tuple[Path, ...]:
+    cards: list[Path] = []
+    raw_cards = parse_storyboard_card_paths(value)
+    if len(raw_cards) < 2:
+        raise RenderValidationError("FL2V storyboard requires at least 2 cards")
+    for index, raw in enumerate(raw_cards, start=1):
+        if not str(raw).strip() or "\x00" in str(raw):
+            raise RenderValidationError(f"Storyboard card {index} path must be non-empty")
+        try:
+            cards.append(Path(raw).expanduser().resolve(strict=False))
+        except (OSError, TypeError, ValueError) as exc:
+            raise RenderValidationError(f"Storyboard card {index} path is not valid") from exc
+    return tuple(cards)
+
+
+def validate_storyboard_request(
+    request: RenderRequest,
+    card_paths: object | None = None,
+    *,
+    card_source_names: Sequence[str] | None = None,
+    repo_root: Path = REPO_ROOT,
+    check_runtime_paths: bool = False,
+    check_images: bool = True,
+    verify_runtime_geometry: bool = True,
+) -> ValidatedStoryboardRequest:
+    """Validate a storyboard before any segment child is launched."""
+    normalized = request.normalized()
+    if normalized.workflow != FL2V_STORYBOARD_WORKFLOW:
+        raise RenderValidationError(
+            f"Storyboard validation requires workflow {FL2V_STORYBOARD_WORKFLOW!r}"
+        )
+    if normalized.mode != FIRST_LAST:
+        raise RenderValidationError("FL2V storyboard segments require FIRST_LAST mode")
+    if normalized.image_paths:
+        raise RenderValidationError("Storyboard cards must be supplied as an ordered card list")
+    cards = _normalize_storyboard_card_paths(
+        normalized.storyboard_card_paths if card_paths is None else card_paths
+    )
+    source_names = tuple(str(name).strip() for name in (card_source_names or ()))
+    if source_names and len(source_names) != len(cards):
+        raise RenderValidationError("Storyboard card source-name count must match card count")
+    if any(not name for name in source_names):
+        raise RenderValidationError("Storyboard card source names must be non-empty")
+    if check_images:
+        cards = tuple(validate_image_path(path) for path in cards)
+
+    storyboard_request = replace(
+        normalized,
+        image_paths=(),
+        storyboard_card_paths=cards,
+    )
+    shared_request = replace(
+        storyboard_request,
+        workflow=SINGLE_RENDER_WORKFLOW,
+        image_paths=(cards[0], cards[1]),
+        storyboard_card_paths=(),
+    )
+    shared = validate_render_request(
+        shared_request,
+        repo_root=repo_root,
+        check_runtime_paths=check_runtime_paths,
+        check_images=check_images,
+        verify_runtime_geometry=verify_runtime_geometry,
+    )
+    return ValidatedStoryboardRequest(
+        request=storyboard_request,
+        card_paths=cards,
+        shared=shared,
+        card_source_names=source_names,
+    )
+
+
+def build_storyboard_segment_jobs(
+    request: RenderRequest | ValidatedStoryboardRequest,
+    card_paths: object | None = None,
+) -> tuple[StoryboardSegmentJob, ...]:
+    """Build exactly one ordinary FIRST_LAST child request for every adjacent card pair."""
+    if isinstance(request, ValidatedStoryboardRequest):
+        validated = request
+    else:
+        normalized = request.normalized()
+        if normalized.workflow != FL2V_STORYBOARD_WORKFLOW:
+            raise RenderValidationError(
+                f"Storyboard job construction requires workflow {FL2V_STORYBOARD_WORKFLOW!r}"
+            )
+        cards = _normalize_storyboard_card_paths(
+            normalized.storyboard_card_paths if card_paths is None else card_paths
+        )
+        validated = ValidatedStoryboardRequest(
+            request=replace(normalized, image_paths=(), storyboard_card_paths=cards),
+            card_paths=cards,
+        )
+    base_request = validated.request
+    if base_request.mode != FIRST_LAST:
+        raise RenderValidationError("FL2V storyboard segments require FIRST_LAST mode")
+    return tuple(
+        StoryboardSegmentJob(
+            segment_index=index,
+            start_card_index=index,
+            end_card_index=index + 1,
+            start_path=start_path,
+            end_path=end_path,
+            request=replace(
+                base_request,
+                workflow=SINGLE_RENDER_WORKFLOW,
+                image_paths=(start_path, end_path),
+                storyboard_card_paths=(),
+            ),
+        )
+        for index, (start_path, end_path) in enumerate(
+            zip(validated.card_paths, validated.card_paths[1:]),
+            start=1,
+        )
     )
 
 
@@ -1291,6 +1477,94 @@ def reserve_run_namespace(validated: ValidatedRequest) -> RunNamespace:
     raise RuntimeError("Could not reserve a unique immutable Render Lab run directory")
 
 
+def reserve_storyboard_namespace(output_root: Path) -> RunNamespace:
+    """Reserve a normal run-shaped parent namespace whose artifact is the storyboard manifest."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(20):
+        now = _utc_now()
+        run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:10]}"
+        run_dir = output_root / run_id
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        namespace = RunNamespace(
+            run_id=run_id,
+            run_dir=run_dir,
+            output_path=run_dir / "storyboard-manifest.json",
+            created_at=iso_timestamp(now),
+        )
+        (run_dir / "inputs").mkdir()
+        namespace.telemetry_dir.mkdir()
+        namespace.stdout_path.touch()
+        namespace.stderr_path.touch()
+        _write_json(namespace.benchmark_path, {
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "run_id": namespace.run_id,
+            "workflow": FL2V_STORYBOARD_WORKFLOW,
+            "status": "pending",
+        })
+        write_status(namespace, "reserved", workflow=FL2V_STORYBOARD_WORKFLOW)
+        return namespace
+    raise RuntimeError("Could not reserve a unique Render Lab storyboard namespace")
+
+
+def storyboard_segment_output_name(output_name: str, segment_index: int) -> str:
+    """Derive one collision-safe, ordered segment filename from the requested base name."""
+    if segment_index < 1:
+        raise RenderValidationError("Storyboard segment index must be positive")
+    name = validate_output_name(output_name)
+    path = Path(name)
+    return f"{path.stem}-{segment_index:02d}{path.suffix}"
+
+
+def reserve_storyboard_segment_namespace(
+    parent: RunNamespace,
+    validated: ValidatedRequest,
+    segment_index: int,
+) -> RunNamespace:
+    """Reserve a uniquely identified child namespace without creating a child directory."""
+    output_name = storyboard_segment_output_name(validated.request.output_name, segment_index)
+    artifact_prefix = Path(output_name).stem
+    namespace = RunNamespace(
+        run_id=f"{parent.run_id}-segment-{segment_index:02d}",
+        run_dir=parent.run_dir,
+        output_path=parent.run_dir / output_name,
+        created_at=iso_timestamp(),
+        artifact_prefix=artifact_prefix,
+    )
+    paths = (
+        namespace.output_path,
+        namespace.config_path,
+        namespace.benchmark_path,
+        namespace.status_path,
+        namespace.stdout_path,
+        namespace.stderr_path,
+        namespace.telemetry_dir,
+    )
+    if any(path.exists() for path in paths):
+        raise RuntimeError(f"Storyboard segment artifact collision: {output_name}")
+    namespace.telemetry_dir.mkdir()
+    namespace.stdout_path.touch()
+    namespace.stderr_path.touch()
+    _write_json(namespace.benchmark_path, {
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "run_id": namespace.run_id,
+        "workflow": FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+        "parent_run_id": parent.run_id,
+        "segment_index": segment_index,
+        "status": "pending",
+    })
+    write_status(
+        namespace,
+        "reserved",
+        workflow=FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+        parent_run_id=parent.run_id,
+        segment_index=segment_index,
+    )
+    return namespace
+
+
 def _stage_uploads(namespace: RunNamespace, uploads: Sequence[UploadedImage]) -> tuple[Path, ...]:
     paths: list[Path] = []
     for index, upload in enumerate(uploads, start=1):
@@ -1300,6 +1574,42 @@ def _stage_uploads(namespace: RunNamespace, uploads: Sequence[UploadedImage]) ->
         path = namespace.run_dir / "inputs" / f"image-{index:02d}{suffix}"
         with path.open("xb") as handle:
             handle.write(upload.data)
+        paths.append(validate_image_path(path))
+    return tuple(paths)
+
+
+def _stage_storyboard_uploads(
+    namespace: RunNamespace,
+    uploads: Sequence[UploadedImage],
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for index, upload in enumerate(uploads, start=1):
+        filename = str(upload.filename).strip()
+        if not filename:
+            raise RenderValidationError(f"Storyboard card {index} has no filename")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in IMAGE_SUFFIXES:
+            suffix = ".img"
+        path = namespace.run_dir / "inputs" / f"card-{index:02d}{suffix}"
+        with path.open("xb") as handle:
+            handle.write(upload.data)
+        paths.append(validate_image_path(path))
+    return tuple(paths)
+
+
+def _stage_storyboard_paths(
+    namespace: RunNamespace,
+    card_paths: Sequence[str | Path],
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for index, raw_path in enumerate(card_paths, start=1):
+        source = validate_image_path(raw_path)
+        suffix = source.suffix.lower()
+        if suffix not in IMAGE_SUFFIXES:
+            suffix = ".img"
+        path = namespace.run_dir / "inputs" / f"card-{index:02d}{suffix}"
+        with source.open("rb") as source_handle, path.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle)
         paths.append(validate_image_path(path))
     return tuple(paths)
 
@@ -1326,6 +1636,7 @@ def build_render_config(
         "schema_version": RUN_SCHEMA_VERSION,
         "run_identifier": namespace.run_id,
         "timestamp": namespace.created_at,
+        "workflow": request.workflow,
         "generation_mode": request.mode,
         "generation_mode_label": MODE_LABELS.get(request.mode, request.mode),
         "prompt": request.prompt,
@@ -1416,6 +1727,149 @@ def build_render_config(
     }
 
 
+def _storyboard_shared_settings(validated: ValidatedRequest) -> dict[str, Any]:
+    """Serialize only settings shared by every adjacent-card child run."""
+    request = validated.request
+    return {
+        "mode": request.mode,
+        "prompt": request.prompt,
+        "resolution_id": request.resolution_id,
+        "width": validated.width,
+        "height": validated.height,
+        "duration_seconds": float(request.duration_seconds),
+        "seed": request.seed,
+        "seed_behavior": "same global seed applied to each segment",
+        "inference_steps": request.steps,
+        "text_encoder_id": request.text_encoder_id,
+        "conditioning_artifact_path": (
+            str(validated.conditioning_artifact_path)
+            if validated.conditioning_artifact_path is not None
+            else None
+        ),
+        "turbo_preset_id": request.turbo_preset_id,
+        "turbo": _turbo_evidence(validated),
+        "lora_enabled": request.lora_enabled,
+        "lora_path": str(request.lora_path) if request.lora_enabled and request.lora_path else None,
+        "lora_scale": float(request.lora_scale) if request.lora_enabled else None,
+        "additional_loras": _additional_lora_evidence(validated),
+        "output_root": str(validated.output_root),
+        "output_name": request.output_name,
+    }
+
+
+def _storyboard_card_evidence(
+    card_paths: Sequence[Path],
+    source_names: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for index, path in enumerate(card_paths, start=1):
+        checksum = sha256_file(path) if path.is_file() else None
+        evidence.append({
+            "card_index": index,
+            "source_path": str(path),
+            "source_name": source_names[index - 1] if source_names else path.name,
+            "sha256": checksum,
+            "identity": checksum,
+        })
+    return evidence
+
+
+def build_storyboard_config(
+    validated: ValidatedStoryboardRequest,
+    namespace: RunNamespace,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
+    """Build the parent run config for a sequential FL2V storyboard."""
+    if validated.shared is None:
+        raise RenderValidationError("Storyboard parent config requires validated global settings")
+    shared = validated.shared
+    return {
+        "schema_version": RUN_SCHEMA_VERSION,
+        "run_identifier": namespace.run_id,
+        "timestamp": namespace.created_at,
+        "workflow": FL2V_STORYBOARD_WORKFLOW,
+        "generation_mode": FIRST_LAST,
+        "generation_mode_label": "FL2V storyboard — sequential first/last-frame segments",
+        "output_root": str(shared.output_root),
+        "output_name": shared.request.output_name,
+        "output_path": str(namespace.output_path),
+        "storyboard": {
+            "manifest_path": str(namespace.output_path),
+            "card_count": len(validated.card_paths),
+            "segment_count": len(validated.card_paths) - 1,
+            "cards": _storyboard_card_evidence(validated.card_paths, validated.card_source_names),
+            "shared_global_settings": _storyboard_shared_settings(shared),
+            "execution": {
+                "isolation": "one child render process per segment",
+                "ordering": "sequential adjacent card pairs",
+                "stop_on_failure": True,
+                "parallel": False,
+            },
+        },
+        "git": _git_identity(repo_root),
+        "runtime_identity": runtime_identity(shared, repo_root),
+    }
+
+
+def _storyboard_manifest(
+    validated: ValidatedStoryboardRequest,
+    namespace: RunNamespace,
+    segments: Sequence[dict[str, Any]],
+    status: str,
+    *,
+    failure_segment_index: int | None = None,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    if validated.shared is None:
+        raise RenderValidationError("Storyboard manifest requires validated global settings")
+    return {
+        "schema_version": 1,
+        "run_id": namespace.run_id,
+        "workflow": FL2V_STORYBOARD_WORKFLOW,
+        "mode": FIRST_LAST,
+        "card_count": len(validated.card_paths),
+        "segment_count": len(validated.card_paths) - 1,
+        "cards": _storyboard_card_evidence(validated.card_paths, validated.card_source_names),
+        "shared_global_settings": _storyboard_shared_settings(validated.shared),
+        "segments": list(segments),
+        "per_segment_run_ids": [item.get("child_run_id") for item in segments],
+        "per_segment_output_paths": [item.get("output_path") for item in segments],
+        "overall_status": status,
+        "status": status,
+        "completed_segment_count": sum(1 for item in segments if item.get("success")),
+        "failure_segment_index": failure_segment_index,
+        "failure_reason": failure_reason,
+        "execution": {
+            "isolation": "one child render process per segment",
+            "ordering": "sequential adjacent card pairs",
+            "stop_on_failure": True,
+            "parallel": False,
+        },
+    }
+
+
+def write_storyboard_manifest(
+    validated: ValidatedStoryboardRequest,
+    namespace: RunNamespace,
+    segments: Sequence[dict[str, Any]],
+    status: str,
+    *,
+    failure_segment_index: int | None = None,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    manifest = _storyboard_manifest(
+        validated,
+        namespace,
+        segments,
+        status,
+        failure_segment_index=failure_segment_index,
+        failure_reason=failure_reason,
+    )
+    _write_json(namespace.output_path, manifest)
+    return manifest
+
+
 def initialize_run(namespace: RunNamespace, config: dict[str, Any]) -> None:
     """Write immutable config exactly once for a reserved namespace."""
     if namespace.config_path.exists():
@@ -1438,7 +1892,7 @@ def read_run_snapshot(namespace: RunNamespace) -> dict[str, Any]:
     status = _read_json(namespace.status_path)
     benchmark = _read_json(namespace.benchmark_path)
     config = _read_json(namespace.config_path)
-    return {
+    snapshot = {
         "run_id": namespace.run_id,
         "run_directory": str(namespace.run_dir),
         "output_root": config.get("output_root"),
@@ -1448,6 +1902,24 @@ def read_run_snapshot(namespace: RunNamespace) -> dict[str, Any]:
         "stdout": _tail_text(namespace.stdout_path),
         "stderr": _tail_text(namespace.stderr_path),
     }
+    if config.get("workflow") == FL2V_STORYBOARD_WORKFLOW:
+        manifest = _read_json(namespace.output_path)
+        snapshot["storyboard"] = manifest
+        segments = manifest.get("segments") if isinstance(manifest, dict) else None
+        if isinstance(segments, list) and segments:
+            latest = segments[-1]
+            stdout_path = latest.get("stdout_path")
+            stderr_path = latest.get("stderr_path")
+            if stdout_path and stderr_path:
+                snapshot["stdout"] = _tail_text(Path(str(stdout_path)))
+                snapshot["stderr"] = _tail_text(Path(str(stderr_path)))
+            else:
+                child_directory = latest.get("child_run_directory")
+                if child_directory:
+                    child_dir = Path(str(child_directory))
+                    snapshot["stdout"] = _tail_text(child_dir / "stdout.log")
+                    snapshot["stderr"] = _tail_text(child_dir / "stderr.log")
+    return snapshot
 
 
 def _copy_pipe(pipe: Any, path: Path) -> None:
@@ -1685,6 +2157,82 @@ def _artifact_record(artifact: Path | None) -> dict[str, Any] | None:
     return record
 
 
+def _storyboard_child_artifact_paths(namespace: RunNamespace) -> dict[str, Any]:
+    return {
+        "output_path": str(namespace.output_path),
+        "config_path": str(namespace.config_path),
+        "status_path": str(namespace.status_path),
+        "stdout_path": str(namespace.stdout_path),
+        "stderr_path": str(namespace.stderr_path),
+        "benchmark_path": str(namespace.benchmark_path),
+        "telemetry_dir": str(namespace.telemetry_dir),
+        "telemetry_before_path": str(namespace.telemetry_dir / "before.json"),
+        "telemetry_after_path": str(namespace.telemetry_dir / "after.json"),
+    }
+
+
+def _storyboard_segment_record(
+    job: StoryboardSegmentJob,
+    result: RunResult | None,
+    *,
+    child_namespace: RunNamespace | None = None,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    child_namespace = child_namespace or (result.namespace if result is not None else None)
+    benchmark = result.benchmark if result is not None else {}
+    artifact = _artifact_record(result.output_artifact) if result is not None else None
+    child_status = (
+        _read_json(child_namespace.status_path).get("status")
+        if child_namespace is not None
+        else None
+    )
+    artifact_paths = (
+        _storyboard_child_artifact_paths(child_namespace)
+        if child_namespace is not None
+        else {}
+    )
+    return {
+        "segment_index": job.segment_index,
+        "start_card_index": job.start_card_index,
+        "end_card_index": job.end_card_index,
+        "start_card_path": str(job.start_path),
+        "end_card_path": str(job.end_path),
+        "child_run_id": child_namespace.run_id if child_namespace is not None else None,
+        "child_run_directory": str(child_namespace.run_dir) if child_namespace is not None else None,
+        "child_exit_code": result.exit_code if result is not None else None,
+        "exit_code": result.exit_code if result is not None else None,
+        "child_status": child_status,
+        "success": bool(result is not None and result.success),
+        "output_path": (
+            artifact_paths.get("output_path")
+            if artifact_paths
+            else (artifact.get("path") if artifact else None)
+        ),
+        "output_checksum": artifact.get("sha256") if artifact else None,
+        "config_path": artifact_paths.get("config_path"),
+        "status_path": artifact_paths.get("status_path"),
+        "stdout_path": artifact_paths.get("stdout_path"),
+        "stderr_path": artifact_paths.get("stderr_path"),
+        "benchmark_path": artifact_paths.get("benchmark_path"),
+        "telemetry_dir": artifact_paths.get("telemetry_dir"),
+        "telemetry_before_path": artifact_paths.get("telemetry_before_path"),
+        "telemetry_after_path": artifact_paths.get("telemetry_after_path"),
+        "artifact_paths": artifact_paths,
+        "timing": {
+            "total_elapsed_seconds": benchmark.get("total_elapsed_seconds"),
+            "child_process_elapsed_seconds": benchmark.get("child_process_elapsed_seconds"),
+            "wall_clock_start": benchmark.get("wall_clock_start"),
+            "wall_clock_end": benchmark.get("wall_clock_end"),
+        },
+        "memory": {
+            "peak_mlx_memory_bytes": benchmark.get("peak_mlx_memory_bytes"),
+            "telemetry": benchmark.get("telemetry"),
+            "allocator_release_evidence": benchmark.get("allocator_release_evidence"),
+        },
+        "failure_reason": failure_reason or benchmark.get("failure_reason"),
+    }
+
+
 def _run_encoder_child(
     namespace: RunNamespace,
     command: Sequence[str],
@@ -1914,6 +2462,239 @@ def execute_run(
     return RunResult(namespace, exit_code, success, artifact, benchmark)
 
 
+def execute_storyboard(
+    namespace: RunNamespace,
+    validated: ValidatedStoryboardRequest,
+    *,
+    repo_root: Path = REPO_ROOT,
+    output_root: Path | None = None,
+    telemetry: Callable[[Path], dict[str, Any]] = capture_host_telemetry,
+    command_runner: Callable[..., tuple[int, float, str, str]] | None = None,
+    check_runtime_paths: bool = True,
+) -> RunResult:
+    """Run adjacent FL2V pairs in isolated child processes, stopping at the first failure."""
+    if validated.shared is None:
+        raise RenderValidationError("Storyboard execution requires validated global settings")
+    output_root = output_root or validated.shared.output_root
+    started_wall = _utc_now()
+    started_monotonic = time.perf_counter()
+    jobs = build_storyboard_segment_jobs(validated)
+    segments: list[dict[str, Any]] = []
+    write_status(
+        namespace,
+        "running",
+        workflow=FL2V_STORYBOARD_WORKFLOW,
+        segment_count=len(jobs),
+        completed_segment_count=0,
+    )
+    write_storyboard_manifest(validated, namespace, segments, "running")
+
+    failure_segment_index: int | None = None
+    failure_reason: str | None = None
+    failure_exit_code: int | None = None
+    for job in jobs:
+        write_status(
+            namespace,
+            "running",
+            workflow=FL2V_STORYBOARD_WORKFLOW,
+            segment_index=job.segment_index,
+            start_card_index=job.start_card_index,
+            end_card_index=job.end_card_index,
+            segment_count=len(jobs),
+            completed_segment_count=sum(1 for item in segments if item.get("success")),
+        )
+        child_namespace: RunNamespace | None = None
+        child_result: RunResult | None = None
+        try:
+            assert validated.shared is not None
+            child_namespace = reserve_storyboard_segment_namespace(
+                namespace,
+                validated.shared,
+                job.segment_index,
+            )
+            child_request = replace(
+                job.request,
+                output_name=child_namespace.output_path.name,
+            )
+            child_validated = validate_render_request(
+                child_request,
+                repo_root=repo_root,
+                check_runtime_paths=check_runtime_paths,
+                check_images=True,
+                verify_runtime_geometry=False,
+            )
+            child_command = build_generation_command_for_namespace(child_validated, child_namespace)
+            child_config = build_render_config(
+                child_validated,
+                child_namespace,
+                child_command,
+                repo_root=repo_root,
+            )
+            child_config.update({
+                "workflow": FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                "storyboard": {
+                    "parent_run_id": namespace.run_id,
+                    "segment_index": job.segment_index,
+                    "start_card_index": job.start_card_index,
+                    "end_card_index": job.end_card_index,
+                    "start_card_path": str(job.start_path),
+                    "end_card_path": str(job.end_path),
+                    "child_run_id": child_namespace.run_id,
+                    "artifact_paths": _storyboard_child_artifact_paths(child_namespace),
+                },
+            })
+            initialize_run(child_namespace, child_config)
+            child_result = execute_run(
+                child_namespace,
+                child_command,
+                repo_root=repo_root,
+                output_root=output_root,
+                telemetry=telemetry,
+                command_runner=command_runner,
+            )
+            child_benchmark = dict(child_result.benchmark)
+            child_benchmark.update({
+                "workflow": FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                "parent_run_id": namespace.run_id,
+                "segment_index": job.segment_index,
+                "start_card_index": job.start_card_index,
+                "end_card_index": job.end_card_index,
+                "artifact_paths": _storyboard_child_artifact_paths(child_namespace),
+            })
+            _write_json(child_namespace.benchmark_path, child_benchmark)
+            write_status(
+                child_namespace,
+                "succeeded" if child_result.success else "failed",
+                workflow=FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                parent_run_id=namespace.run_id,
+                segment_index=job.segment_index,
+                start_card_index=job.start_card_index,
+                end_card_index=job.end_card_index,
+                success=child_result.success,
+                exit_code=child_result.exit_code,
+                finished_at=child_benchmark.get("wall_clock_end", iso_timestamp()),
+                output_artifact=_artifact_record(child_result.output_artifact),
+                artifact_paths=_storyboard_child_artifact_paths(child_namespace),
+            )
+        except Exception as exc:
+            failure_reason = str(exc)
+            if child_namespace is not None:
+                if not child_namespace.config_path.exists():
+                    _write_json(child_namespace.config_path, {
+                        "schema_version": RUN_SCHEMA_VERSION,
+                        "run_identifier": child_namespace.run_id,
+                        "timestamp": child_namespace.created_at,
+                        "workflow": FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                        "generation_mode": FIRST_LAST,
+                        "output_root": str(output_root),
+                        "output_path": str(child_namespace.output_path),
+                        "storyboard": {
+                            "parent_run_id": namespace.run_id,
+                            "segment_index": job.segment_index,
+                            "child_run_id": child_namespace.run_id,
+                            "artifact_paths": _storyboard_child_artifact_paths(child_namespace),
+                        },
+                        "admission_failure": failure_reason,
+                    })
+                _write_json(child_namespace.benchmark_path, {
+                    "schema_version": BENCHMARK_SCHEMA_VERSION,
+                    "run_id": child_namespace.run_id,
+                    "workflow": FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                    "parent_run_id": namespace.run_id,
+                    "segment_index": job.segment_index,
+                    "success": False,
+                    "process_exit_code": None,
+                    "failure_reason": failure_reason,
+                    "artifact_paths": _storyboard_child_artifact_paths(child_namespace),
+                })
+                write_status(
+                    child_namespace,
+                    "failed",
+                    workflow=FL2V_STORYBOARD_SEGMENT_WORKFLOW,
+                    parent_run_id=namespace.run_id,
+                    segment_index=job.segment_index,
+                    success=False,
+                    exit_code=None,
+                    failure_reason=failure_reason,
+                    artifact_paths=_storyboard_child_artifact_paths(child_namespace),
+                )
+            child_result = None
+
+        record = _storyboard_segment_record(
+            job,
+            child_result,
+            child_namespace=child_namespace,
+            failure_reason=failure_reason if child_result is None else None,
+        )
+        segments.append(record)
+        if not record["success"]:
+            failure_segment_index = job.segment_index
+            failure_reason = record.get("failure_reason") or "segment child failed"
+            failure_exit_code = record.get("child_exit_code")
+            write_storyboard_manifest(
+                validated,
+                namespace,
+                segments,
+                "failed",
+                failure_segment_index=failure_segment_index,
+                failure_reason=failure_reason,
+            )
+            break
+        write_storyboard_manifest(validated, namespace, segments, "running")
+
+    success = failure_segment_index is None and len(segments) == len(jobs)
+    if success:
+        final_status = "succeeded"
+        final_failure_reason = None
+        final_exit_code = 0
+    else:
+        final_status = "failed"
+        final_failure_reason = failure_reason or "storyboard did not complete"
+        final_exit_code = failure_exit_code if failure_exit_code is not None else 1
+    manifest = write_storyboard_manifest(
+        validated,
+        namespace,
+        segments,
+        final_status,
+        failure_segment_index=failure_segment_index,
+        failure_reason=final_failure_reason,
+    )
+    elapsed = time.perf_counter() - started_monotonic
+    benchmark = {
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "run_id": namespace.run_id,
+        "workflow": FL2V_STORYBOARD_WORKFLOW,
+        "wall_clock_start": iso_timestamp(started_wall),
+        "wall_clock_end": iso_timestamp(),
+        "total_elapsed_seconds": elapsed,
+        "process_exit_code": final_exit_code,
+        "success": success,
+        "segment_count": len(jobs),
+        "completed_segment_count": sum(1 for item in segments if item.get("success")),
+        "segments": segments,
+        "manifest_path": str(namespace.output_path),
+        "output_artifact": None,
+    }
+    if not success:
+        benchmark["failure_reason"] = final_failure_reason
+        benchmark["failure_segment_index"] = failure_segment_index
+    _write_json(namespace.benchmark_path, benchmark)
+    write_status(
+        namespace,
+        final_status,
+        workflow=FL2V_STORYBOARD_WORKFLOW,
+        success=success,
+        exit_code=final_exit_code,
+        segment_count=len(jobs),
+        completed_segment_count=benchmark["completed_segment_count"],
+        failure_segment_index=failure_segment_index,
+        failure_reason=final_failure_reason,
+        manifest_path=str(namespace.output_path),
+        finished_at=benchmark["wall_clock_end"],
+    )
+    return RunResult(namespace, final_exit_code, success, None, benchmark | {"manifest": manifest})
+
+
 class RenderFileLock:
     """A process-level output-root lock so a second render cannot be admitted."""
 
@@ -1976,17 +2757,24 @@ def history_rows(output_root: str | Path, *, limit: int = 25) -> list[dict[str, 
         benchmark = _read_json(run_dir / "benchmark.json")
         if not config:
             continue
+        shared = (config.get("storyboard") or {}).get("shared_global_settings", {})
         artifact = benchmark.get("output_artifact") or {}
         artifact_path = artifact.get("path")
+        workflow = config.get("workflow")
+        display_mode = (
+            workflow
+            if workflow in {FL2V_STORYBOARD_WORKFLOW, FL2V_STORYBOARD_SEGMENT_WORKFLOW}
+            else config.get("generation_mode")
+        )
         rows.append({
             "run_id": run_dir.name,
             "timestamp": config.get("timestamp"),
-            "mode": config.get("generation_mode"),
-            "resolution": f"{config.get('width')} × {config.get('height')}",
-            "width": config.get("width"),
-            "height": config.get("height"),
-            "steps": config.get("inference_steps_requested"),
-            "seed": config.get("seed"),
+            "mode": display_mode,
+            "resolution": f"{config.get('width', shared.get('width'))} × {config.get('height', shared.get('height'))}",
+            "width": config.get("width", shared.get("width")),
+            "height": config.get("height", shared.get("height")),
+            "steps": config.get("inference_steps_requested", shared.get("inference_steps")),
+            "seed": config.get("seed", shared.get("seed")),
             "elapsed_seconds": benchmark.get("total_elapsed_seconds"),
             "status": status.get("status", "unknown"),
             "success": benchmark.get("success"),
@@ -2016,10 +2804,13 @@ class RenderController:
         *,
         uploads: Sequence[UploadedImage] = (),
     ) -> RunNamespace:
+        normalized_request = request.normalized()
+        if normalized_request.workflow == FL2V_STORYBOARD_WORKFLOW:
+            return self.start_storyboard(normalized_request, uploads=uploads)
         with self._state_lock:
             if self._active_thread is not None and self._active_thread.is_alive():
                 raise RenderBusyError("A render is already active")
-            request = request.normalized()
+            request = normalized_request
             # Count validation happens before any child process admission. Uploaded bytes are
             # staged only after a fresh namespace has been reserved.
             submission_count = len(uploads) if uploads else len(request.image_paths)
@@ -2190,6 +2981,157 @@ class RenderController:
             thread.start()
             return namespace
 
+    def start_storyboard(
+        self,
+        request: RenderRequest,
+        *,
+        uploads: Sequence[UploadedImage] = (),
+    ) -> RunNamespace:
+        """Admit a storyboard parent, then execute its ordinary child runs sequentially."""
+        with self._state_lock:
+            if self._active_thread is not None and self._active_thread.is_alive():
+                raise RenderBusyError("A render is already active")
+            request = request.normalized()
+            if request.workflow != FL2V_STORYBOARD_WORKFLOW:
+                raise RenderValidationError(
+                    f"Storyboard admission requires workflow {FL2V_STORYBOARD_WORKFLOW!r}"
+                )
+            if uploads and request.storyboard_card_paths:
+                raise RenderValidationError("Storyboard cards must be supplied as uploads or paths, not both")
+            if uploads:
+                if len(uploads) < 2:
+                    raise RenderValidationError("FL2V storyboard requires at least 2 cards")
+                for index, upload in enumerate(uploads, start=1):
+                    if not str(upload.filename).strip():
+                        raise RenderValidationError(f"Storyboard card {index} has no filename")
+                    if not upload.data:
+                        raise RenderValidationError(f"Storyboard card {index} is empty")
+                preflight_cards = tuple(Path(f"__uploaded_storyboard_card_{index}") for index in range(len(uploads)))
+            else:
+                preflight_cards = request.storyboard_card_paths
+            card_source_names = (
+                tuple(upload.filename for upload in uploads)
+                if uploads
+                else tuple(Path(path).name for path in request.storyboard_card_paths)
+            )
+            validated = validate_storyboard_request(
+                request,
+                preflight_cards,
+                card_source_names=card_source_names,
+                repo_root=self.repo_root,
+                check_runtime_paths=True,
+                check_images=False,
+                verify_runtime_geometry=True,
+            )
+            assert validated.shared is not None
+            output_lock = RenderFileLock(validated.shared.output_root)
+            output_lock.acquire()
+            namespace: RunNamespace | None = None
+            try:
+                namespace = reserve_storyboard_namespace(validated.shared.output_root)
+                staged_paths = (
+                    _stage_storyboard_uploads(namespace, uploads)
+                    if uploads
+                    else _stage_storyboard_paths(namespace, request.storyboard_card_paths)
+                )
+                validated = validate_storyboard_request(
+                    request,
+                    staged_paths,
+                    card_source_names=card_source_names,
+                    repo_root=self.repo_root,
+                    check_runtime_paths=True,
+                    check_images=True,
+                    verify_runtime_geometry=False,
+                )
+                initialize_run(
+                    namespace,
+                    build_storyboard_config(validated, namespace, repo_root=self.repo_root),
+                )
+                write_storyboard_manifest(validated, namespace, (), "reserved")
+            except Exception as exc:
+                if namespace is not None:
+                    if not namespace.config_path.exists():
+                        _write_json(namespace.config_path, {
+                            "schema_version": RUN_SCHEMA_VERSION,
+                            "run_identifier": namespace.run_id,
+                            "timestamp": namespace.created_at,
+                            "workflow": FL2V_STORYBOARD_WORKFLOW,
+                            "generation_mode": FIRST_LAST,
+                            "output_root": str(validated.shared.output_root if validated.shared else request.output_root),
+                            "output_path": str(namespace.output_path),
+                            "admission_failure": str(exc),
+                        })
+                    _write_json(namespace.output_path, {
+                        "schema_version": 1,
+                        "run_id": namespace.run_id,
+                        "workflow": FL2V_STORYBOARD_WORKFLOW,
+                        "overall_status": "failed",
+                        "status": "failed",
+                        "card_count": len(preflight_cards),
+                        "segment_count": max(0, len(preflight_cards) - 1),
+                        "segments": [],
+                        "failure_reason": str(exc),
+                    })
+                    _write_json(namespace.benchmark_path, {
+                        "schema_version": BENCHMARK_SCHEMA_VERSION,
+                        "run_id": namespace.run_id,
+                        "workflow": FL2V_STORYBOARD_WORKFLOW,
+                        "success": False,
+                        "process_exit_code": None,
+                        "failure_reason": str(exc),
+                    })
+                    write_status(
+                        namespace,
+                        "failed",
+                        workflow=FL2V_STORYBOARD_WORKFLOW,
+                        success=False,
+                        failure_reason=str(exc),
+                    )
+                output_lock.release()
+                raise
+            self._active_namespace = namespace
+            self._active_lock = output_lock
+            self._last_result = None
+
+            def worker() -> None:
+                try:
+                    self._last_result = execute_storyboard(
+                        namespace,
+                        validated,
+                        repo_root=self.repo_root,
+                        output_root=validated.shared.output_root if validated.shared else None,
+                    )
+                except Exception as exc:
+                    _write_json(namespace.benchmark_path, {
+                        "schema_version": BENCHMARK_SCHEMA_VERSION,
+                        "run_id": namespace.run_id,
+                        "workflow": FL2V_STORYBOARD_WORKFLOW,
+                        "success": False,
+                        "process_exit_code": None,
+                        "failure_reason": str(exc),
+                    })
+                    write_status(
+                        namespace,
+                        "failed",
+                        workflow=FL2V_STORYBOARD_WORKFLOW,
+                        success=False,
+                        failure_reason=str(exc),
+                    )
+                    self._last_result = RunResult(
+                        namespace,
+                        None,
+                        False,
+                        None,
+                        _read_json(namespace.benchmark_path),
+                    )
+                finally:
+                    output_lock.release()
+
+            thread = threading.Thread(target=worker, name=f"render-lab-storyboard-{namespace.run_id}", daemon=True)
+            self._active_thread = thread
+            thread.start()
+            return namespace
+
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
             if self._active_namespace is None:
@@ -2205,10 +3147,15 @@ class RenderController:
         transformer = default_transformer_path(self.repo_root)
         return {
             "modes": [{"id": mode, "label": MODE_LABELS[mode], "image_count": expected_image_count(mode)} for mode in (T2V, I2V, FIRST_LAST)],
+            "workflows": [
+                {"id": workflow, "label": WORKFLOW_LABELS[workflow]}
+                for workflow in (SINGLE_RENDER_WORKFLOW, FL2V_STORYBOARD_WORKFLOW)
+            ],
             "text_encoders": text_encoder_payload(self.repo_root),
             "resolutions": preset_payload(),
             "turbo_presets": turbo_preset_payload(self.repo_root),
             "defaults": {
+                "workflow": SINGLE_RENDER_WORKFLOW,
                 "output_root": str(DEFAULT_OUTPUT_ROOT.relative_to(self.repo_root)),
                 "output_name": DEFAULT_OUTPUT_NAME,
                 "duration_seconds": DEFAULT_DURATION_SECONDS,
@@ -2226,6 +3173,14 @@ class RenderController:
                 "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
                 "text_encoder_id": CANONICAL_ENCODER_ID,
                 "conditioning_artifact_path": "",
+            },
+            "storyboard_contract": {
+                "workflow": FL2V_STORYBOARD_WORKFLOW,
+                "mode": FIRST_LAST,
+                "minimum_cards": 2,
+                "reordering": "append-order-only",
+                "parallel": False,
+                "child_process_isolation": True,
             },
             "resolution_contract": {
                 "min_dimension": MIN_RESOLUTION,

@@ -35,10 +35,12 @@ from tools.render_lab.runner import (  # noqa: E402
     RenderController,
     RenderRequest,
     RenderValidationError,
+    SINGLE_RENDER_WORKFLOW,
     T2V,
     UploadedImage,
     history_rows,
     parse_additional_loras_payload,
+    parse_storyboard_card_paths,
     resolve_output_root,
 )
 
@@ -76,6 +78,14 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
 .small { font-size: 12px; } .warning { padding: 10px; border-radius: 9px; background: #fff2cc; color: #6e5200; margin-top: 12px; }
 .lora-row { display: grid; grid-template-columns: minmax(0, 1fr) 140px auto; gap: 10px; align-items: end; margin: 10px 0; }
 .lora-row label { margin: 0 0 6px; }
+.storyboard-card { border: 1px dashed #aeb5bf; border-radius: 12px; padding: 12px; margin: 10px 0; transition: background .15s, border-color .15s; }
+.storyboard-card.dragover { border-color: #147ef5; background: #edf6ff; }
+.storyboard-card-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.storyboard-order { font-weight: 700; }
+.storyboard-preview { display: flex; align-items: center; gap: 12px; min-height: 72px; margin: 10px 0; }
+.storyboard-preview img { width: 92px; height: 68px; object-fit: cover; border-radius: 8px; background: #17191d; }
+.storyboard-empty { color: #68707b; font-size: 13px; }
+.storyboard-source { overflow-wrap: anywhere; font-size: 13px; }
 .secondary { background: #e9edf2; color: #1d1f23; }
 @media (max-width: 700px) { .grid, .grid.three { grid-template-columns: 1fr; } }
 @media (max-width: 700px) { .lora-row { grid-template-columns: 1fr; } }
@@ -97,6 +107,9 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
 
 <section class="card">
   <h2>Render controls</h2>
+  <label for="workflow">Workflow</label>
+  <select id="workflow"></select>
+  <div id="workflow-hint" class="meta">Single render keeps the existing T2V, I2V, and first/last-frame modes.</div>
   <label for="mode">Mode</label>
   <select id="mode"></select>
   <label for="prompt">Prompt</label>
@@ -110,6 +123,13 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
   <div class="grid">
     <div id="image1-slot" class="image-slot hidden"><label for="image1">First image</label><input id="image1" type="file" accept="image/*"></div>
     <div id="image2-slot" class="image-slot hidden"><label for="image2">Last image</label><input id="image2" type="file" accept="image/*"></div>
+  </div>
+  <div id="storyboard-panel" class="hidden">
+    <label>Storyboard cards</label>
+    <div class="meta">Cards run in append order. Each adjacent pair becomes one isolated FL2V segment; phase one does not offer per-card overrides or reordering.</div>
+    <div id="storyboard-cards"></div>
+    <button id="add-storyboard-card" class="secondary" type="button" onclick="addStoryboardCard()">+ Add card</button>
+    <div class="small">Add at least two valid image cards. Drop an image onto a card or choose a file.</div>
   </div>
   <div class="grid three">
     <div class="dimension-control">
@@ -211,10 +231,27 @@ function updateGeometry() {
   const tokens = Number.isInteger(lh) && Number.isInteger(lw) ? (lh / patch[1]) * (lw / patch[2]) : null;
   $('geometry').textContent = `${width.value} × ${height.value}` + (tokens ? ` · latent grid ${lh} × ${lw} · ${tokens} spatial tokens/frame` : '');
 }
+function isStoryboardWorkflow() {
+  return $('workflow').value === 'FL2V_STORYBOARD';
+}
+function updateWorkflow() {
+  const storyboard = isStoryboardWorkflow();
+  $('storyboard-panel').classList.toggle('hidden', !storyboard);
+  $('mode').disabled = storyboard;
+  if (storyboard) $('mode').value = 'FIRST_LAST';
+  $('workflow-hint').textContent = storyboard
+    ? 'FL2V storyboard uses each adjacent card pair with the same global render settings and one child process per segment.'
+    : 'Single render keeps the existing T2V, I2V, and first/last-frame modes.';
+  updateMode();
+}
 function updateMode() {
   const mode = $('mode').value;
+  const storyboard = isStoryboardWorkflow();
+  if (storyboard) $('mode').value = 'FIRST_LAST';
   $('image1-slot').classList.toggle('hidden', mode === 'T2V');
   $('image2-slot').classList.toggle('hidden', mode !== 'FIRST_LAST');
+  $('image1-slot').classList.toggle('hidden', storyboard || mode === 'T2V');
+  $('image2-slot').classList.toggle('hidden', storyboard || mode !== 'FIRST_LAST');
   updateTextEncoderControls();
 }
 function selectedTextEncoder() {
@@ -282,6 +319,66 @@ function selectedAdditionalLoras() {
   syncAdditionalLoraRows();
   return additionalLoras.map(row => ({path: row.path, scale: row.scale}));
 }
+let storyboardCards = [{file: null}, {file: null}];
+function storyboardCardPreview(card, index) {
+  if (!card.file) return '<div class="storyboard-empty">Drop an image here or choose a file below.</div>';
+  const preview = URL.createObjectURL(card.file);
+  const source = card.file.webkitRelativePath || card.file.name;
+  return `<img src="${preview}" alt="Storyboard card ${index + 1} thumbnail"><div class="storyboard-source">${htmlEscape(source)}</div>`;
+}
+function renderStoryboardCards() {
+  const container = $('storyboard-cards');
+  container.innerHTML = storyboardCards.map((card, index) => `
+    <div class="storyboard-card" data-index="${index}">
+      <div class="storyboard-card-header"><span class="storyboard-order">Card ${index + 1}</span><button class="secondary remove-storyboard-card" type="button" data-index="${index}">Remove</button></div>
+      <div class="storyboard-preview">${storyboardCardPreview(card, index)}</div>
+      <input id="storyboard-card-file-${index}" type="file" accept="image/*" aria-label="Choose storyboard card ${index + 1}">
+    </div>`).join('');
+  for (const card of container.querySelectorAll('.storyboard-card')) {
+    const index = Number(card.dataset.index);
+    const input = $(`storyboard-card-file-${index}`);
+    input.onchange = () => setStoryboardCard(index, input.files[0]);
+    card.ondragover = event => { event.preventDefault(); card.classList.add('dragover'); };
+    card.ondragleave = () => card.classList.remove('dragover');
+    card.ondrop = event => {
+      event.preventDefault(); card.classList.remove('dragover');
+      setStoryboardCard(index, event.dataTransfer.files[0]);
+    };
+  }
+  for (const button of container.querySelectorAll('.remove-storyboard-card')) {
+    button.onclick = () => removeStoryboardCard(Number(button.dataset.index));
+  }
+}
+function setStoryboardCard(index, file) {
+  if (!file) return;
+  if (!file.type || !file.type.startsWith('image/')) {
+    setStatus('Storyboard cards must be image files', true);
+    return;
+  }
+  storyboardCards[index].file = file;
+  renderStoryboardCards();
+}
+function addStoryboardCard() {
+  storyboardCards.push({file: null});
+  renderStoryboardCards();
+  $(`storyboard-card-file-${storyboardCards.length - 1}`).focus();
+}
+function removeStoryboardCard(index) {
+  storyboardCards.splice(index, 1);
+  if (!storyboardCards.length) storyboardCards.push({file: null});
+  renderStoryboardCards();
+}
+function validateStoryboardBeforeLaunch() {
+  if (storyboardCards.length < 2) {
+    setStatus('FL2V storyboard requires at least 2 cards', true);
+    return false;
+  }
+  if (storyboardCards.some(card => !card.file)) {
+    setStatus('Choose or drop an image for every storyboard card', true);
+    return false;
+  }
+  return true;
+}
 function selectedTurboPreset() {
   const id = $('turbo-preset').value;
   return (config.turbo_presets || []).find(item => item.id === id) || null;
@@ -326,12 +423,31 @@ function validateDimensionsBeforeLaunch() {
 }
 function renderBenchmark(benchmark) {
   if (!benchmark || !benchmark.run_id) return '';
+  if (benchmark.workflow === 'FL2V_STORYBOARD') {
+    const total = benchmark.segment_count ?? '—';
+    const completed = benchmark.completed_segment_count ?? 0;
+    const state = benchmark.success ? '<span class="pill ok">succeeded</span>' : '<span class="pill bad">failed</span>';
+    const failure = benchmark.failure_segment_index ? ` · stopped at segment ${benchmark.failure_segment_index}` : '';
+    return `<p>${state} · ${completed}/${total} segments completed · ${Number(benchmark.total_elapsed_seconds || 0).toFixed(2)} s${failure}</p>`;
+  }
   const state = benchmark.success ? '<span class="pill ok">succeeded</span>' : '<span class="pill bad">failed</span>';
   const forwards = benchmark.actual_transformer_forward_count == null ? 'unavailable' : benchmark.actual_transformer_forward_count;
   const peak = benchmark.peak_mlx_memory_bytes == null ? 'unavailable' : `${benchmark.peak_mlx_memory_bytes.toLocaleString()} B`;
   return `<p>${state} · ${Number(benchmark.total_elapsed_seconds || 0).toFixed(2)} s · ${forwards} observed transformer forwards · peak MLX ${peak}</p>`;
 }
 function previewFor(snapshot) {
+  const storyboard = snapshot && snapshot.storyboard;
+  if (storyboard && storyboard.workflow === 'FL2V_STORYBOARD') {
+    const root = encodeURIComponent(snapshot.output_root || $('output-root').value);
+    const rows = (storyboard.segments || []).map(segment => {
+      const label = `Card ${segment.start_card_index} → card ${segment.end_card_index}`;
+      if (!segment.output_path || !segment.child_run_id || !segment.success) return `<li>${label} · ${segment.success ? 'completed' : 'failed'}</li>`;
+      const name = segment.output_path.split('/').pop();
+      const link = `/api/artifact?root=${root}&run=${encodeURIComponent(snapshot.run_id)}&file=${encodeURIComponent(name)}`;
+      return `<li>${label} · <a href="${link}" target="_blank">${htmlEscape(name)}</a></li>`;
+    }).join('');
+    return `<h3>Storyboard segment outputs</h3><ol>${rows || '<li>No segment output yet.</li>'}</ol><div class="meta">Manifest: ${htmlEscape(storyboard.status || 'running')}</div>`;
+  }
   const artifact = snapshot && snapshot.benchmark && snapshot.benchmark.output_artifact;
   if (!artifact || artifact.kind !== 'mp4') return '';
   const root = encodeURIComponent(snapshot.output_root || $('output-root').value);
@@ -389,9 +505,12 @@ async function refreshHistory() {
   catch (_) { $('history').textContent = 'History unavailable.'; }
 }
 async function renderJob() {
-  const mode = $('mode').value;
+  const storyboard = isStoryboardWorkflow();
+  const mode = storyboard ? 'FIRST_LAST' : $('mode').value;
   if (!validateDimensionsBeforeLaunch()) return;
+  if (storyboard && !validateStoryboardBeforeLaunch()) return;
   const form = new FormData();
+  form.set('workflow', storyboard ? 'FL2V_STORYBOARD' : 'SINGLE_RENDER');
   form.set('mode', mode); form.set('prompt', $('prompt').value);
   form.set('text_encoder_id', $('text-encoder').value);
   const conditioningArtifactPath = $('conditioning-artifact').value.trim();
@@ -403,8 +522,12 @@ async function renderJob() {
   form.set('additional_loras', JSON.stringify(selectedAdditionalLoras()));
   form.set('turbo_enabled', 'false');
   form.set('turbo_steps', '');
-  if (mode !== 'T2V' && $('image1').files[0]) form.append('image1', $('image1').files[0]);
-  if (mode === 'FIRST_LAST' && $('image2').files[0]) form.append('image2', $('image2').files[0]);
+  if (storyboard) {
+    for (const card of storyboardCards) form.append('storyboard_card', card.file, card.file.name);
+  } else {
+    if (mode !== 'T2V' && $('image1').files[0]) form.append('image1', $('image1').files[0]);
+    if (mode === 'FIRST_LAST' && $('image2').files[0]) form.append('image2', $('image2').files[0]);
+  }
   $('render').disabled = true; setStatus('Admitting…');
   try {
     const response = await fetch('/api/render', {method: 'POST', body: form}); const result = await response.json();
@@ -416,6 +539,8 @@ async function renderJob() {
 }
 async function boot() {
   config = await (await fetch('/api/config')).json();
+  $('workflow').innerHTML = (config.workflows || [{id: 'SINGLE_RENDER', label: 'Single render'}]).map(item => `<option value="${item.id}">${item.label}</option>`).join('');
+  $('workflow').value = config.defaults.workflow || 'SINGLE_RENDER';
   $('mode').innerHTML = config.modes.map(item => `<option value="${item.id}">${item.label}</option>`).join('');
   $('text-encoder').innerHTML = (config.text_encoders || []).map(item => `<option value="${item.id}" ${item.available ? '' : 'disabled'}>${item.label}</option>`).join('');
   $('text-encoder').value = config.defaults.text_encoder_id || 'canonical-qwen3-vl';
@@ -439,9 +564,11 @@ async function boot() {
   $('conditioning-artifact').value = config.defaults.conditioning_artifact_path || '';
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
   $('mode').onchange = updateMode;
+  $('workflow').onchange = updateWorkflow;
   $('text-encoder').onchange = updateTextEncoderControls;
   $('turbo-preset').onchange = updateTurboPresetControls;
-  updateTurboPresetControls(); updateMode(); updateGeometry();
+  renderStoryboardCards();
+  updateTurboPresetControls(); updateWorkflow(); updateGeometry();
   $('runtime').textContent = `Checkpoint: ${config.runtime.checkpoint_root} · Transformer: ${config.runtime.transformer_path || 'from checkpoint'} · generator: ${config.runtime.generator}`;
   if (!config.runtime.checkpoint_exists || !config.runtime.transformer_exists) { $('runtime-warning').textContent = 'Configured checkpoint or transformer path is not currently readable. Set H3_CHECKPOINT_ROOT and H3_TRANSFORMER before rendering.'; $('runtime-warning').classList.remove('hidden'); }
   else if (config.runtime.transformer_mode !== config.runtime.transformer_required_mode) { $('runtime-warning').textContent = `Render Lab requires ${config.runtime.transformer_required_mode}; the configured transformer is not admitted.`; $('runtime-warning').classList.remove('hidden'); }
@@ -509,6 +636,7 @@ def _render_request_from_fields(fields: dict[str, object]) -> RenderRequest:
     return RenderRequest(
         mode=fields.get("mode", ""),
         prompt=fields.get("prompt") or "",
+        workflow=fields.get("workflow", SINGLE_RENDER_WORKFLOW),
         text_encoder_id=fields.get("text_encoder_id", "canonical-qwen3-vl"),
         conditioning_artifact_path=fields.get("conditioning_artifact_path") or None,
         resolution_id=fields.get("resolution_id") or None,
@@ -526,6 +654,7 @@ def _render_request_from_fields(fields: dict[str, object]) -> RenderRequest:
         turbo_enabled=fields.get("turbo_enabled", "false"),
         turbo_steps=fields.get("turbo_steps") or None,
         turbo_preset_id=fields.get("turbo_preset_id") or None,
+        storyboard_card_paths=parse_storyboard_card_paths(fields.get("storyboard_card_paths")),
     )
 
 
@@ -575,8 +704,17 @@ class Handler(BaseHTTPRequestHandler):
             raise FileNotFoundError(run_dir)
         artifact = run_dir / name
         config = json.loads((run_dir / "render-config.json").read_text(encoding="utf-8"))
-        allowed = Path(str(config.get("output_path", ""))).name
-        if name != allowed or not artifact.is_file():
+        if config.get("workflow") == "FL2V_STORYBOARD":
+            manifest_path = run_dir / "storyboard-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            allowed = {
+                Path(str(segment.get("output_path", ""))).name
+                for segment in manifest.get("segments", [])
+                if isinstance(segment, dict) and segment.get("output_path")
+            }
+        else:
+            allowed = {Path(str(config.get("output_path", ""))).name}
+        if name not in allowed or not artifact.is_file():
             raise FileNotFoundError(artifact)
         self._stream_file(artifact)
 
