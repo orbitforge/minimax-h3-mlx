@@ -18,7 +18,7 @@ WORK = REPO.parent
 GENERATOR = REPO / "scripts" / "generate.py"
 PYTHON = REPO / ".venv" / "bin" / "python"
 CHECKPOINT = WORK / "checkpoints" / "minimax-h3-fl2va"
-TRANSFORMER = WORK / "models" / "minimax-h3-mlx-6bit"
+TRANSFORMER = WORK / "models" / "minimax-h3-mlx-6bit-streamed-adaln"
 DEFAULT_OUTPUT = REPO.parent.parent / "outputs" / "minimax-h3-output.mp4"
 PORT = 8765
 
