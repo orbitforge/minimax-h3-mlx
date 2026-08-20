@@ -1,6 +1,6 @@
 # MiniMax H3 MLX Runtime Roadmap
 
-**Last updated:** 2026-08-19
+**Last updated:** 2026-08-20
 
 ## Purpose
 
@@ -363,6 +363,52 @@ Current baseline:
 ### Objective
 
 Improve arbitrary-prompt compatibility for Heretic without weakening conditioning correctness or silently accepting ambiguous token mappings.
+
+---
+
+## Slice 024 - Monolithic BF16-to-MLX Q6/Q8 Conversion
+
+**Status:** Complete for implementation and bounded host proof. The complete
+beta conversion, streamed-AdaLN forge, and any beta H3 render remain unrun.
+See [the Slice 024 closeout](slice-024-monolithic-q6-converter-closeout.md).
+
+### Delivered scope
+
+Slice 024 added a bounded-memory converter for the verified monolithic
+MiniMax H3 beta-0.6 BF16 safetensors source. It provides header-first source
+admission, strict topology classification, exact named-range reads, one
+logical linear resident at a time, deterministic streamed sharded output, and
+atomic publication into the repository's conventional MLX quantized
+checkpoint format.
+
+The locked recipe is Q6 core weights, Q8 block-AdaLN weights, group size `64`,
+and `quantize_adaln=true`. The complete conventional output is expected to
+contain `1,050` logical tensors.
+
+### Evidence and boundaries
+
+- the verified source identity and complete header bounds were recorded;
+- a real host single-tensor Q6 proof passed with source immutability,
+  bounded output verification, and peak-footprint telemetry;
+- the focused monolithic contract passed `33/33`, checkpoint forge passed
+  `30` with `2` skipped, and previously reported surrounding MLX-free suites
+  passed `44/44`, `31/31`, and `5/5`; and
+- `py_compile` for all six implementation paths and `git diff --check` passed.
+
+The complete beta conversion was explicitly outside the implementation slice.
+The conventional beta checkpoint and its streamed-AdaLN derivative do not
+exist yet, and no beta H3 generation was performed. Continuation, latent
+masking, and PR 15375 research are not Slice 024 deliverables.
+
+### Next operational step
+
+On the host, run the converter with explicit `--full`, source-linked verify
+the resulting conventional checkpoint, then run the existing streamed-AdaLN
+forge and verify the derived checkpoint. The first forge publication should
+not use `--force`; plan for roughly `30.3 GB` of conventional logical output
+and at least `80 GB` of free disk for conversion plus forging. This is a host
+execution of the completed Slice 024 converter, not a newly named development
+slice.
 
 ---
 
