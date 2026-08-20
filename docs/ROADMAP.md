@@ -1,6 +1,6 @@
 # MiniMax H3 MLX Runtime Roadmap
 
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 
 ## Purpose
 
@@ -280,13 +280,47 @@ Card reordering was not part of the delivered phase-one contract.
   four transformer forwards per segment and no observed overlap between the
   sequential child runs.
 - Streamed-AdaLN Q6 remains canonical. A stale README path was reconciled to
-  that production path; the separate legacy local browser launcher still
-  references the removed resident transformer and remains deferred future
-  runtime-safety debt. It was not modified by this slice closeout.
+  that production path. At Slice 021F closeout, the separate legacy local
+  browser launcher still referenced the removed resident transformer; Slice
+  021G subsequently repaired that legacy surface default to the canonical
+  streamed-AdaLN Q6 transformer. The historical 021F closeout document
+  remains unchanged.
 
 Deferred progress/logging polish remains future work. This slice does not add
 continuous live child-output streaming, explicit pending-segment records, or
 richer per-segment progress.
+
+---
+
+## Slice 021G - Legacy Browser Surface Streamed-Transformer Safety
+
+**Status:** Complete — implementation committed locally; no host render required.
+
+### Delivered scope
+
+- repaired the stale legacy browser surface transformer default;
+- changed the transformer basename from `minimax-h3-mlx-6bit` to the canonical
+  `minimax-h3-mlx-6bit-streamed-adaln` path;
+- preserved the legacy `scripts/generate.py` command propagation through
+  `--transformer <TRANSFORMER>`; and
+- preserved explicit original/resident checkpoint loading for research and
+  probe workflows.
+
+### Evidence and boundaries
+
+- focused 021G contract passed `3/3`;
+- surrounding offline validation passed: Render Lab encoder safety `10/10`,
+  Render Lab Turbo safety `5/5`, and LightX production-entry contract `7/7`;
+- `py_compile` passed for both changed Python files and the implementation
+  `git diff --check` passed; and
+- no MLX, Metal, or H3 render was run, and no host render was required.
+
+021G fixed only the stale legacy browser surface default. It did not globally
+prohibit original/resident transformers, alter `scripts/generate.py`, alter
+the H3 pipeline or loader, change transformer routing, change Render Lab,
+change probes or research workflows, change `Launch MiniMax H3.command`, or
+begin beta-0.6 conversion. Broader resident-transformer fail-closed safety
+work and beta-0.6 conversion remain separate future work.
 
 ---
 
