@@ -368,9 +368,12 @@ Improve arbitrary-prompt compatibility for Heretic without weakening conditionin
 
 ## Slice 024 - Monolithic BF16-to-MLX Q6/Q8 Conversion
 
-**Status:** Complete for implementation and bounded host proof. The complete
-beta conversion, streamed-AdaLN forge, and any beta H3 render remain unrun.
-See [the Slice 024 closeout](slice-024-monolithic-q6-converter-closeout.md).
+**Status:** Complete for implementation and full host completion. The
+subsequent full beta conversion and streamed-AdaLN forge passed independent
+verification. Beta H3 runtime execution, generation, and render acceptance
+remain unproven.
+See the [historical Slice 024 closeout](slice-024-monolithic-q6-converter-closeout.md)
+and the [host-completion addendum](slice-024-host-completion-addendum.md).
 
 ### Delivered scope
 
@@ -395,20 +398,32 @@ contain `1,050` logical tensors.
   passed `44/44`, `31/31`, and `5/5`; and
 - `py_compile` for all six implementation paths and `git diff --check` passed.
 
-The complete beta conversion was explicitly outside the implementation slice.
-The conventional beta checkpoint and its streamed-AdaLN derivative do not
-exist yet, and no beta H3 generation was performed. Continuation, latent
-masking, and PR 15375 research are not Slice 024 deliverables.
+- The subsequent real-host full conversion exited `0` after `111` seconds,
+  produced six shards and `1,050` logical tensors, and was independently
+  accepted as `CONVENTIONAL_BETA_Q6_VERIFIED`.
+- The subsequent real-host streamed-AdaLN forge exited `0` after `135`
+  seconds, produced an `850`-tensor resident base and `50` block sidecars,
+  and was independently accepted as
+  `BETA_STREAMED_ADALN_CHECKPOINT_VERIFIED`.
+- The existing production streamed-AdaLN runtime remains unchanged. The
+  host operation detected no source mutation and no modified tracked
+  repository paths; detailed source, artifact, hash, and resource receipts
+  are recorded in the host-completion addendum.
 
-### Next operational step
+The original Slice 024 closeout is a historical snapshot of the pre-host
+state and remains unchanged. The host completion did not run beta H3 runtime
+execution, live Qwen conditioning, denoising/generation, VAE execution, or
+video/audio render acceptance. Continuation, latent masking, and PR 15375
+research are not Slice 024 deliverables.
 
-On the host, run the converter with explicit `--full`, source-linked verify
-the resulting conventional checkpoint, then run the existing streamed-AdaLN
-forge and verify the derived checkpoint. The first forge publication should
-not use `--force`; plan for roughly `30.3 GB` of conventional logical output
-and at least `80 GB` of free disk for conversion plus forging. This is a host
-execution of the completed Slice 024 converter, not a newly named development
-slice.
+### Next authorized step
+
+Begin the separately authorized beta generation acceptance gate. It must
+establish beta transformer runtime execution, live Qwen conditioning,
+denoising/generation, VAE execution, and video/audio render acceptance. The
+converter and streamed-AdaLN forge are already host-complete and independently
+verified; further converter implementation is not the next work. This roadmap
+update does not begin beta generation acceptance.
 
 ---
 
