@@ -42,10 +42,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx.utils import tree_flatten
-
 # Suffixes of the linear layers that carry the DiT's weight mass.
 CORE_LINEARS = (
     ".attn.qkv_proj",
@@ -97,6 +93,11 @@ class QuantConfig:
 def _class_predicate(config: QuantConfig, counts: dict[int, int] | None = None, verbose: bool = False):
     """Build the `nn.quantize` predicate for a recipe, shared by conversion and loading."""
 
+    # Keep policy-only callers (notably the monolithic header/classification path) usable on a
+    # host without a Metal device.  The MLX import remains lazy and is still required when this
+    # predicate is actually used to quantize a module tree.
+    import mlx.nn as nn
+
     def predicate(path: str, module: nn.Module) -> bool | dict:
         if not isinstance(module, nn.Linear):
             return False
@@ -123,6 +124,8 @@ def apply_quantization_structure(model, config: QuantConfig) -> None:
     those carry packed weights plus scales and biases under different names than `nn.Linear`. This
     replays the recorded recipe so the keys line up; the values are then overwritten by the load.
     """
+    import mlx.nn as nn
+
     nn.quantize(
         model,
         group_size=config.group_size,
@@ -136,6 +139,9 @@ def quantize_dit(model, config: QuantConfig | None = None, verbose: bool = False
 
     Returns a summary with the before/after footprint and the per-width layer counts.
     """
+    import mlx.core as mx
+    import mlx.nn as nn
+
     config = config or QuantConfig()
     before = _footprint(model)
     counts: dict[int, int] = {}
@@ -165,11 +171,15 @@ def quantize_dit(model, config: QuantConfig | None = None, verbose: bool = False
 
 
 def _footprint(model) -> float:
+    from mlx.utils import tree_flatten
+
     return sum(v.nbytes for _, v in tree_flatten(model.parameters())) / 1e9
 
 
 def resident_footprint(model) -> dict[str, float]:
     """Footprint split into what stays resident and what is dropped after the cache is built."""
+    from mlx.utils import tree_flatten
+
     total = adaln = 0
     for key, value in tree_flatten(model.parameters()):
         total += value.nbytes

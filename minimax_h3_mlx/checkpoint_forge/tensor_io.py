@@ -12,7 +12,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Callable, Iterable
 
 
 MAX_HEADER_BYTES = 100 * 1024 * 1024
@@ -200,6 +200,40 @@ def write_safetensors_fast(
                     output,
                     source_header.data_start + tensor.start,
                     source_header.data_start + tensor.end,
+                )
+            tensor_checksums[tensor.name] = checksum
+    return sha256_file(destination), tensor_checksums
+
+
+def write_safetensors_stream(
+    destination: Path,
+    tensors: Iterable[TensorHeader],
+    payload_writer: Callable[[TensorHeader, BinaryIO], str],
+    metadata: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Write a deterministic safetensors file while streaming each payload through a callback.
+
+    The callback owns one payload at a time.  This keeps the generic writer usable for converters
+    whose ordinary tensors are copied from named source ranges and whose derived tensors are
+    materialized independently, without requiring an in-memory shard dictionary.
+    """
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in metadata.items()):
+        raise ValueError("safetensors metadata must contain string keys and values")
+    ordered = sorted(tensors, key=lambda item: item.name)
+    raw_header = _header_bytes(ordered, metadata)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tensor_checksums: dict[str, str] = {}
+    with destination.open("wb") as output:
+        output.write(struct.pack("<Q", len(raw_header)))
+        output.write(raw_header)
+        for tensor in ordered:
+            before = output.tell()
+            checksum = payload_writer(tensor, output)
+            written = output.tell() - before
+            if written != tensor.nbytes:
+                raise ValueError(
+                    f"payload writer emitted {written} bytes for {tensor.name}; "
+                    f"header requires {tensor.nbytes}"
                 )
             tensor_checksums[tensor.name] = checksum
     return sha256_file(destination), tensor_checksums
