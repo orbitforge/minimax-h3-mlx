@@ -632,6 +632,61 @@ The controlled Q6-versus-Q8 comparison remains later optimization work.
 
 ---
 
+## Slice 028 - Runtime Assets Environment Isolation
+
+**Status:** Closeout ready — implementation committed at `fc45f28`; the
+Current/manual environment-isolation regression passed without model or media
+execution. The post-Slice 027 host acceptance failure and the remaining
+Current-vs-Beta host comparison are recorded in the [Slice 028
+closeout](slice-028-runtime-assets-env-isolation-closeout.md).
+
+### Objective
+
+Separate ambient `MINIMAX_H3_RUNTIME_ASSETS` configuration from explicit
+`--runtime-assets` CLI intent so that the existing Current/manual Render
+Surface path remains independent of named-runtime selection.
+
+### Delivered scope
+
+- `--runtime-assets` defaults to `None`, so `args.runtime_assets` represents
+  explicit CLI input only;
+- `MINIMAX_H3_RUNTIME_ASSETS` is consulted only after a named runtime has
+  actually been selected;
+- explicit `--runtime-assets` without `--runtime` remains a fail-closed exit-2
+  error;
+- named `beta-0.6` continues to consume the environment when no explicit
+  runtime-assets root is supplied, with an explicit CLI root taking precedence;
+- Slice 026 `resolve_runtime()` admission remains the owner of named-runtime
+  selection and was not modified; and
+- Render Surface production code, runtime-assets profile links, and model or
+  checkpoint artifacts were not modified.
+
+### Evidence and boundaries
+
+- the post-Slice 027 host attempt exposed the prior exit-2 failure
+  `--runtime-assets requires --runtime` on the Current/manual path;
+- the independent model-free Surface-shaped regression passed
+  `CURRENT_ENV_ISOLATION_PASS`;
+- the new environment regressions passed `4/4`, Slice 026 runtime-selection
+  validation remained `23/23`, Slice 027 Surface validation remained `10/10`,
+  and the combined focused result was `37/37`;
+- `generate.py --help`, `py_compile`, and `git diff --check` passed; and
+- independent review returned `PASS_WITH_GAPS`, with the gaps limited to
+  host-generation/media acceptance rather than a code blocker.
+
+No generation, Qwen/VAE/MLX/Metal execution, or Current-vs-Beta host
+comparison was run for Slice 028.
+
+### Next authorized step
+
+After this documentation closeout is published, a separately authorized host
+acceptance operation may rerun the legacy-surface Current/Beta comparison under
+the corrected CLI/environment contract. That operation remains outside Slice
+028 documentation closeout and must not treat the model-free regression as
+media acceptance.
+
+---
+
 # Later Workflow Improvements
 
 After LoRA stacking and Heretic reconciliation, reassess based on actual Render Lab usage.
