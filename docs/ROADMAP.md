@@ -578,6 +578,60 @@ This roadmap update does not implement that work.
 
 ---
 
+## Slice 027 - Render Surface Beta Runtime Integration
+
+**Status:** Closeout ready — implementation committed at `6d117cc`; the
+legacy browser surface now integrates the explicit, opt-in Slice 026 named
+runtime. Full Beta host generation and media acceptance remain unproven. See
+the [Slice 027 closeout](slice-027-render-surface-beta-runtime-closeout.md).
+
+### Objective
+
+Integrate the accepted Slice 026 named runtime into the existing legacy
+browser Render Surface while preserving its existing Current/manual generation
+path and keeping Beta opt-in.
+
+### Delivered scope
+
+- a user-facing runtime selector with `Current` as the existing default and
+  `Beta 0.6` mapped to `beta-0.6`;
+- legacy-surface `start_job()` launch of `scripts/generate.py` as a child
+  process;
+- Beta selection propagated as `--runtime beta-0.6`, without UI assembly of
+  checkpoint, transformer, or Slice 025 artifact paths;
+- inherited `MINIMAX_H3_RUNTIME_ASSETS` environment propagation to the child;
+- existing prompt, size/megapixels preset, duration, and output-path behavior
+  preserved across Current and Beta; and
+- explicit no-fallback and status/logging behavior for named-runtime failures.
+
+Render Lab and storyboard remain separate surfaces/contracts and were not
+modified by Slice 027. The legacy surface does not expose LoRA, Turbo,
+Heretic, storyboard, image-conditioning, or manual transformer controls.
+
+### Evidence and boundaries
+
+- the legacy-surface validation passed `10/10`, and Slice 026
+  runtime-selection validation passed `23/23`;
+- surrounding Render Lab, storyboard, encoder, Turbo, conditioning,
+  Render Lab conditioning, and additional-LoRA validations passed
+  `19/19`, `11/11`, `10/10`, `5/5`, `6/6`, `6/6`, and `12/12`;
+- `generate.py --help`, `py_compile`, and `git diff --check` passed;
+- independent implementation review returned `PASS_WITH_GAPS`, including
+  `NO_FALLBACK_CONFIRMED`; and
+- no host profile symlinks, generation, Qwen/VAE/MLX/Metal execution, or
+  Q6-vs-Q8 comparison was performed for this closeout.
+
+### Next authorized step
+
+After promotion, establish the canonical host interpreter, create the
+Slice 026-required `beta-0.6` runtime-assets symlinks, set
+`MINIMAX_H3_RUNTIME_ASSETS`, and perform the real legacy-surface Beta
+acceptance sequence through named admission, corrected streamed transformer,
+Canonical Qwen, video/audio VAEs, final media, and human visual acceptance.
+The controlled Q6-versus-Q8 comparison remains later optimization work.
+
+---
+
 # Later Workflow Improvements
 
 After LoRA stacking and Heretic reconciliation, reassess based on actual Render Lab usage.
