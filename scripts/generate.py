@@ -12,6 +12,8 @@ larger canvases explicitly; anything below the 768-pixel training canvas is off-
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,7 +27,10 @@ from minimax_h3_mlx.lora import (
     LoRAError,
     LoRAStack,
 )
-from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+from minimax_h3_mlx.runtime_selection import (
+    RuntimeSelectionError,
+    resolve_runtime,
+)
 from minimax_h3_mlx.transformer_routing import (
     REF2VA_REFERENCE_INPUT_NOT_IMPLEMENTED,
     TransformerRoutingError,
@@ -33,6 +38,14 @@ from minimax_h3_mlx.transformer_routing import (
 )
 
 DEFAULT_CHECKPOINT = "/Volumes/models/MiniMax-H3/FL2VA"
+RUNTIME_ASSETS_ENV = "MINIMAX_H3_RUNTIME_ASSETS"
+
+
+def _load_pipeline_class():
+    """Import MLX-backed pipeline code only after runtime selection has been admitted."""
+    from minimax_h3_mlx.pipeline import MiniMaxH3Pipeline
+
+    return MiniMaxH3Pipeline
 
 
 def main() -> int:
@@ -44,10 +57,23 @@ def main() -> int:
         help="the live prompt; omit it when --conditioning-artifact supplies the prompt identity",
     )
     parser.add_argument("-o", "--output", default="out.mp4")
-    parser.add_argument("-c", "--checkpoint", default=DEFAULT_CHECKPOINT,
+    parser.add_argument("-c", "--checkpoint", default=None,
                         help="the upstream release; supplies the VAEs and text encoder")
     parser.add_argument("-t", "--transformer", default=None,
                         help="a quantized transformer directory to use instead of the release's")
+    parser.add_argument(
+        "--runtime",
+        default=None,
+        help="explicit named runtime selection (currently: beta-0.6)",
+    )
+    parser.add_argument(
+        "--runtime-assets",
+        default=os.environ.get(RUNTIME_ASSETS_ENV),
+        help=(
+            "host runtime-assets root containing <runtime>/checkpoint, transformer, and "
+            f"conventional links (env: {RUNTIME_ASSETS_ENV})"
+        ),
+    )
     parser.add_argument("-d", "--duration", type=float, default=5.0, help="seconds, 5 to 15")
     parser.add_argument("-s", "--steps", type=int, default=None,
                         help="transformer evaluations (NFE); normal default 16, Turbo default 8")
@@ -119,6 +145,27 @@ def main() -> int:
     if args.conditioning_artifact is not None and args.keep_text_encoder:
         parser.error("--keep-text-encoder is incompatible with --conditioning-artifact")
 
+    if args.runtime is None and args.runtime_assets is not None:
+        parser.error("--runtime-assets requires --runtime")
+    resolved_runtime = None
+    if args.runtime is not None:
+        if args.checkpoint is not None or args.transformer is not None:
+            parser.error("--runtime cannot be combined with --checkpoint or --transformer overrides")
+        try:
+            resolved_runtime = resolve_runtime(args.runtime, args.runtime_assets)
+        except RuntimeSelectionError as exc:
+            parser.error(str(exc))
+        checkpoint = str(resolved_runtime.checkpoint_root)
+        transformer = str(resolved_runtime.transformer_root)
+        print(
+            "resolved runtime: "
+            + json.dumps(resolved_runtime.receipt, sort_keys=True),
+            flush=True,
+        )
+    else:
+        checkpoint = args.checkpoint or DEFAULT_CHECKPOINT
+        transformer = args.transformer
+
     selected_adapters = [
         name
         for name, value in (
@@ -177,8 +224,8 @@ def main() -> int:
         try:
             resolve_manifest_transformer(
                 lightx_manifest,
-                args.checkpoint,
-                explicit_transformer_dir=args.transformer,
+                checkpoint,
+                explicit_transformer_dir=transformer,
             )
         except TransformerRoutingError as exc:
             parser.error(str(exc))
@@ -195,9 +242,9 @@ def main() -> int:
     if images and len(anchors) != len(images):
         parser.error(f"--anchor must be given once per --image ({len(images)} images, {len(anchors)} anchors)")
 
-    pipe = MiniMaxH3Pipeline.from_pretrained(
-        args.checkpoint,
-        transformer_dir=args.transformer,
+    pipe = _load_pipeline_class().from_pretrained(
+        checkpoint,
+        transformer_dir=transformer,
         load_vision=bool(images),
         unload_text_encoder=not args.keep_text_encoder,
         keep_adaln=args.keep_adaln,

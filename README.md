@@ -359,6 +359,28 @@ ordinary component-release purges remain at the text-encoder, transformer, and V
 none runs between denoising steps. This may reduce peak pressure and swap at the cost of some
 first-step reallocation, and the actual benefit depends on the MLX allocator and must be measured.
 
+### Named beta runtime selection
+
+The accepted beta 0.6 combination can be selected explicitly with `--runtime beta-0.6`. Configure a
+host-local, non-copying profile under a caller-selected assets root:
+
+```text
+<runtime-assets>/beta-0.6/
+  checkpoint    -> <canonical surrounding checkpoint>
+  transformer   -> <accepted streamed beta transformer>
+  conventional -> <accepted conventional transformer metadata>
+```
+
+The three entries must be symbolic links. The resolver validates the streamed manifest and the
+actual `transformer/config.json` through the production `DiTConfig` semantics, then validates the
+model-index tokenizer/processor mapping and their concrete metadata files, QKV evidence, and
+surrounding Qwen/VAE/scheduler contract before importing the MLX pipeline. The resolved-runtime
+receipt reports the transformer config SHA and normalized DiT fields plus tokenizer/processor
+identity paths. Use `--runtime-assets <runtime-assets>` or
+`MINIMAX_H3_RUNTIME_ASSETS`; `--runtime beta-0.6` never becomes the default, and it cannot be
+combined with explicit `--checkpoint` or `--transformer` overrides. Legacy explicit checkpoint and
+transformer selection remains available when no named runtime is requested.
+
 ### Derived streamed-AdaLN checkpoint forge
 
 The repository includes a v0.3b converter that creates a new
