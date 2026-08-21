@@ -1,6 +1,6 @@
 # MiniMax H3 MLX Runtime Roadmap
 
-**Last updated:** 2026-08-20
+**Last updated:** 2026-08-21
 
 ## Purpose
 
@@ -439,9 +439,11 @@ the next host operation in the Slice 025 closeout.
 
 ## Slice 025 - Beta QKV Layout Reconciliation
 
-**Status:** Closeout ready — implementation committed at `26869fb`; corrected
-beta conversion, verification, forge, and semantic acceptance remain
-unproven. See the [Slice 025 closeout](slice-025-beta-qkv-layout-reconciliation-closeout.md).
+**Status:** Closeout ready — implementation committed at `26869fb`; Slice 026
+subsequently hardened named beta runtime selection at `685c6f2`. Corrected
+beta conversion, verification, forge, named-runtime generation, and semantic
+acceptance remain unproven. See the [Slice 025 closeout](slice-025-beta-qkv-layout-reconciliation-closeout.md)
+and the [Slice 026 closeout](slice-026-beta-runtime-hardening-closeout.md).
 
 ### Objective
 
@@ -482,12 +484,97 @@ format unchanged.
 
 ### Next authorized step
 
-Run the corrected beta host operation only after this documentation closeout
-is promoted: full BF16-to-conventional Q6/Q8 conversion, independent
-verification, streamed-AdaLN forge, independent streamed-checkpoint
-verification, and the controlled `512×512` semantic acceptance render. The
-full operation and its exact render settings are defined in the Slice 025
-closeout; this roadmap update does not begin it.
+Slice 026 subsequently addressed the operational runtime-selection gap with an
+explicit, fail-closed `beta-0.6` named runtime and metadata-only pre-load
+admission. Slice 026 did not run the corrected host operation: full
+BF16-to-conventional Q6/Q8 conversion, independent verification,
+streamed-AdaLN forge, independent streamed-checkpoint verification, named
+runtime generation, or semantic acceptance remain unproven. The earlier
+manual-transformer host run remains pre-repair evidence and is not proof of
+the named-runtime CLI path. See the [Slice 026 closeout](slice-026-beta-runtime-hardening-closeout.md).
+
+---
+
+## Slice 026 - Beta Runtime Hardening
+
+**Status:** Closeout ready — implementation committed at `685c6f2`; metadata
+admission and runtime-selection contracts are accepted with gaps. No
+model-backed generation or Render Surface integration was run. See the
+[Slice 026 closeout](slice-026-beta-runtime-hardening-closeout.md).
+
+### Objective
+
+Replace fragile caller-composed beta runtime selection with the explicit,
+opt-in named runtime `beta-0.6`. The named runtime represents the complete
+accepted combination: the surrounding checkpoint root, Canonical Qwen3-VL,
+tokenizer, processor, video and audio VAEs, scheduler/config contract,
+corrected conventional provenance, corrected streamed-AdaLN transformer,
+transformer configuration, Slice 025 QKV reconciliation, Q6/Q8 policy, and
+streamed topology. It is not the default. Legacy explicit
+`--checkpoint`/`--transformer` selection remains available when no named
+runtime is requested, while named selection rejects conflicting manual
+overrides.
+
+### Delivered scope
+
+- `--runtime beta-0.6` with `--runtime-assets` and
+  `MINIMAX_H3_RUNTIME_ASSETS`, with the CLI value taking precedence over the
+  environment value;
+- a host-local `<runtime-assets>/beta-0.6/` profile whose current Slice 026
+  deployment contract requires symbolic links named `checkpoint`,
+  `transformer`, and `conventional`;
+- fail-closed pre-load admission for streamed provenance, transformer
+  configuration, tokenizer/processor metadata, Qwen/VAE identity, and
+  scheduler metadata before lazy pipeline import and model construction;
+- semantic transformer-architecture admission with a resolved config
+  SHA/architecture receipt;
+- Slice 025 QKV source/layout/count, quantization, and streamed-topology
+  provenance admission; and
+- a resolved-runtime receipt that reports validated facts rather than only
+  caller intent. Conventional metadata remains required as provenance
+  hardening, but conventional tensor payloads are not loaded by named-runtime
+  admission.
+
+The current symbolic-link deployment rule is an operational Slice 026 host
+contract, not an eternal requirement of the model format.
+
+### Evidence and boundaries
+
+- the runtime-selection suite passed `23/23`;
+- real-host positive and negative probes were respectively
+  `ACCEPTED_METADATA_ONLY` and `REJECTED_METADATA_ONLY`;
+- invalid transformer configuration was rejected before pipeline import with
+  zero safetensors payload bytes read and no Qwen, VAE, MLX, Metal, or model
+  construction;
+- the legacy surface passed `3/3`, conditioning contracts passed `6/6`,
+  LightX metadata contracts passed, `generate.py --help` passed,
+  `py_compile` passed, and `git diff --check` passed; and
+- the second independent review returned `PASS_WITH_GAPS` after resolving
+  the original admission blocker.
+
+Slice 026 does not prove full MLX generation through
+`--runtime beta-0.6`, Render Surface integration,
+Render Surface-to-named-runtime corrected beta generation, or a Q6-versus-Q8
+beta comparison.
+
+### Next authorized step
+
+The next engineering slice is **Render Surface integration**. The intended
+path is:
+
+```text
+Render Surface
+→ named beta-0.6 runtime
+→ hardened pre-load admission
+→ corrected streamed beta transformer
+→ Canonical Qwen/VAE components
+→ final media
+```
+
+The UI must consume the named runtime contract rather than reconstructing the
+checkpoint root, transformer override, or Slice 025 artifact history. A full
+named-runtime render may serve as part of post-integration host acceptance.
+This roadmap update does not implement that work.
 
 ---
 
