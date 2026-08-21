@@ -68,10 +68,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--runtime-assets",
-        default=os.environ.get(RUNTIME_ASSETS_ENV),
+        default=None,
         help=(
             "host runtime-assets root containing <runtime>/checkpoint, transformer, and "
-            f"conventional links (env: {RUNTIME_ASSETS_ENV})"
+            f"conventional links (used for named runtimes when omitted; env: {RUNTIME_ASSETS_ENV})"
         ),
     )
     parser.add_argument("-d", "--duration", type=float, default=5.0, help="seconds, 5 to 15")
@@ -145,14 +145,17 @@ def main() -> int:
     if args.conditioning_artifact is not None and args.keep_text_encoder:
         parser.error("--keep-text-encoder is incompatible with --conditioning-artifact")
 
-    if args.runtime is None and args.runtime_assets is not None:
+    runtime_assets = args.runtime_assets
+    if args.runtime is None and runtime_assets is not None:
         parser.error("--runtime-assets requires --runtime")
     resolved_runtime = None
     if args.runtime is not None:
         if args.checkpoint is not None or args.transformer is not None:
             parser.error("--runtime cannot be combined with --checkpoint or --transformer overrides")
+        if runtime_assets is None:
+            runtime_assets = os.environ.get(RUNTIME_ASSETS_ENV)
         try:
-            resolved_runtime = resolve_runtime(args.runtime, args.runtime_assets)
+            resolved_runtime = resolve_runtime(args.runtime, runtime_assets)
         except RuntimeSelectionError as exc:
             parser.error(str(exc))
         checkpoint = str(resolved_runtime.checkpoint_root)

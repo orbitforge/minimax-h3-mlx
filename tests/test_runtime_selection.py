@@ -637,10 +637,8 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         load_pipeline.assert_not_called()
 
-    def test_legacy_manual_workflow_is_not_forced_through_beta_profile(self) -> None:
-        module = load_generate_module()
-        calls = {}
-
+    @staticmethod
+    def _fake_pipeline(calls):
         class FakePipeline:
             @classmethod
             def from_pretrained(cls, checkpoint, **kwargs):
@@ -658,6 +656,50 @@ class RuntimeSelectionTests(unittest.TestCase):
                     total_seconds=0.1,
                 )
 
+        return FakePipeline
+
+    def test_explicit_runtime_assets_without_named_runtime_still_rejects(self) -> None:
+        module = load_generate_module()
+        argv = [
+            "generate.py",
+            "prompt",
+            "--runtime-assets",
+            str(self.fixture.assets),
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            with mock.patch.object(module, "_load_pipeline_class") as load_pipeline:
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        module.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--runtime-assets requires --runtime", stderr.getvalue())
+        load_pipeline.assert_not_called()
+
+    def test_ambient_runtime_assets_without_named_runtime_stays_manual(self) -> None:
+        module = load_generate_module()
+        calls = {}
+        argv = [
+            "generate.py",
+            "ambient manual prompt",
+            "--output",
+            str(self.temp / "ambient-manual.mp4"),
+        ]
+        with mock.patch.dict(module.os.environ, {module.RUNTIME_ASSETS_ENV: str(self.fixture.assets)}):
+            with mock.patch.object(module, "resolve_runtime", side_effect=AssertionError("named runtime selected")) as resolve:
+                with mock.patch.object(module, "_load_pipeline_class", return_value=self._fake_pipeline(calls)):
+                    with mock.patch.object(module, "save_mp4"):
+                        with mock.patch.object(sys, "argv", argv):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                self.assertEqual(module.main(), 0)
+        resolve.assert_not_called()
+        self.assertEqual(calls["checkpoint"], module.DEFAULT_CHECKPOINT)
+        self.assertIsNone(calls["transformer"])
+
+    def test_legacy_manual_workflow_is_not_forced_through_beta_profile(self) -> None:
+        module = load_generate_module()
+        calls = {}
+        fake_pipeline = self._fake_pipeline(calls)
+
         argv = [
             "generate.py",
             "legacy prompt",
@@ -665,17 +707,73 @@ class RuntimeSelectionTests(unittest.TestCase):
             str(self.temp / "manual-checkpoint"),
             "--transformer",
             str(self.temp / "manual-transformer"),
+            "--megapixels",
+            "0.2",
+            "--duration",
+            "5",
             "--output",
             str(self.temp / "legacy.mp4"),
         ]
-        with mock.patch.object(sys, "argv", argv):
-            with mock.patch.object(module, "resolve_runtime", side_effect=AssertionError("beta profile was selected")):
-                with mock.patch.object(module, "_load_pipeline_class", return_value=FakePipeline):
+        with mock.patch.dict(module.os.environ, {module.RUNTIME_ASSETS_ENV: str(self.fixture.assets)}):
+            with mock.patch.object(module, "resolve_runtime", side_effect=AssertionError("beta profile was selected")) as resolve:
+                with mock.patch.object(module, "_load_pipeline_class", return_value=fake_pipeline):
                     with mock.patch.object(module, "save_mp4"):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            self.assertEqual(module.main(), 0)
+                        with mock.patch.object(sys, "argv", argv):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                self.assertEqual(module.main(), 0)
+        resolve.assert_not_called()
         self.assertEqual(calls["checkpoint"], str(self.temp / "manual-checkpoint"))
         self.assertEqual(calls["transformer"], str(self.temp / "manual-transformer"))
+
+    def test_named_runtime_consumes_ambient_runtime_assets(self) -> None:
+        module = load_generate_module()
+        calls = {}
+        argv = [
+            "generate.py",
+            "ambient beta prompt",
+            "--runtime",
+            "beta-0.6",
+            "--output",
+            str(self.temp / "ambient-beta.mp4"),
+        ]
+        with mock.patch.dict(module.os.environ, {module.RUNTIME_ASSETS_ENV: str(self.fixture.assets)}):
+            with mock.patch.object(module, "resolve_runtime", wraps=module.resolve_runtime) as resolve:
+                with mock.patch.object(module, "_load_pipeline_class", return_value=self._fake_pipeline(calls)):
+                    with mock.patch.object(module, "save_mp4"):
+                        with mock.patch.object(sys, "argv", argv):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                self.assertEqual(module.main(), 0)
+        resolve.assert_called_once_with("beta-0.6", str(self.fixture.assets))
+        self.assertEqual(calls["checkpoint"], str(self.fixture.checkpoint.resolve()))
+        self.assertEqual(calls["transformer"], str(self.fixture.transformer.resolve()))
+
+    def test_named_runtime_cli_assets_override_ambient_runtime_assets(self) -> None:
+        module = load_generate_module()
+        calls = {}
+        explicit_assets = self.fixture.assets
+        argv = [
+            "generate.py",
+            "explicit beta prompt",
+            "--runtime",
+            "beta-0.6",
+            "--runtime-assets",
+            str(explicit_assets),
+            "--output",
+            str(self.temp / "explicit-beta.mp4"),
+        ]
+        with mock.patch.dict(
+            module.os.environ,
+            {module.RUNTIME_ASSETS_ENV: str(self.temp / "ambient-assets-that-must-not-win")},
+        ):
+            with mock.patch.object(module, "resolve_runtime", wraps=module.resolve_runtime) as resolve:
+                with mock.patch.object(module, "_load_pipeline_class", return_value=self._fake_pipeline(calls)):
+                    with mock.patch.object(module, "save_mp4"):
+                        with mock.patch.object(sys, "argv", argv):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                self.assertEqual(module.main(), 0)
+        resolve.assert_called_once_with("beta-0.6", str(explicit_assets))
+        self.assertEqual(calls["checkpoint"], str(self.fixture.checkpoint.resolve()))
+        self.assertEqual(calls["transformer"], str(self.fixture.transformer.resolve()))
 
     def test_invalid_profile_is_rejected_before_heavy_loader(self) -> None:
         mutate_json(
