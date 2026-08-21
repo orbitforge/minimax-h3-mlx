@@ -369,9 +369,11 @@ Improve arbitrary-prompt compatibility for Heretic without weakening conditionin
 ## Slice 024 - Monolithic BF16-to-MLX Q6/Q8 Conversion
 
 **Status:** Complete for implementation and full host completion. The
-subsequent full beta conversion and streamed-AdaLN forge passed independent
-verification. Beta H3 runtime execution, generation, and render acceptance
-remain unproven.
+subsequent beta acceptance operation used those structurally verified outputs:
+the runtime and media pipeline structural gates passed, while human semantic
+acceptance exposed the source-layout contract repaired by Slice 025. Slice
+024's conversion and runtime structural contracts passed; Slice 024 itself is
+not characterized as failed.
 See the [historical Slice 024 closeout](slice-024-monolithic-q6-converter-closeout.md)
 and the [host-completion addendum](slice-024-host-completion-addendum.md).
 
@@ -406,24 +408,86 @@ contain `1,050` logical tensors.
   and was independently accepted as
   `BETA_STREAMED_ADALN_CHECKPOINT_VERIFIED`.
 - The existing production streamed-AdaLN runtime remains unchanged. The
-  host operation detected no source mutation and no modified tracked
+  subsequent pre-repair beta acceptance operation used live Canonical Qwen3-VL
+  conditioning, loaded the streamed beta transformer, completed `15`
+  denoising forwards, ran video and audio VAE paths, produced a structurally
+  valid MP4, and reclaimed memory. Human media acceptance failed at both
+  `128×128` and `512×512`: output was muddy/low-contrast with no recognizable
+  prompt semantics. This was the semantic source-layout discovery that led to
+  Slice 025, not a failure of Slice 024's conversion or runtime structural
+  contracts.
+- The host operation detected no source mutation and no modified tracked
   repository paths; detailed source, artifact, hash, and resource receipts
   are recorded in the host-completion addendum.
 
 The original Slice 024 closeout is a historical snapshot of the pre-host
 state and remains unchanged. The host completion did not run beta H3 runtime
 execution, live Qwen conditioning, denoising/generation, VAE execution, or
-video/audio render acceptance. Continuation, latent masking, and PR 15375
-research are not Slice 024 deliverables.
+video/audio render acceptance; that later pre-repair acceptance operation is
+recorded in the Slice 025 closeout. Corrected semantic output remains
+unproven. Continuation, latent masking, and PR 15375 research are not Slice
+024 deliverables.
 
 ### Next authorized step
 
-Begin the separately authorized beta generation acceptance gate. It must
-establish beta transformer runtime execution, live Qwen conditioning,
-denoising/generation, VAE execution, and video/audio render acceptance. The
-converter and streamed-AdaLN forge are already host-complete and independently
-verified; further converter implementation is not the next work. This roadmap
-update does not begin beta generation acceptance.
+The next operation after the pre-repair acceptance finding was the separately
+authorized Slice 025 beta QKV layout reconciliation. The corrected full
+conversion, verification, forge, and semantic acceptance gate are recorded as
+the next host operation in the Slice 025 closeout.
+
+---
+
+## Slice 025 - Beta QKV Layout Reconciliation
+
+**Status:** Closeout ready — implementation committed at `26869fb`; corrected
+beta conversion, verification, forge, and semantic acceptance remain
+unproven. See the [Slice 025 closeout](slice-025-beta-qkv-layout-reconciliation-closeout.md).
+
+### Objective
+
+Reconcile the accepted PinkCherry beta fused-QKV source row order with the
+runtime-native MLX row order before the existing Q6 quantization path, while
+keeping runtime attention semantics, quantization policy, and streamed-AdaLN
+format unchanged.
+
+### Delivered scope
+
+- exact beta source admission as `grouped_qkv`, bound to the accepted source
+  identity and checked-in authorization receipt;
+- fail-closed rejection of unknown, ambiguous, or contradictory layouts, with
+  runtime-native sources remaining a no-op;
+- grouped `[Q_all;K_all;V_all]` to runtime-native
+  `[head0:q,k,v][head1:q,k,v]...` reconciliation before Q6 quantization;
+- exhaustive coverage of `50` main-block and `2` token-refiner fused-QKV
+  weights, with zero fused-QKV biases; and
+- separate planning and execution receipts for QKV reconciliation.
+
+### Evidence and boundaries
+
+- independent payload evidence covered all `52/52` fused-QKV weights;
+- direct beta-versus-runtime comparison had relative L2 range
+  `1.400078–1.410067`, mean `1.405500`, and cosine range
+  `0.006202–0.020231`;
+- grouped-to-runtime reconciliation had relative L2 range
+  `0.022318–0.026479`, mean `0.023695`, and cosine range
+  `0.999650–0.999751`;
+- the final accepted validation recorded `55/55` monolithic tests,
+  `32 PASS` with `2` MLX-gated skips for checkpoint forge, exact source SHA
+  verification, `py_compile` pass, `git diff --check` pass, and an
+  independent second review of `PASS_WITH_GAPS` with the original P1 and P2
+  resolved; and
+- no corrected full conversion, conventional verification, streamed-AdaLN
+  forge, MLX/Metal generation, or human media acceptance was run for Slice
+  025.
+
+### Next authorized step
+
+Run the corrected beta host operation only after this documentation closeout
+is promoted: full BF16-to-conventional Q6/Q8 conversion, independent
+verification, streamed-AdaLN forge, independent streamed-checkpoint
+verification, and the controlled `512×512` semantic acceptance render. The
+full operation and its exact render settings are defined in the Slice 025
+closeout; this roadmap update does not begin it.
 
 ---
 
