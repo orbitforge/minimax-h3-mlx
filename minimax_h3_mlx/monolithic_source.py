@@ -30,6 +30,37 @@ from .quantize import CORE_LINEARS, NEVER_QUANTIZE, QuantConfig
 SUPPORTED_SOURCE_DTYPES = frozenset({"BF16", "F32"})
 CONFIG_METADATA_KEY = "config"
 
+# The MLX DiT consumes fused QKV rows as ``[head0:q,k,v][head1:q,k,v]...``.  The accepted
+# PinkCherry beta master is a distinct source lineage whose fused rows are ``[Q_all;K_all;V_all]``.
+# Shapes alone cannot distinguish those layouts, so admission is payload-receipt-bound and fail-closed.
+QKV_WEIGHT_SUFFIX = ".attn.qkv_proj.weight"
+QKV_BIAS_SUFFIX = ".attn.qkv_proj.bias"
+QKV_SOURCE_LAYOUT_METADATA_KEY = "qkv_source_layout"
+QKV_SOURCE_LAYOUT_GROUPED = "grouped_qkv"
+QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED = "runtime_interleaved"
+QKV_CANONICAL_LAYOUT = QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED
+QKV_MASTER_FORMAT_METADATA_KEY = "pinkcherry_h3_master_format"
+QKV_ACCEPTED_MASTER_FORMAT = "bf16_convrot_lineage_consolidation_v1"
+QKV_SOURCE_FINGERPRINT_METADATA_KEY = "pinkcherry_h3_source_fingerprint"
+QKV_ACCEPTED_SOURCE_FINGERPRINT = "41490c636f0f1158eadb37fab5b5c4b2fa16a4548f542db919756a59c40e20df"
+QKV_LAYOUT_AUTHORIZATION_SCHEMA = "slice025.qkv_layout_authorization.v1"
+QKV_LAYOUT_AUTHORIZATION_RECEIPT_NAME = "qkv_layout_authorization.json"
+QKV_LAYOUT_AUTHORIZATION_RECEIPT_PATH = Path(__file__).with_name(QKV_LAYOUT_AUTHORIZATION_RECEIPT_NAME)
+QKV_LAYOUT_AUTHORIZATION_RECEIPT_SHA256 = (
+    "62095531d253bc129c39b0033fa4b6c167067588aa5d0dfd851720d8753e10b6"
+)
+QKV_ACCEPTED_SOURCE_PATH = (
+    "/Users/elbancol/Downloads/PinkCherry-beta-redownload/beta-0.6-fl2va/"
+    "PinkCherry_fl2va_MiniMax_H3_bf16_beta-0.6.safetensors"
+)
+QKV_ACCEPTED_SOURCE_BYTES = 66288818760
+QKV_ACCEPTED_SOURCE_SHA256 = "16f1950cc83bd686106d49588c8611281fbb5e9ae46f8cd1ae7945fd4e00357d"
+QKV_ACCEPTED_SOURCE_IDENTITY = (
+    "safetensors:/Users/elbancol/Downloads/PinkCherry-beta-redownload/beta-0.6-fl2va/"
+    "PinkCherry_fl2va_MiniMax_H3_bf16_beta-0.6.safetensors:16777233:76930510:66288818760:"
+    "1787194704372543937:1787194704374750655:46d8e0071c98dbc5690b5e8bf990d536b18289c8b7b4c97724973fab88d5b35b"
+)
+
 # These are the fields present in the canonical production transformer's config.json.  The
 # loader's DiTConfig has a deliberate rope_theta default because the production file omits it;
 # this adapter does not synthesize any other field or topology value.
@@ -69,6 +100,89 @@ class MonolithicSourceError(ValueError):
 
 class SourceStaleError(MonolithicSourceError):
     """Raised when the registered source's local identity changes during conversion."""
+
+
+@dataclass(frozen=True)
+class FusedQKVSurface:
+    """The complete fused-QKV weight/bias surface derived from admitted source names."""
+
+    weight_names: tuple[str, ...]
+    bias_names: tuple[str, ...]
+
+    @property
+    def weight_count(self) -> int:
+        return len(self.weight_names)
+
+
+@dataclass(frozen=True)
+class QKVLayoutDecision:
+    """The source-to-runtime QKV layout contract carried by a conversion plan."""
+
+    source_layout: str
+    canonical_layout: str
+    row_reconciliation_required: bool
+    weight_names: tuple[str, ...]
+    bias_names: tuple[str, ...]
+    authorization: str
+    source_identity: str | None = None
+
+    @property
+    def weight_count(self) -> int:
+        return len(self.weight_names)
+
+
+def is_fused_qkv_weight(name: str) -> bool:
+    return name.endswith(QKV_WEIGHT_SUFFIX)
+
+
+def is_fused_qkv_bias(name: str) -> bool:
+    return name.endswith(QKV_BIAS_SUFFIX)
+
+
+def enumerate_fused_qkv_surface(tensor_names: tuple[str, ...] | list[str] | set[str]) -> FusedQKVSurface:
+    """Derive every fused QKV weight and bias from the source topology without a fixed count."""
+    names = tuple(sorted(tensor_names))
+    qkvish = tuple(name for name in names if ".attn.qkv_proj." in name)
+    weights = tuple(name for name in qkvish if is_fused_qkv_weight(name))
+    biases = tuple(name for name in qkvish if is_fused_qkv_bias(name))
+    unsupported = tuple(
+        name for name in qkvish if not is_fused_qkv_weight(name) and not is_fused_qkv_bias(name)
+    )
+    if unsupported:
+        raise MonolithicSourceError(
+            f"unsupported fused QKV tensor names in source topology: {list(unsupported)}"
+        )
+    weight_parents = {name[:-len(".weight")] for name in weights}
+    orphan_biases = tuple(
+        name for name in biases if name[:-len(".bias")] not in weight_parents
+    )
+    if orphan_biases:
+        raise MonolithicSourceError(
+            f"fused QKV bias has no corresponding weight: {list(orphan_biases)}"
+        )
+    return FusedQKVSurface(weights, biases)
+
+
+def _layout_decision(
+    source_layout: str,
+    surface: FusedQKVSurface,
+    *,
+    authorization: str,
+    source_identity: str | None,
+) -> QKVLayoutDecision:
+    if source_layout not in {QKV_SOURCE_LAYOUT_GROUPED, QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED}:
+        raise MonolithicSourceError(f"unknown QKV source layout: {source_layout!r}")
+    if not surface.weight_names:
+        raise MonolithicSourceError("admitted source topology contains no fused QKV weights")
+    return QKVLayoutDecision(
+        source_layout=source_layout,
+        canonical_layout=QKV_CANONICAL_LAYOUT,
+        row_reconciliation_required=source_layout == QKV_SOURCE_LAYOUT_GROUPED,
+        weight_names=surface.weight_names,
+        bias_names=surface.bias_names,
+        authorization=authorization,
+        source_identity=source_identity,
+    )
 
 
 @dataclass(frozen=True)
@@ -257,6 +371,275 @@ class MonolithicSafetensorsSource:
         return digest.hexdigest()
 
 
+def _load_qkv_layout_authorization_receipt() -> Mapping[str, object]:
+    """Load and validate the checked-in payload-bound Slice 025 layout receipt."""
+    receipt_path = QKV_LAYOUT_AUTHORIZATION_RECEIPT_PATH
+    try:
+        raw = receipt_path.read_bytes()
+    except OSError as exc:
+        raise MonolithicSourceError(
+            f"QKV layout authorization receipt is unavailable: {receipt_path}"
+        ) from exc
+    if hashlib.sha256(raw).hexdigest() != QKV_LAYOUT_AUTHORIZATION_RECEIPT_SHA256:
+        raise MonolithicSourceError(
+            "QKV layout authorization receipt checksum does not match the admitted evidence"
+        )
+    try:
+        receipt = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MonolithicSourceError("QKV layout authorization receipt is not valid JSON") from exc
+    if not isinstance(receipt, dict) or receipt.get("receipt_schema") != QKV_LAYOUT_AUTHORIZATION_SCHEMA:
+        raise MonolithicSourceError("QKV layout authorization receipt schema is not admitted")
+
+    beta = receipt.get("beta_source")
+    if not isinstance(beta, dict):
+        raise MonolithicSourceError("QKV layout authorization receipt has no beta source record")
+    if {
+        beta.get("path"),
+        beta.get("bytes"),
+        beta.get("sha256"),
+        beta.get("source_identity"),
+    } != {
+        QKV_ACCEPTED_SOURCE_PATH,
+        QKV_ACCEPTED_SOURCE_BYTES,
+        QKV_ACCEPTED_SOURCE_SHA256,
+        QKV_ACCEPTED_SOURCE_IDENTITY,
+    }:
+        raise MonolithicSourceError(
+            "QKV layout authorization receipt beta source identity is not admitted"
+        )
+    if beta.get("topology") != {"tensor_count": 535, "bf16": 522, "f32": 13}:
+        raise MonolithicSourceError("QKV layout authorization receipt topology is not admitted")
+
+    coverage = receipt.get("coverage")
+    if not isinstance(coverage, dict) or coverage != {
+        "all_expected_qkv_examined": True,
+        "examined_qkv_count": 52,
+        "expected_qkv_count": 52,
+        "main_block_count": 50,
+        "token_refiner_count": 2,
+    }:
+        raise MonolithicSourceError("QKV layout authorization receipt coverage is incomplete")
+    conclusion = receipt.get("layout_conclusion")
+    if not isinstance(conclusion, dict) or conclusion.get("status") != "GROUPED_QKV_PAYLOAD_SUPPORTED":
+        raise MonolithicSourceError("QKV layout authorization receipt has no grouped-QKV conclusion")
+    if conclusion.get("accepted_source_layout") != QKV_SOURCE_LAYOUT_GROUPED:
+        raise MonolithicSourceError("QKV layout authorization receipt does not authorize grouped QKV")
+    if conclusion.get("canonical_runtime_layout") != QKV_CANONICAL_LAYOUT:
+        raise MonolithicSourceError("QKV layout authorization receipt has an invalid runtime layout")
+
+    aggregate = receipt.get("aggregate")
+    if not isinstance(aggregate, dict):
+        raise MonolithicSourceError("QKV layout authorization receipt has no aggregate metrics")
+    direct_metrics = aggregate.get("direct_orientation")
+    grouped_metrics = aggregate.get("grouped_to_runtime_orientation")
+    if not isinstance(direct_metrics, dict) or not isinstance(grouped_metrics, dict):
+        raise MonolithicSourceError("QKV layout authorization receipt aggregate metrics are incomplete")
+    decisive_metrics = (
+        direct_metrics.get("mean_relative_l2"),
+        direct_metrics.get("max_cosine"),
+        grouped_metrics.get("max_relative_l2"),
+        grouped_metrics.get("min_cosine"),
+    )
+    if any(
+        not isinstance(value, (int, float)) or isinstance(value, bool)
+        for value in decisive_metrics
+    ):
+        raise MonolithicSourceError("QKV layout authorization receipt aggregate metrics are invalid")
+    if not (
+        decisive_metrics[0] > 1.0
+        and decisive_metrics[1] < 0.1
+        and decisive_metrics[2] < 0.1
+        and decisive_metrics[3] > 0.99
+    ):
+        raise MonolithicSourceError(
+            "QKV layout authorization receipt does not decisively support grouped QKV"
+        )
+
+    tensors = receipt.get("tensors")
+    if not isinstance(tensors, list) or len(tensors) != 52:
+        raise MonolithicSourceError("QKV layout authorization receipt does not contain all tensors")
+    names: set[str] = set()
+    expected_names = {
+        *(f"blocks.{block}.attn.qkv_proj.weight" for block in range(50)),
+        *(f"token_refiner.blocks.{block}.attn.qkv_proj.weight" for block in range(2)),
+    }
+    for tensor in tensors:
+        if not isinstance(tensor, dict) or not isinstance(tensor.get("name"), str):
+            raise MonolithicSourceError("QKV layout authorization receipt has an invalid tensor record")
+        name = tensor["name"]
+        if name in names:
+            raise MonolithicSourceError("QKV layout authorization receipt has duplicate tensor records")
+        names.add(name)
+        for orientation in ("direct", "grouped_to_runtime"):
+            metrics = tensor.get(orientation)
+            if (
+                not isinstance(metrics, dict)
+                or not isinstance(metrics.get("relative_l2"), (int, float))
+                or not isinstance(metrics.get("cosine"), (int, float))
+            ):
+                raise MonolithicSourceError(
+                    f"QKV layout authorization receipt has incomplete metrics for {name}"
+                )
+    if names != expected_names:
+        raise MonolithicSourceError(
+            "QKV layout authorization receipt tensor surface is not the admitted 52-tensor QKV surface"
+        )
+    return receipt
+
+
+def _authorize_grouped_qkv_source(
+    source: MonolithicSafetensorsSource,
+    *,
+    master_format: str | None,
+    source_fingerprint: str | None,
+) -> tuple[str, str]:
+    """Authorize grouped rows only for the exact source bound by the independent receipt."""
+    if (
+        master_format != QKV_ACCEPTED_MASTER_FORMAT
+        or source_fingerprint != QKV_ACCEPTED_SOURCE_FINGERPRINT
+    ):
+        raise MonolithicSourceError(
+            "grouped QKV source layout requires the exact accepted beta lineage metadata"
+        )
+    receipt = _load_qkv_layout_authorization_receipt()
+    beta = receipt["beta_source"]
+    if not isinstance(beta, dict):
+        raise MonolithicSourceError("QKV layout authorization receipt beta source record is invalid")
+    if source.path.as_posix() != QKV_ACCEPTED_SOURCE_PATH or source.source_size != QKV_ACCEPTED_SOURCE_BYTES:
+        raise MonolithicSourceError(
+            "grouped QKV authorization is bound to the exact accepted beta source path and size"
+        )
+    if source.identity != QKV_ACCEPTED_SOURCE_IDENTITY or source.identity != beta["source_identity"]:
+        raise MonolithicSourceError(
+            "grouped QKV authorization source identity does not match the payload-bound receipt"
+        )
+    authorization = (
+        f"payload_receipt:{QKV_LAYOUT_AUTHORIZATION_SCHEMA};"
+        f"receipt_sha256={QKV_LAYOUT_AUTHORIZATION_RECEIPT_SHA256};"
+        f"source_sha256={QKV_ACCEPTED_SOURCE_SHA256};"
+        f"source_identity={source.identity};"
+        f"layout={QKV_SOURCE_LAYOUT_GROUPED}"
+    )
+    return authorization, source.identity
+
+
+def resolve_qkv_layout(
+    source: MonolithicSafetensorsSource,
+    surface: FusedQKVSurface,
+) -> QKVLayoutDecision:
+    """Resolve the source QKV layout from explicit metadata and trusted beta lineage evidence."""
+    explicit = source.metadata.get(QKV_SOURCE_LAYOUT_METADATA_KEY)
+    master_format = source.metadata.get(QKV_MASTER_FORMAT_METADATA_KEY)
+    source_fingerprint = source.metadata.get(QKV_SOURCE_FINGERPRINT_METADATA_KEY)
+
+    if explicit is not None:
+        if explicit not in {QKV_SOURCE_LAYOUT_GROUPED, QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED}:
+            raise MonolithicSourceError(
+                f"unknown QKV source layout metadata {explicit!r}; refusing to guess"
+            )
+        if explicit == QKV_SOURCE_LAYOUT_GROUPED:
+            authorization, source_identity = _authorize_grouped_qkv_source(
+                source,
+                master_format=master_format,
+                source_fingerprint=source_fingerprint,
+            )
+            return _layout_decision(
+                explicit,
+                surface,
+                authorization=authorization,
+                source_identity=source_identity,
+            )
+        elif master_format == QKV_ACCEPTED_MASTER_FORMAT:
+            raise MonolithicSourceError(
+                "QKV source layout metadata conflicts with the accepted grouped beta lineage"
+            )
+        elif master_format is not None or source_fingerprint is not None:
+            raise MonolithicSourceError(
+                "QKV source layout metadata is ambiguous with additional source lineage metadata"
+            )
+        return _layout_decision(
+            explicit,
+            surface,
+            authorization=f"metadata:{QKV_SOURCE_LAYOUT_METADATA_KEY}={explicit}",
+            source_identity=source.identity,
+        )
+
+    if master_format == QKV_ACCEPTED_MASTER_FORMAT:
+        authorization, source_identity = _authorize_grouped_qkv_source(
+            source,
+            master_format=master_format,
+            source_fingerprint=source_fingerprint,
+        )
+        return _layout_decision(
+            QKV_SOURCE_LAYOUT_GROUPED,
+            surface,
+            authorization=authorization,
+            source_identity=source_identity,
+        )
+
+    if master_format is not None or source_fingerprint is not None:
+        raise MonolithicSourceError(
+            "QKV source layout is unknown for the supplied source lineage; refusing to guess"
+        )
+    raise MonolithicSourceError(
+        f"QKV source layout metadata {QKV_SOURCE_LAYOUT_METADATA_KEY!r} is missing; refusing to guess"
+    )
+
+
+def reconcile_qkv_rows(
+    value: np.ndarray,
+    *,
+    source_layout: str,
+    num_attention_heads: int,
+    attention_head_dim: int,
+    tensor_name: str,
+) -> np.ndarray:
+    """Canonicalize grouped QKV rows into runtime interleaving without changing feature axes."""
+    if source_layout not in {QKV_SOURCE_LAYOUT_GROUPED, QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED}:
+        raise MonolithicSourceError(
+            f"cannot reconcile {tensor_name}: unknown QKV source layout {source_layout!r}"
+        )
+    if num_attention_heads <= 0 or attention_head_dim <= 0:
+        raise MonolithicSourceError(
+            f"cannot reconcile {tensor_name}: QKV dimensions must be positive"
+        )
+    expected_rows = 3 * num_attention_heads * attention_head_dim
+    if value.ndim == 2:
+        if value.shape[0] != expected_rows or value.shape[1] <= 0:
+            raise MonolithicSourceError(
+                f"{tensor_name} fused QKV weight shape {tuple(value.shape)} is incompatible with "
+                f"{num_attention_heads} heads x {attention_head_dim} head_dim; "
+                f"expected ({expected_rows}, input_features>0)"
+            )
+        if source_layout == QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED:
+            return np.array(value, copy=True)
+        return (
+            value.reshape(3, num_attention_heads, attention_head_dim, value.shape[1])
+            .transpose(1, 0, 2, 3)
+            .reshape(value.shape)
+            .copy()
+        )
+    if value.ndim == 1:
+        if value.shape[0] != expected_rows:
+            raise MonolithicSourceError(
+                f"{tensor_name} fused QKV bias shape {tuple(value.shape)} is incompatible with "
+                f"{num_attention_heads} heads x {attention_head_dim} head_dim; "
+                f"expected ({expected_rows},)"
+            )
+        if source_layout == QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED:
+            return np.array(value, copy=True)
+        return (
+            value.reshape(3, num_attention_heads, attention_head_dim)
+            .transpose(1, 0, 2)
+            .reshape(value.shape)
+            .copy()
+        )
+    raise MonolithicSourceError(
+        f"{tensor_name} fused QKV tensor must be rank 1 bias or rank 2 weight; got rank {value.ndim}"
+    )
+
+
 def extract_embedded_config(
     metadata: Mapping[str, str],
     *,
@@ -430,6 +813,7 @@ class SourceClassification:
     config_raw: Mapping[str, object]
     tensors: tuple[TensorClassification, ...]
     counts: Mapping[str, int]
+    qkv_layout: QKVLayoutDecision
 
     @property
     def by_name(self) -> dict[str, TensorClassification]:
@@ -448,6 +832,7 @@ def _classify_admitted_descriptors(
     config: DiTConfig,
     config_raw: Mapping[str, object],
     descriptors: Mapping[str, TensorHeader],
+    qkv_layout: QKVLayoutDecision,
 ) -> SourceClassification:
     """Apply the production QuantConfig policy to an already admitted canonical topology."""
     policy = QuantConfig(bits=6, group_size=64, quantize_adaln=True, adaln_bits=8)
@@ -512,7 +897,13 @@ def _classify_admitted_descriptors(
         )
     if len(classified) - counts["recomputed"] != 534:
         raise MonolithicSourceError("stored source tensor count after rope exclusion is not 534")
-    return SourceClassification(config, config_raw, tuple(classified), dict(sorted(counts.items())))
+    return SourceClassification(
+        config,
+        config_raw,
+        tuple(classified),
+        dict(sorted(counts.items())),
+        qkv_layout,
+    )
 
 
 def classify_expected_source_config(config_raw: Mapping[str, object]) -> SourceClassification:
@@ -532,7 +923,14 @@ def classify_expected_source_config(config_raw: Mapping[str, object]) -> SourceC
         end = offset + element_count * DTYPE_BYTES[dtype]
         descriptors[name] = TensorHeader(name, dtype, shape, offset, end)
         offset = end
-    return _classify_admitted_descriptors(config, dict(config_raw), descriptors)
+    surface = enumerate_fused_qkv_surface(tuple(descriptors))
+    qkv_layout = _layout_decision(
+        QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED,
+        surface,
+        authorization="canonical-output-topology",
+        source_identity=None,
+    )
+    return _classify_admitted_descriptors(config, dict(config_raw), descriptors, qkv_layout)
 
 
 def classify_source(
@@ -573,7 +971,9 @@ def classify_source(
                 f"source tensor {name} has shape {descriptor.shape}; expected {shape}"
             )
 
-    return _classify_admitted_descriptors(config, config_raw, descriptors)
+    surface = enumerate_fused_qkv_surface(tuple(descriptors))
+    qkv_layout = resolve_qkv_layout(source, surface)
+    return _classify_admitted_descriptors(config, config_raw, descriptors, qkv_layout)
 
 
 def decode_bfloat16_to_float32(raw: bytes, shape: tuple[int, ...]) -> np.ndarray:

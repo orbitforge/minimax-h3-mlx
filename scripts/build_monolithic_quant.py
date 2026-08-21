@@ -76,6 +76,15 @@ def _plan_receipt(plan) -> dict[str, object]:
         "selected_quantized_weights": list(plan.selected_quantized_weights),
         "classification_counts": dict(plan.classification.counts),
         "quant_config": plan.quant_config,
+        "qkv_source_layout": plan.classification.qkv_layout.source_layout,
+        "qkv_canonical_layout": plan.classification.qkv_layout.canonical_layout,
+        "qkv_row_reconciliation_applied": False,
+        "qkv_tensors_reconciled": 0,
+        "qkv_tensors_planned": plan.qkv_tensors_planned,
+        "qkv_layout_source_identity": (
+            plan.classification.qkv_layout.source_identity or plan.source.identity
+        ),
+        "qkv_layout_authorization": plan.classification.qkv_layout.authorization,
         "shards": [{"filename": shard.filename, "tensor_count": len(shard.tensors), "bytes": shard.nbytes} for shard in plan.shards()],
     }
 
@@ -142,6 +151,12 @@ def main(argv: list[str] | None = None) -> int:
                     "payload_bytes_read": receipt.payload_bytes_read,
                     "range_read_count": receipt.range_read_count,
                     "memory_snapshots": list(receipt.memory_snapshots),
+                    "qkv_source_layout": receipt.qkv_source_layout,
+                    "qkv_canonical_layout": receipt.qkv_canonical_layout,
+                    "qkv_row_reconciliation_applied": receipt.qkv_row_reconciliation_applied,
+                    "qkv_tensors_reconciled": receipt.qkv_tensors_reconciled,
+                    "qkv_layout_source_identity": receipt.qkv_layout_source_identity,
+                    "qkv_layout_authorization": receipt.qkv_layout_authorization,
                 },
                 indent=2,
                 default=str,

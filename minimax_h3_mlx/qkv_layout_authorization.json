@@ -1,0 +1,931 @@
+{
+  "aggregate": {
+    "direct_orientation": {
+      "max_cosine": 0.02023120316302276,
+      "max_relative_l2": 1.4100666012868908,
+      "mean_relative_l2": 1.405500125048941,
+      "min_cosine": 0.006201557044973879,
+      "worst_relative_l2": 1.4100666012868908,
+      "worst_relative_l2_tensor": "blocks.9.attn.qkv_proj.weight"
+    },
+    "grouped_to_runtime_orientation": {
+      "max_cosine": 0.9997510981731262,
+      "max_relative_l2": 0.026479141567149807,
+      "mean_relative_l2": 0.023695182934508528,
+      "min_cosine": 0.9996496216596668,
+      "worst_relative_l2": 0.026479141567149807,
+      "worst_relative_l2_tensor": "blocks.2.attn.qkv_proj.weight"
+    }
+  },
+  "beta_source": {
+    "bytes": 66288818760,
+    "expected_bytes": 66288818760,
+    "path": "/Users/elbancol/Downloads/PinkCherry-beta-redownload/beta-0.6-fl2va/PinkCherry_fl2va_MiniMax_H3_bf16_beta-0.6.safetensors",
+    "source_identity": "safetensors:/Users/elbancol/Downloads/PinkCherry-beta-redownload/beta-0.6-fl2va/PinkCherry_fl2va_MiniMax_H3_bf16_beta-0.6.safetensors:16777233:76930510:66288818760:1787194704372543937:1787194704374750655:46d8e0071c98dbc5690b5e8bf990d536b18289c8b7b4c97724973fab88d5b35b",
+    "qkv_count_examined": 52,
+    "sha256": "16f1950cc83bd686106d49588c8611281fbb5e9ae46f8cd1ae7945fd4e00357d",
+    "source_payload_bytes_examined": 12022972416,
+    "source_range_count": 52,
+    "source_stat_unchanged": true,
+    "topology": {
+      "bf16": 522,
+      "f32": 13,
+      "tensor_count": 535
+    }
+  },
+  "comparison_reference": {
+    "base_path": "/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln/base",
+    "conversion_manifest_sha256": "602e3caba9e0c3243e90b0b7455ff762823ad0428be680e0f592a29211151d3e",
+    "path": "/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln",
+    "quantization": {
+      "bits": 6,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "reference_payload_bytes_examined": 4884332544,
+    "reference_shards": [
+      {
+        "filename": "model-00001-of-00006.safetensors",
+        "size_bytes": 5324328299
+      },
+      {
+        "filename": "model-00002-of-00006.safetensors",
+        "size_bytes": 5307167619
+      },
+      {
+        "filename": "model-00003-of-00006.safetensors",
+        "size_bytes": 5307167627
+      },
+      {
+        "filename": "model-00004-of-00006.safetensors",
+        "size_bytes": 5307167621
+      },
+      {
+        "filename": "model-00005-of-00006.safetensors",
+        "size_bytes": 5307167628
+      },
+      {
+        "filename": "model-00006-of-00006.safetensors",
+        "size_bytes": 3739307007
+      }
+    ],
+    "runtime_contract": "verified production streamed-adaln base; qkv packed payloads are consumed as runtime-native rows",
+    "source_checkpoint_logical_identity": "beff3b611b6b7597c30d07dd050c50ea393d785c97b3e0417309ead226719abe",
+    "source_checkpoint_path": "/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit",
+    "source_safetensors_index_checksum": "beff3b611b6b7597c30d07dd050c50ea393d785c97b3e0417309ead226719abe"
+  },
+  "coverage": {
+    "all_expected_qkv_examined": true,
+    "examined_qkv_count": 52,
+    "expected_qkv_count": 52,
+    "main_block_count": 50,
+    "token_refiner_count": 2
+  },
+  "layout_conclusion": {
+    "accepted_source_layout": "grouped_qkv",
+    "canonical_runtime_layout": "runtime_interleaved",
+    "fail_closed_rule": "authorization is valid only for the exact beta source SHA256 and this complete receipt identity",
+    "status": "GROUPED_QKV_PAYLOAD_SUPPORTED"
+  },
+  "receipt_schema": "slice025.qkv_layout_authorization.v1",
+  "tensors": [
+    {
+      "direct": {
+        "cosine": 0.014083997929506464,
+        "relative_l2": 1.4044584735650985
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997251154212472,
+        "relative_l2": 0.02345362106388783
+      },
+      "name": "blocks.0.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.011269995130303367,
+        "relative_l2": 1.4064677878671465
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9996855175717163,
+        "relative_l2": 0.02508599386020592
+      },
+      "name": "blocks.1.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.008013239875860334,
+        "relative_l2": 1.4087875143725879
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997163026078666,
+        "relative_l2": 0.02382698069707799
+      },
+      "name": "blocks.10.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.011033950796902807,
+        "relative_l2": 1.4066352921499035
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997278022558436,
+        "relative_l2": 0.023338969309870887
+      },
+      "name": "blocks.11.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010542118819169582,
+        "relative_l2": 1.4069866444404375
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997299007082547,
+        "relative_l2": 0.023248913515264896
+      },
+      "name": "blocks.12.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010372884130570002,
+        "relative_l2": 1.4071062833240555
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997284859760165,
+        "relative_l2": 0.023309681152600972
+      },
+      "name": "blocks.13.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01870317941425845,
+        "relative_l2": 1.4011724078238899
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.999728995032706,
+        "relative_l2": 0.023287857791213364
+      },
+      "name": "blocks.14.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.014692977431783985,
+        "relative_l2": 1.4040335736809657
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.999728435581032,
+        "relative_l2": 0.023311917023788
+      },
+      "name": "blocks.15.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.009249042253324147,
+        "relative_l2": 1.4079105696581238
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997215549694534,
+        "relative_l2": 0.0236054670365781
+      },
+      "name": "blocks.16.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.007615209693756319,
+        "relative_l2": 1.4090690492081812
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997243952271073,
+        "relative_l2": 0.02348471986687478
+      },
+      "name": "blocks.17.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.009563497971945846,
+        "relative_l2": 1.4076835603328968
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997281121897541,
+        "relative_l2": 0.023325792145565873
+      },
+      "name": "blocks.18.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.02023120316302276,
+        "relative_l2": 1.40007842498504
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997341045289041,
+        "relative_l2": 0.02306722969480321
+      },
+      "name": "blocks.19.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012484610283187137,
+        "relative_l2": 1.405614019388414
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9996496216596668,
+        "relative_l2": 0.026479141567149807
+      },
+      "name": "blocks.2.attn.qkv_proj.weight",
+      "reference_shard": "model-00001-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013768408694240463,
+        "relative_l2": 1.4046930923771923
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997212792878513,
+        "relative_l2": 0.02361704460038724
+      },
+      "name": "blocks.20.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.014143276306331809,
+        "relative_l2": 1.4044293816571254
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997281097382392,
+        "relative_l2": 0.02332605668163583
+      },
+      "name": "blocks.21.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012914535882334217,
+        "relative_l2": 1.4053032946062267
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997277378897873,
+        "relative_l2": 0.023341958587407608
+      },
+      "name": "blocks.22.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.014245062278824388,
+        "relative_l2": 1.4043571029031623
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997251663851633,
+        "relative_l2": 0.0234519539921197
+      },
+      "name": "blocks.23.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.009683872212150868,
+        "relative_l2": 1.4076041702312734
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997329999427805,
+        "relative_l2": 0.02311546118006252
+      },
+      "name": "blocks.24.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013063400611724315,
+        "relative_l2": 1.4051958413321333
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997291724453262,
+        "relative_l2": 0.02328034037790823
+      },
+      "name": "blocks.25.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.011586271062347355,
+        "relative_l2": 1.4062546284331447
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997311073409731,
+        "relative_l2": 0.02319734308301692
+      },
+      "name": "blocks.26.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012657153904414227,
+        "relative_l2": 1.4054903921963537
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997233840555145,
+        "relative_l2": 0.02352795942631885
+      },
+      "name": "blocks.27.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010041924594635801,
+        "relative_l2": 1.4073546722783796
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997336764681439,
+        "relative_l2": 0.02308635879452927
+      },
+      "name": "blocks.28.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012066465283502832,
+        "relative_l2": 1.4059145293914943
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997317719700625,
+        "relative_l2": 0.023168723806261345
+      },
+      "name": "blocks.29.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.006916883795618168,
+        "relative_l2": 1.409580907409903
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9996646397946412,
+        "relative_l2": 0.025905939101533212
+      },
+      "name": "blocks.3.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01164725533999178,
+        "relative_l2": 1.406220075507467
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997329100025849,
+        "relative_l2": 0.023119821648428848
+      },
+      "name": "blocks.30.attn.qkv_proj.weight",
+      "reference_shard": "model-00002-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013522422219626018,
+        "relative_l2": 1.4048684397371303
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997318399149718,
+        "relative_l2": 0.02316541320991188
+      },
+      "name": "blocks.31.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012888081916574784,
+        "relative_l2": 1.4053160331240482
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997294967517911,
+        "relative_l2": 0.02326622505779312
+      },
+      "name": "blocks.32.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.014027869652905079,
+        "relative_l2": 1.404509543322218
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997319769419902,
+        "relative_l2": 0.02315953584714584
+      },
+      "name": "blocks.33.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.015108890975378764,
+        "relative_l2": 1.4037404984463893
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997307568152816,
+        "relative_l2": 0.023212221384994496
+      },
+      "name": "blocks.34.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013327383695640514,
+        "relative_l2": 1.405006721765818
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997276175804614,
+        "relative_l2": 0.023347012234932806
+      },
+      "name": "blocks.35.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01271500637248924,
+        "relative_l2": 1.4054343060694257
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.99972284097893,
+        "relative_l2": 0.023550471263194664
+      },
+      "name": "blocks.36.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01699443166498977,
+        "relative_l2": 1.4023904885909042
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997263798476421,
+        "relative_l2": 0.023399875232730967
+      },
+      "name": "blocks.37.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013462731606524092,
+        "relative_l2": 1.4049040764102665
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.999718234065256,
+        "relative_l2": 0.023745428503953198
+      },
+      "name": "blocks.38.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.013789733316118387,
+        "relative_l2": 1.4046713035710068
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997239651653262,
+        "relative_l2": 0.023502752358220406
+      },
+      "name": "blocks.39.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010707708989852807,
+        "relative_l2": 1.4068799720103526
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.999676057963621,
+        "relative_l2": 0.025460887914552997
+      },
+      "name": "blocks.4.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01388573043054529,
+        "relative_l2": 1.4046042164572405
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997263010889972,
+        "relative_l2": 0.023403165742014096
+      },
+      "name": "blocks.40.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.018689554284344705,
+        "relative_l2": 1.4011775310043229
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997196980040418,
+        "relative_l2": 0.023683679060296586
+      },
+      "name": "blocks.41.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012753822593519686,
+        "relative_l2": 1.405412914461955
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997181441152889,
+        "relative_l2": 0.023749374555939777
+      },
+      "name": "blocks.42.attn.qkv_proj.weight",
+      "reference_shard": "model-00003-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012992786194019362,
+        "relative_l2": 1.4052329909960803
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997132100317949,
+        "relative_l2": 0.023955934254704193
+      },
+      "name": "blocks.43.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.01494495763885702,
+        "relative_l2": 1.40384690601432
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997181427892673,
+        "relative_l2": 0.023749221925849683
+      },
+      "name": "blocks.44.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010599861761142977,
+        "relative_l2": 1.4069409542030975
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997171504482906,
+        "relative_l2": 0.023791030806351747
+      },
+      "name": "blocks.45.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012950323196186898,
+        "relative_l2": 1.4052634933248511
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997104828750719,
+        "relative_l2": 0.024069553953806583
+      },
+      "name": "blocks.46.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012844591135935604,
+        "relative_l2": 1.4053408315303186
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997069257374744,
+        "relative_l2": 0.02421701539781901
+      },
+      "name": "blocks.47.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.017655829180475455,
+        "relative_l2": 1.4019079053122583
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997032220788613,
+        "relative_l2": 0.024369373453757174
+      },
+      "name": "blocks.48.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.010712524476362948,
+        "relative_l2": 1.4068475215390366
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9996943500997278,
+        "relative_l2": 0.02473065468608212
+      },
+      "name": "blocks.49.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.012460659591307195,
+        "relative_l2": 1.4056372832455346
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9996860243819246,
+        "relative_l2": 0.025066412617409495
+      },
+      "name": "blocks.5.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.011000205275735114,
+        "relative_l2": 1.4066679958987414
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997057295885852,
+        "relative_l2": 0.02426693878651257
+      },
+      "name": "blocks.6.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.007998290473398484,
+        "relative_l2": 1.408802359807484
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997022507581091,
+        "relative_l2": 0.024409970266858066
+      },
+      "name": "blocks.7.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.019982432539353737,
+        "relative_l2": 1.4002661796394977
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.999714254370185,
+        "relative_l2": 0.023912958068064285
+      },
+      "name": "blocks.8.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.006201557044973879,
+        "relative_l2": 1.4100666012868908
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997277740182526,
+        "relative_l2": 0.023340136970067992
+      },
+      "name": "blocks.9.attn.qkv_proj.weight",
+      "reference_shard": "model-00004-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.015341365993957535,
+        "relative_l2": 1.4035622043122353
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997510981731262,
+        "relative_l2": 0.022317895355944483
+      },
+      "name": "token_refiner.blocks.0.attn.qkv_proj.weight",
+      "reference_shard": "model-00005-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    },
+    {
+      "direct": {
+        "cosine": 0.008676793106365007,
+        "relative_l2": 1.4083055413429177
+      },
+      "grouped_to_runtime": {
+        "cosine": 0.9997505807611134,
+        "relative_l2": 0.02234112768104422
+      },
+      "name": "token_refiner.blocks.1.attn.qkv_proj.weight",
+      "reference_shard": "model-00005-of-00005.safetensors",
+      "shape": [
+        21504,
+        5376
+      ]
+    }
+  ],
+  "tool_algorithm": {
+    "algorithm": "independent_numpy_payload_comparison_v1",
+    "packed_reference_dequantization": "MLX affine bitstream unpack, 6-bit, group_size=64, BF16 scales/biases widened to F32",
+    "repository_head": "de27787e4965eaccc5b4238c98c705307070a954",
+    "row_permutation": "reshape(3,56,128,input)->transpose(1,0,2,3)->flatten, accumulated without full permuted retention"
+  }
+}

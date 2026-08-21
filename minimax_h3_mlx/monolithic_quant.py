@@ -30,12 +30,18 @@ from .checkpoint_forge.tensor_io import (
 from .monolithic_source import (
     MonolithicSafetensorsSource,
     MonolithicSourceError,
+    QKV_BIAS_SUFFIX,
+    QKV_SOURCE_LAYOUT_GROUPED,
+    QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED,
+    QKV_WEIGHT_SUFFIX,
+    QKVLayoutDecision,
     SourceClassification,
     SourceStaleError,
     TensorClassification,
     classify_expected_source_config,
     classify_source,
     decode_bfloat16_to_float32,
+    reconcile_qkv_rows,
 )
 
 
@@ -109,6 +115,12 @@ class ConversionPlan:
     @property
     def quant_config(self) -> dict[str, object]:
         return {**OUTPUT_RECIPE, "quantized_layers": self.quantized_counts}
+
+    @property
+    def qkv_tensors_planned(self) -> int:
+        if not self.classification.qkv_layout.row_reconciliation_required:
+            return 0
+        return sum(name.endswith(QKV_WEIGHT_SUFFIX) for name in self.selected_quantized_weights)
 
     def shards(self, target_bytes: int = MAX_SHARD_BYTES) -> tuple[OutputShard, ...]:
         if target_bytes <= 0:
@@ -321,6 +333,24 @@ class QuantizedResult:
     arrays: Mapping[str, QuantizedArray]
 
 
+class QKVReconciliationExecution:
+    """Actual per-invocation QKV transformations that completed before quantization."""
+
+    def __init__(self) -> None:
+        self.reconciled_tensor_names: set[str] = set()
+
+    def record(self, tensor_name: str) -> None:
+        self.reconciled_tensor_names.add(tensor_name)
+
+    @property
+    def qkv_tensors_reconciled(self) -> int:
+        return len(self.reconciled_tensor_names)
+
+    @property
+    def qkv_row_reconciliation_applied(self) -> bool:
+        return bool(self.reconciled_tensor_names)
+
+
 class Quantizer(Protocol):
     def quantize(self, parent: str, bias_bytes: bytes | None = None) -> QuantizedResult:
         ...
@@ -372,29 +402,100 @@ class MlxArrayPayload:
                 pass
 
 
-def _decode_to_mlx(raw: bytes, dtype: str, shape: tuple[int, ...], mx_module):
+def _decode_source_array(raw: bytes, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
     if dtype == "BF16":
-        decoded = decode_bfloat16_to_float32(raw, shape)
-        result = mx_module.array(decoded).astype(mx_module.bfloat16)
-        del decoded
-        return result
+        return decode_bfloat16_to_float32(raw, shape)
     if dtype == "F32":
         expected = int(np.prod(shape, dtype=np.int64)) if shape else 1
         if len(raw) != expected * DTYPE_BYTES["F32"]:
             raise MonolithicSourceError(
                 f"F32 payload has {len(raw)} bytes; expected {expected * DTYPE_BYTES['F32']}"
             )
-        decoded = np.frombuffer(raw, dtype=np.dtype("<f4"), count=expected).reshape(shape)
-        result = mx_module.array(decoded).astype(mx_module.float32)
-        del decoded
-        return result
+        return np.frombuffer(raw, dtype=np.dtype("<f4"), count=expected).reshape(shape)
     raise MonolithicSourceError(f"cannot decode source dtype for MLX quantization: {dtype}")
+
+
+def prepare_source_array_for_quantization(
+    raw: bytes,
+    dtype: str,
+    shape: tuple[int, ...],
+    *,
+    tensor_name: str,
+    qkv_layout: QKVLayoutDecision | None,
+    num_attention_heads: int,
+    attention_head_dim: int,
+    reconciliation_execution: QKVReconciliationExecution | None = None,
+) -> np.ndarray:
+    """Decode one source tensor and reconcile only fused QKV rows before MLX sees the weight."""
+    decoded = _decode_source_array(raw, dtype, shape)
+    if tensor_name.endswith(QKV_WEIGHT_SUFFIX) or tensor_name.endswith(QKV_BIAS_SUFFIX):
+        if qkv_layout is None:
+            raise MonolithicSourceError(
+                f"QKV tensor {tensor_name} reached quantization without an admitted layout decision"
+            )
+        if tensor_name not in (*qkv_layout.weight_names, *qkv_layout.bias_names):
+            raise MonolithicSourceError(
+                f"QKV tensor {tensor_name} is not part of the admitted QKV surface"
+            )
+        if qkv_layout.source_layout == QKV_SOURCE_LAYOUT_GROUPED:
+            transformed = reconcile_qkv_rows(
+                decoded,
+                source_layout=qkv_layout.source_layout,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                tensor_name=tensor_name,
+            )
+            if reconciliation_execution is not None:
+                reconciliation_execution.record(tensor_name)
+            return transformed
+        if qkv_layout.source_layout != QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED:
+            raise MonolithicSourceError(
+                f"QKV tensor {tensor_name} reached quantization with unknown source layout "
+                f"{qkv_layout.source_layout!r}"
+            )
+    return decoded
+
+
+def _decode_to_mlx(
+    raw: bytes,
+    dtype: str,
+    shape: tuple[int, ...],
+    mx_module,
+    *,
+    tensor_name: str,
+    qkv_layout: QKVLayoutDecision | None,
+    num_attention_heads: int,
+    attention_head_dim: int,
+    reconciliation_execution: QKVReconciliationExecution | None = None,
+):
+    decoded = prepare_source_array_for_quantization(
+        raw,
+        dtype,
+        shape,
+        tensor_name=tensor_name,
+        qkv_layout=qkv_layout,
+        num_attention_heads=num_attention_heads,
+        attention_head_dim=attention_head_dim,
+        reconciliation_execution=reconciliation_execution,
+    )
+    if dtype == "BF16":
+        result = mx_module.array(decoded).astype(mx_module.bfloat16)
+    else:
+        result = mx_module.array(decoded).astype(mx_module.float32)
+    del decoded
+    return result
 
 
 class MlxIsolatedQuantizer:
     """MLX-backed one-linear quantizer; importing MLX is intentionally deferred to construction."""
 
-    def __init__(self, source: MonolithicSafetensorsSource, classification: SourceClassification, temp_dir: Path):
+    def __init__(
+        self,
+        source: MonolithicSafetensorsSource,
+        classification: SourceClassification,
+        temp_dir: Path,
+        reconciliation_execution: QKVReconciliationExecution | None = None,
+    ):
         import mlx.core as mx
         import mlx.nn as nn
 
@@ -404,7 +505,11 @@ class MlxIsolatedQuantizer:
         self.mx = mx
         self.nn = nn
         self.memory_snapshots: list[dict[str, int | None]] = []
+        self.reconciliation_execution = reconciliation_execution
         self._snapshot("quantizer_ready")
+
+    def bind_reconciliation_execution(self, execution: QKVReconciliationExecution) -> None:
+        self.reconciliation_execution = execution
 
     def _snapshot(self, label: str) -> None:
         values: dict[str, object] = {"label": label}
@@ -428,7 +533,17 @@ class MlxIsolatedQuantizer:
         self._snapshot(f"before_{parent}")
         raw_weight = self.source.read_tensor(parent)
         output_features, input_features = item.descriptor.shape
-        weight = _decode_to_mlx(raw_weight, item.descriptor.dtype, item.descriptor.shape, self.mx)
+        weight = _decode_to_mlx(
+            raw_weight,
+            item.descriptor.dtype,
+            item.descriptor.shape,
+            self.mx,
+            tensor_name=parent,
+            qkv_layout=self.classification.qkv_layout,
+            num_attention_heads=self.classification.config.num_attention_heads,
+            attention_head_dim=self.classification.config.attention_head_dim,
+            reconciliation_execution=self.reconciliation_execution,
+        )
         del raw_weight
 
         bias_name = f"{parent[:-len('.weight')]}.bias"
@@ -440,7 +555,17 @@ class MlxIsolatedQuantizer:
             if bias_bytes is None:
                 bias_bytes = self.source.read_tensor(bias_name)
             bias_descriptor = by_name[bias_name].descriptor
-            linear.bias = _decode_to_mlx(bias_bytes, bias_descriptor.dtype, bias_descriptor.shape, self.mx)
+            linear.bias = _decode_to_mlx(
+                bias_bytes,
+                bias_descriptor.dtype,
+                bias_descriptor.shape,
+                self.mx,
+                tensor_name=bias_name,
+                qkv_layout=self.classification.qkv_layout,
+                num_attention_heads=self.classification.config.num_attention_heads,
+                attention_head_dim=self.classification.config.attention_head_dim,
+                reconciliation_execution=self.reconciliation_execution,
+            )
 
         quantized = self.nn.QuantizedLinear.from_linear(
             linear,
@@ -498,7 +623,13 @@ def _ensure_output_disjoint(source: MonolithicSafetensorsSource, output: Path) -
     return target
 
 
-def _index_metadata(plan: ConversionPlan) -> dict[str, object]:
+def _index_metadata(
+    plan: ConversionPlan,
+    *,
+    qkv_tensors_reconciled: int = 0,
+    qkv_row_reconciliation_applied: bool = False,
+) -> dict[str, object]:
+    qkv_layout = plan.classification.qkv_layout
     return {
         "total_size": sum(tensor.nbytes for tensor in plan.output_tensors),
         "bounded": plan.bounded,
@@ -506,6 +637,36 @@ def _index_metadata(plan: ConversionPlan) -> dict[str, object]:
         "source_size": plan.source.source_size,
         "selected_quantized_weights": list(plan.selected_quantized_weights),
         "quantized_layers": plan.quantized_counts,
+        "qkv_source_layout": qkv_layout.source_layout,
+        "qkv_canonical_layout": qkv_layout.canonical_layout,
+        "qkv_row_reconciliation_applied": qkv_row_reconciliation_applied,
+        "qkv_tensors_reconciled": qkv_tensors_reconciled,
+        "qkv_layout_source_identity": qkv_layout.source_identity or plan.source.identity,
+        "qkv_layout_authorization": qkv_layout.authorization,
+    }
+
+
+def _qkv_receipt_metadata(
+    plan: ConversionPlan,
+    *,
+    qkv_tensors_reconciled: int = 0,
+    qkv_row_reconciliation_applied: bool = False,
+) -> dict[str, object]:
+    metadata = _index_metadata(
+        plan,
+        qkv_tensors_reconciled=qkv_tensors_reconciled,
+        qkv_row_reconciliation_applied=qkv_row_reconciliation_applied,
+    )
+    return {
+        key: metadata[key]
+        for key in (
+            "qkv_source_layout",
+            "qkv_canonical_layout",
+            "qkv_row_reconciliation_applied",
+            "qkv_tensors_reconciled",
+            "qkv_layout_source_identity",
+            "qkv_layout_authorization",
+        )
     }
 
 
@@ -524,6 +685,12 @@ class ConversionReceipt:
     payload_bytes_read: int
     range_read_count: int
     memory_snapshots: tuple[Mapping[str, object], ...]
+    qkv_source_layout: str
+    qkv_canonical_layout: str
+    qkv_row_reconciliation_applied: bool
+    qkv_tensors_reconciled: int
+    qkv_layout_source_identity: str
+    qkv_layout_authorization: str
 
 
 def convert(
@@ -543,6 +710,7 @@ def convert(
     shards = plan.shards(target_shard_bytes)
     temporary: Path | None = Path(tempfile.mkdtemp(prefix=f".{target.name}.incomplete-", dir=target.parent))
     active_quantizer = quantizer
+    reconciliation_execution = QKVReconciliationExecution()
     states: dict[str, QuantizedResult] = {}
     remaining: dict[str, int] = {name: 3 for name in plan.selected_quantized_weights}
     cached_biases: dict[str, bytes] = {}
@@ -550,7 +718,16 @@ def convert(
         _dump_json(temporary / "config.json", plan.config_raw)
         _dump_json(temporary / "quant_config.json", plan.quant_config)
         if active_quantizer is None:
-            active_quantizer = MlxIsolatedQuantizer(plan.source, plan.classification, temporary / ".mlx-arrays")
+            active_quantizer = MlxIsolatedQuantizer(
+                plan.source,
+                plan.classification,
+                temporary / ".mlx-arrays",
+                reconciliation_execution,
+            )
+        else:
+            bind_execution = getattr(active_quantizer, "bind_reconciliation_execution", None)
+            if callable(bind_execution):
+                bind_execution(reconciliation_execution)
 
         output_by_name = {tensor.name: tensor for tensor in plan.output_tensors}
         shard_names: list[str] = []
@@ -610,7 +787,16 @@ def convert(
         source_identity = plan.source.identity
         _dump_json(
             temporary / "model.safetensors.index.json",
-            {"metadata": _index_metadata(plan), "weight_map": weight_map},
+            {
+                "metadata": _index_metadata(
+                    plan,
+                    qkv_tensors_reconciled=reconciliation_execution.qkv_tensors_reconciled,
+                    qkv_row_reconciliation_applied=(
+                        reconciliation_execution.qkv_row_reconciliation_applied
+                    ),
+                ),
+                "weight_map": weight_map,
+            },
         )
         plan.source.validate_current()
         os.replace(temporary, target)
@@ -626,6 +812,12 @@ def convert(
             plan.source.payload_bytes_read,
             plan.source.range_read_count,
             memory,
+            plan.classification.qkv_layout.source_layout,
+            plan.classification.qkv_layout.canonical_layout,
+            reconciliation_execution.qkv_row_reconciliation_applied,
+            reconciliation_execution.qkv_tensors_reconciled,
+            plan.classification.qkv_layout.source_identity or plan.source.identity,
+            plan.classification.qkv_layout.authorization,
         )
     except Exception:
         if temporary is not None and temporary.exists():
@@ -640,6 +832,73 @@ class VerificationReceipt:
     total_size: int
     bounded: bool
     source_checked: bool
+
+
+_QKV_RECEIPT_KEYS = frozenset(
+    {
+        "qkv_source_layout",
+        "qkv_canonical_layout",
+        "qkv_row_reconciliation_applied",
+        "qkv_tensors_reconciled",
+        "qkv_layout_source_identity",
+        "qkv_layout_authorization",
+    }
+)
+
+
+def _validate_qkv_receipt_metadata(
+    metadata: Mapping[str, object],
+    *,
+    plan: ConversionPlan | None,
+) -> None:
+    present = _QKV_RECEIPT_KEYS & set(metadata)
+    if not present:
+        # Existing Slice 024 receipts predate this field group and remain readable.
+        return
+    if present != _QKV_RECEIPT_KEYS:
+        raise MonolithicSourceError(
+            "output index QKV layout receipt is incomplete; expected all layout decision fields"
+        )
+    if metadata["qkv_source_layout"] not in {
+        "grouped_qkv",
+        "runtime_interleaved",
+    }:
+        raise MonolithicSourceError("output index QKV source layout is unknown")
+    if metadata["qkv_canonical_layout"] != "runtime_interleaved":
+        raise MonolithicSourceError("output index QKV canonical layout is not runtime_interleaved")
+    if not isinstance(metadata["qkv_row_reconciliation_applied"], bool):
+        raise MonolithicSourceError("output index QKV reconciliation flag is not boolean")
+    reconciled = metadata["qkv_tensors_reconciled"]
+    if not isinstance(reconciled, int) or isinstance(reconciled, bool) or reconciled < 0:
+        raise MonolithicSourceError("output index QKV reconciled tensor count is invalid")
+    if metadata["qkv_row_reconciliation_applied"] != (reconciled > 0):
+        raise MonolithicSourceError(
+            "output index QKV reconciliation flag does not match the actual reconciled count"
+        )
+    if metadata["qkv_source_layout"] == QKV_SOURCE_LAYOUT_RUNTIME_INTERLEAVED and reconciled != 0:
+        raise MonolithicSourceError(
+            "runtime-interleaved output cannot report reconciled QKV tensors"
+        )
+    for key in ("qkv_layout_source_identity", "qkv_layout_authorization"):
+        if not isinstance(metadata[key], str) or not metadata[key]:
+            raise MonolithicSourceError(f"output index {key} is invalid")
+    if plan is not None:
+        expected = _qkv_receipt_metadata(plan)
+        static_keys = _QKV_RECEIPT_KEYS - {
+            "qkv_row_reconciliation_applied",
+            "qkv_tensors_reconciled",
+        }
+        actual_static = {key: metadata[key] for key in static_keys}
+        expected_static = {key: expected[key] for key in static_keys}
+        if actual_static != expected_static:
+            raise MonolithicSourceError(
+                "output index QKV layout authorization does not match the source-derived conversion plan"
+            )
+        if metadata["qkv_source_layout"] == QKV_SOURCE_LAYOUT_GROUPED:
+            if reconciled > plan.qkv_tensors_planned:
+                raise MonolithicSourceError(
+                    "output index QKV reconciled count exceeds the selected source plan"
+                )
 
 
 def verify_output(
@@ -777,20 +1036,22 @@ def verify_output(
             f"output index total_size {metadata.get('total_size')} does not match headers {total_size}"
         )
     source_checked = False
+    source_plan: ConversionPlan | None = None
     if source is not None:
         source.validate_current()
-        plan = build_conversion_plan(
+        source_plan = build_conversion_plan(
             source,
             selected_quantized_weights=None if not bounded else tuple(selected),
         )
-        source_expected = {tensor.name: (tensor.dtype, tensor.shape) for tensor in plan.output_tensors}
+        source_expected = {tensor.name: (tensor.dtype, tensor.shape) for tensor in source_plan.output_tensors}
         if source_expected != actual:
             raise MonolithicSourceError("output tensor descriptors differ from the source-derived conversion plan")
-        if dict(plan.config_raw) != config_raw:
+        if dict(source_plan.config_raw) != config_raw:
             raise MonolithicSourceError("output config does not match the source-embedded config")
         if metadata.get("source_identity") != source.identity:
             raise SourceStaleError("output source identity does not match the currently registered source")
         if metadata.get("source_size") != source.source_size:
             raise SourceStaleError("output source size does not match the currently registered source")
         source_checked = True
+    _validate_qkv_receipt_metadata(metadata, plan=source_plan)
     return VerificationReceipt(root, len(actual), total_size, bounded, source_checked)
