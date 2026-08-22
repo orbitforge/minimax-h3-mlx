@@ -9,8 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.render_lab.runner import (
+    BETA_TRANSFORMER_NAME,
     CANONICAL_TRANSFORMER_NAME,
     CANONICAL_TRANSFORMER_MODE,
+    CURRENT_MODEL_ID,
+    DEFAULT_TURBO_PRESET_ID,
     RenderController,
     RenderRequest,
     RenderValidationError,
@@ -45,7 +48,7 @@ def make_request(root: Path, **changes: object) -> RenderRequest:
         "output_root": root / "render-lab",
         "output_name": "test.mp4",
         "checkpoint_root": root / "checkpoint",
-        "transformer_path": root / "transformer",
+        "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
     }
     values.update(changes)
     return RenderRequest(**values)
@@ -54,7 +57,7 @@ def make_request(root: Path, **changes: object) -> RenderRequest:
 class RenderLabTurboContractTests(unittest.TestCase):
     def test_default_and_exact_five_production_presets_are_exposed_once(self) -> None:
         payload = RenderController(ROOT).config_payload()
-        self.assertEqual(payload["defaults"]["turbo_preset_id"], REFERENCE_TURBO_PRESET_ID)
+        self.assertEqual(payload["defaults"]["turbo_preset_id"], DEFAULT_TURBO_PRESET_ID)
         self.assertEqual(payload["turbo_presets"][0]["label"], "None / Reference")
 
         surfaced = [item for item in payload["turbo_presets"] if item["id"] != REFERENCE_TURBO_PRESET_ID]
@@ -158,6 +161,7 @@ class RenderLabTurboContractTests(unittest.TestCase):
                     width=1344,
                     height=768,
                     steps=4,
+                    model_id=CURRENT_MODEL_ID,
                     turbo_preset_id=preset.preset_id,
                     checkpoint_root=CHECKPOINT,
                     transformer_path=STREAMED_TRANSFORMER,
@@ -185,10 +189,10 @@ class RenderLabTurboContractTests(unittest.TestCase):
 
     def test_normal_render_lab_rejects_non_streamed_q6_and_uses_streamed_default(self) -> None:
         with patch.dict(os.environ, {"H3_TRANSFORMER": ""}):
-            self.assertEqual(default_transformer_path(ROOT).name, CANONICAL_TRANSFORMER_NAME)
+            self.assertEqual(default_transformer_path(ROOT).name, BETA_TRANSFORMER_NAME)
         ordinary = ROOT.parent / "models" / "minimax-h3-mlx-6bit"
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RenderValidationError, CANONICAL_TRANSFORMER_NAME):
+            with self.assertRaisesRegex(RenderValidationError, "arbitrary transformer overrides"):
                 validate_render_request(
                     make_request(
                         Path(directory),

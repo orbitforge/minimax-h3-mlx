@@ -27,9 +27,19 @@ from minimax_h3_mlx.load import (
     validate_derived_base_index,
 )
 import minimax_h3_mlx.load as load_module
+import minimax_h3_mlx.runtime_selection as runtime_selection
 
 
 FORMAT = "minimax-h3-mlx-streamed-adaln-v1"
+TEST_DTYPE_BYTES = {"BF16": 2, "U32": 4}
+VALID_DERIVED_BASE_BYTE_COUNT = 16_464_048_640
+
+
+def _independent_payload_byte_count(shape: list[int], dtype: str) -> int:
+    element_count = 1
+    for dimension in shape:
+        element_count *= dimension
+    return element_count * TEST_DTYPE_BYTES[dtype]
 
 
 def tiny_config() -> DiTConfig:
@@ -55,7 +65,23 @@ def tiny_config() -> DiTConfig:
 
 def write_derived_fixture(root: Path) -> None:
     root.mkdir()
-    (root / "config.json").write_text(json.dumps({"hidden_size": 16}) + "\n")
+    config = {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in runtime_selection.BETA_DIT_CONFIG_VALUES.items()
+    }
+    (root / "config.json").write_text(json.dumps(config) + "\n")
+    (root / "quant_config.json").write_text(
+        json.dumps(
+            {
+                "bits": runtime_selection.BETA_CORE_BITS,
+                "adaln_bits": runtime_selection.BETA_ADALN_BITS,
+                "group_size": runtime_selection.BETA_GROUP_SIZE,
+                "quantize_adaln": True,
+                "quantized_layers": dict(runtime_selection.BETA_QUANTIZED_LAYER_COUNTS),
+            }
+        )
+        + "\n"
+    )
     base = root / "base"
     base.mkdir()
     shards = [f"model-{i:05d}-of-00005.safetensors" for i in range(1, 6)]
@@ -65,17 +91,57 @@ def write_derived_fixture(root: Path) -> None:
         "final_layer.adaln_proj.linear.weight",
     ]
     weight_map = {key: shards[index % 5] for index, key in enumerate(keys)}
-    (base / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}) + "\n")
+    (base / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "metadata": {"total_size": VALID_DERIVED_BASE_BYTE_COUNT},
+            "weight_map": weight_map,
+        })
+        + "\n"
+    )
     for shard in shards:
         (base / shard).write_bytes(b"")
 
     adaln = root / "adaln"
     adaln.mkdir()
     blocks = {}
+    projection = {
+        "quantization_bits": 8,
+        "quantization_group_size": 64,
+        "logical_input_features": 2688,
+        "logical_output_features": 96768,
+        "packed_weight_shape": [96768, 672],
+        "scales_shape": [96768, 42],
+        "quantization_biases_shape": [96768, 42],
+        "learned_bias_shape": [96768],
+    }
     for index in range(50):
         filename = f"block-{index:03d}.safetensors"
         (adaln / filename).write_bytes(b"")
-        blocks[str(index)] = {"block_index": index, "sidecar_filename": filename}
+        prefix = f"blocks.{index}.adaln_proj.linear."
+        tensor_specs = (
+            ("bias", "learned_bias", "BF16", [96768], "unquantized", None, None),
+            ("biases", "quantization_biases", "BF16", [96768, 42], "affine", 8, 64),
+            ("scales", "scales", "BF16", [96768, 42], "affine", 8, 64),
+            ("weight", "packed_weight", "U32", [96768, 672], "affine", 8, 64),
+        )
+        tensors = []
+        for suffix, role, dtype, shape, quantization_format, bits, group_size in tensor_specs:
+            tensors.append({
+                "tensor_key": prefix + suffix,
+                "tensor_role": role,
+                "source_shape": shape,
+                "source_dtype": dtype,
+                "byte_count": _independent_payload_byte_count(shape, dtype),
+                "quantization_format": quantization_format,
+                "quantization_bits": bits,
+                "group_size": group_size,
+            })
+        blocks[str(index)] = {
+            "block_index": index,
+            "sidecar_filename": filename,
+            "projection": projection,
+            "tensors": tensors,
+        }
     (adaln / "manifest.json").write_text(
         json.dumps({"format_identifier": FORMAT, "schema_version": 1, "bounded": False, "blocks": blocks})
         + "\n"
@@ -88,9 +154,11 @@ def write_derived_fixture(root: Path) -> None:
                 "bounded": False,
                 "verification_status": "verified",
                 "derived_base_tensor_count": 850,
+                "derived_base_byte_count": VALID_DERIVED_BASE_BYTE_COUNT,
                 "total_logical_tensor_count": 1050,
                 "sidecar_count": 50,
                 "sidecar_tensor_count": 200,
+                "sidecar_byte_count": 13_828_147_200,
                 "selected_blocks": list(range(50)),
             }
         )

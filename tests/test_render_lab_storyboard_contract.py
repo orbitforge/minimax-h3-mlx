@@ -14,6 +14,7 @@ from tools.render_lab.runner import (
     FL2V_STORYBOARD_SEGMENT_WORKFLOW,
     FL2V_STORYBOARD_WORKFLOW,
     I2V,
+    REFERENCE_TURBO_PRESET_ID,
     RenderRequest,
     RenderValidationError,
     SINGLE_RENDER_WORKFLOW,
@@ -49,7 +50,7 @@ def _request(root: Path, **changes: object) -> RenderRequest:
         "output_root": root / "render-lab",
         "output_name": "segment.mp4",
         "checkpoint_root": root / "checkpoint",
-        "transformer_path": root / "minimax-h3-mlx-6bit-streamed-adaln",
+        "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
     }
     values.update(changes)
     return RenderRequest(**values)

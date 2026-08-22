@@ -23,6 +23,14 @@ from minimax_h3_mlx.streamed_adaln import build_streamed_modulation_cache
 
 
 FORMAT = "minimax-h3-mlx-streamed-adaln-v1"
+TEST_DTYPE_BYTES = {"BF16": 2, "U32": 4}
+
+
+def _independent_payload_byte_count(shape: list[int], dtype: str) -> int:
+    element_count = 1
+    for dimension in shape:
+        element_count *= dimension
+    return element_count * TEST_DTYPE_BYTES[dtype]
 
 
 def tiny_config() -> DiTConfig:
@@ -110,7 +118,7 @@ class StreamedAdaLNTests(unittest.TestCase):
                     "tensor_role": role,
                     "source_dtype": dtype,
                     "source_shape": shape,
-                    "byte_count": 1,
+                    "byte_count": _independent_payload_byte_count(shape, dtype),
                     "tensor_checksum": "fixture",
                     "quantization_format": quant_format,
                     "quantization_bits": bits,

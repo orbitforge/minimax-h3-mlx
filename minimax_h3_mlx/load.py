@@ -24,7 +24,20 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .config import DiTConfig
-from .checkpoint_forge.topology import BLOCK_COUNT, FORMAT_IDENTIFIER
+from .checkpoint_format import (
+    BLOCK_COUNT,
+    DERIVED_BASE_TENSOR_COUNT,
+    DERIVED_BASE_SHARD_COUNT,
+    DERIVED_SIDECAR_COUNT,
+    DERIVED_SIDECAR_TENSOR_COUNT,
+    FORMAT_IDENTIFIER,
+    CheckpointFormatInfo,
+    _read_json,
+    _require,
+    _validated_base_shards,
+    inspect_checkpoint_format,
+    SUPPORTED_DERIVED_SCHEMA_VERSION,
+)
 from .dit import CACHE_ONLY_CONSTRUCTION, MiniMaxH3DiT, RESIDENT_CONSTRUCTION
 from .lora import LoRARegistry, load_lora_safetensors
 
@@ -39,24 +52,6 @@ FP32_PREFIXES = (
 
 # Carried by the checkpoint but recomputed by the port.
 SKIP_KEYS = ("rope.inv_freq",)
-SUPPORTED_DERIVED_SCHEMA_VERSION = 1
-DERIVED_BASE_TENSOR_COUNT = 850
-DERIVED_SIDECAR_COUNT = 50
-DERIVED_SIDECAR_TENSOR_COUNT = 200
-DERIVED_BASE_SHARD_COUNT = 5
-
-
-@dataclass(frozen=True)
-class CheckpointFormatInfo:
-    """Validated, lightweight format routing information for a transformer checkpoint."""
-
-    checkpoint_format: str
-    derived_root: Path | None
-    base_root: Path
-    conversion_manifest_path: Path | None
-    adaln_manifest_path: Path | None
-    construction_mode: str
-    base_shards: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -64,137 +59,6 @@ class LoadStats:
     loaded_tensor_count: int
     loaded_logical_bytes: int
     expected_tensor_count: int
-
-
-def _read_json(path: Path, label: str) -> dict:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid JSON: {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object: {path}")
-    return value
-
-
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValueError(message)
-
-
-def _validated_base_shards(weight_map: Mapping[str, object]) -> tuple[str, ...]:
-    values = list(weight_map.values())
-    _require(
-        all(isinstance(name, str) for name in values),
-        "derived base index shard names must be strings",
-    )
-    names = tuple(sorted(set(values)))
-    _require(
-        len(names) == DERIVED_BASE_SHARD_COUNT,
-        f"derived base index must reference exactly {DERIVED_BASE_SHARD_COUNT} shards",
-    )
-    for name in names:
-        _require(
-            Path(name).name == name
-            and name.startswith("model-")
-            and name.endswith("-of-00005.safetensors"),
-            f"unsafe derived base shard filename: {name!r}",
-        )
-    return names
-
-
-def inspect_checkpoint_format(model_dir: str | Path) -> CheckpointFormatInfo:
-    """Route a transformer directory using explicit derived-format metadata.
-
-    This is a lightweight structural/runtime check. It validates manifests, indexes, filenames, and
-    required files, but deliberately does not hash the 30 GB source or open any AdaLN sidecar
-    payload. Complete forensic verification remains the forge verifier's separate operation.
-    """
-    root = Path(model_dir)
-    conversion_path = root / "conversion_manifest.json"
-    if not conversion_path.exists():
-        return CheckpointFormatInfo(
-            checkpoint_format="original",
-            derived_root=None,
-            base_root=root,
-            conversion_manifest_path=None,
-            adaln_manifest_path=None,
-            construction_mode=RESIDENT_CONSTRUCTION,
-            base_shards=(),
-        )
-
-    manifest = _read_json(conversion_path, "derived conversion manifest")
-    _require(
-        manifest.get("format_identifier") == FORMAT_IDENTIFIER,
-        f"unsupported derived checkpoint format identifier: {manifest.get('format_identifier')!r}",
-    )
-    _require(
-        manifest.get("schema_version") == SUPPORTED_DERIVED_SCHEMA_VERSION,
-        f"unsupported derived checkpoint schema version: {manifest.get('schema_version')!r}",
-    )
-    _require(manifest.get("bounded") is False, "bounded derived checkpoints cannot load a transformer base")
-    _require(
-        manifest.get("verification_status") == "verified",
-        "derived checkpoint verification_status must be 'verified'",
-    )
-    _require(manifest.get("derived_base_tensor_count") == DERIVED_BASE_TENSOR_COUNT, "derived base tensor count is not complete")
-    _require(manifest.get("total_logical_tensor_count") == 1050, "derived checkpoint tensor count is incomplete")
-    _require(manifest.get("sidecar_count") == DERIVED_SIDECAR_COUNT, "derived sidecar count is incomplete")
-    _require(manifest.get("sidecar_tensor_count") == DERIVED_SIDECAR_TENSOR_COUNT, "derived sidecar tensor count is incomplete")
-    _require(manifest.get("selected_blocks") == list(range(BLOCK_COUNT)), "derived checkpoint does not contain all 50 blocks")
-
-    base_root = root / "base"
-    base_index_path = base_root / "model.safetensors.index.json"
-    base_index = _read_json(base_index_path, "derived base index")
-    weight_map = base_index.get("weight_map")
-    _require(isinstance(weight_map, dict) and len(weight_map) == DERIVED_BASE_TENSOR_COUNT, "derived base index must contain exactly 850 tensors")
-    base_shards = _validated_base_shards(weight_map)
-    _require(not any(key.startswith("blocks.") and ".adaln_proj." in key for key in weight_map), "derived base index contains block-level AdaLN tensors")
-    _require("final_layer.adaln_proj.linear.weight" in weight_map, "derived base index is missing final-layer AdaLN weight")
-    _require("final_layer.adaln_proj.linear.bias" in weight_map, "derived base index is missing final-layer AdaLN bias")
-    actual_base_shards = {
-        path.name for path in base_root.glob("*.safetensors") if path.is_file()
-    }
-    missing_base_shards = sorted(set(base_shards) - actual_base_shards)
-    unexpected_base_shards = sorted(actual_base_shards - set(base_shards))
-    _require(
-        not missing_base_shards and not unexpected_base_shards,
-        "derived base payload file set mismatch: "
-        f"missing={missing_base_shards}, unexpected={unexpected_base_shards}",
-    )
-
-    adaln_path = root / "adaln" / "manifest.json"
-    adaln_manifest = _read_json(adaln_path, "AdaLN sidecar manifest")
-    _require(adaln_manifest.get("format_identifier") == FORMAT_IDENTIFIER, "invalid AdaLN sidecar-manifest format identifier")
-    _require(adaln_manifest.get("schema_version") == SUPPORTED_DERIVED_SCHEMA_VERSION, "unsupported AdaLN sidecar-manifest schema version")
-    _require(adaln_manifest.get("bounded") is False, "bounded AdaLN sidecar manifest is not loadable")
-    blocks = adaln_manifest.get("blocks")
-    _require(isinstance(blocks, dict) and set(blocks) == {str(i) for i in range(BLOCK_COUNT)}, "AdaLN sidecar manifest must describe all 50 blocks")
-    expected_sidecars = {f"block-{index:03d}.safetensors" for index in range(BLOCK_COUNT)}
-    actual_sidecars = {
-        path.name for path in (root / "adaln").glob("*.safetensors") if path.is_file()
-    }
-    missing_sidecars = sorted(expected_sidecars - actual_sidecars)
-    unexpected_sidecars = sorted(actual_sidecars - expected_sidecars)
-    _require(
-        not missing_sidecars and not unexpected_sidecars,
-        "AdaLN sidecar payload file set mismatch: "
-        f"missing={missing_sidecars}, unexpected={unexpected_sidecars}",
-    )
-    for block_index in range(BLOCK_COUNT):
-        entry = blocks[str(block_index)]
-        expected_name = f"block-{block_index:03d}.safetensors"
-        _require(isinstance(entry, dict) and entry.get("sidecar_filename") == expected_name, f"invalid AdaLN sidecar entry for block {block_index}")
-        _require((root / "adaln" / expected_name).is_file(), f"missing AdaLN sidecar: {expected_name}")
-
-    return CheckpointFormatInfo(
-        checkpoint_format="derived",
-        derived_root=root,
-        base_root=base_root,
-        conversion_manifest_path=conversion_path,
-        adaln_manifest_path=adaln_path,
-        construction_mode=CACHE_ONLY_CONSTRUCTION,
-        base_shards=base_shards,
-    )
 
 
 def validate_derived_base_index(info: CheckpointFormatInfo, expected_keys: set[str]) -> dict[str, str]:

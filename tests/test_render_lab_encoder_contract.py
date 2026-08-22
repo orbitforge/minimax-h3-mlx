@@ -34,6 +34,7 @@ from tools.render_lab.encoder_catalog import (
 from tools.render_lab import heretic_encoder
 from tools.render_lab.runner import (
     FIRST_LAST,
+    REFERENCE_TURBO_PRESET_ID,
     T2V,
     RenderRequest,
     RenderController,
@@ -64,7 +65,7 @@ def _request(root: Path, **changes: object) -> RenderRequest:
         "output_root": root / "render-lab",
         "output_name": "test.mp4",
         "checkpoint_root": root / "checkpoint",
-        "transformer_path": root / "minimax-h3-mlx-6bit-streamed-adaln",
+        "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
     }
     values.update(changes)
     return RenderRequest(**values)

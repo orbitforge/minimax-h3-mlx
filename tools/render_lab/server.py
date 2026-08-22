@@ -29,6 +29,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.render_lab.runner import (  # noqa: E402
     DEFAULT_OUTPUT_ROOT,
+    DEFAULT_MODEL_ID,
+    DEFAULT_TURBO_PRESET_ID,
     FIRST_LAST,
     I2V,
     RenderBusyError,
@@ -114,6 +116,9 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { bord
   <select id="mode"></select>
   <label for="prompt">Prompt</label>
   <textarea id="prompt" placeholder="Describe the video to generate.">A cinematic live-action scene with natural movement and atmosphere.</textarea>
+  <label for="model">Model</label>
+  <select id="model"></select>
+  <div id="model-hint" class="meta">The selected model is resolved from the server model catalog.</div>
   <label for="text-encoder">Text encoder</label>
   <select id="text-encoder"></select>
   <div id="text-encoder-hint" class="meta">Canonical Qwen3-VL is the default H3 conditioning path.</div>
@@ -257,6 +262,28 @@ function updateMode() {
 function selectedTextEncoder() {
   const id = $('text-encoder').value;
   return (config.text_encoders || []).find(item => item.id === id) || null;
+}
+function selectedModel() {
+  const id = $('model').value;
+  return (config.models || []).find(item => item.id === id) || null;
+}
+function updateModelControls() {
+  const selected = selectedModel();
+  if (!selected) {
+    $('model-hint').textContent = 'Choose an admitted Render Lab model.';
+    return;
+  }
+  $('model-hint').textContent = selected.available
+    ? `${selected.label} · ${selected.transformer_mode}`
+    : `${selected.label} is unavailable: ${selected.disabled_reason || 'the admitted transformer asset is not readable.'}`;
+  if (!config.runtime.checkpoint_exists || !selected.available) {
+    $('runtime-warning').textContent = !config.runtime.checkpoint_exists
+      ? 'The shared FL2VA checkpoint is not currently readable.'
+      : `${selected.label} is not currently readable. Choose an available model or restore this asset before rendering.`;
+    $('runtime-warning').classList.remove('hidden');
+  } else {
+    $('runtime-warning').classList.add('hidden');
+  }
 }
 function updateTextEncoderControls() {
   const mode = $('mode').value;
@@ -512,6 +539,7 @@ async function renderJob() {
   const form = new FormData();
   form.set('workflow', storyboard ? 'FL2V_STORYBOARD' : 'SINGLE_RENDER');
   form.set('mode', mode); form.set('prompt', $('prompt').value);
+  form.set('model_id', $('model').value);
   form.set('text_encoder_id', $('text-encoder').value);
   const conditioningArtifactPath = $('conditioning-artifact').value.trim();
   if (conditioningArtifactPath) form.set('conditioning_artifact_path', conditioningArtifactPath);
@@ -542,10 +570,12 @@ async function boot() {
   $('workflow').innerHTML = (config.workflows || [{id: 'SINGLE_RENDER', label: 'Single render'}]).map(item => `<option value="${item.id}">${item.label}</option>`).join('');
   $('workflow').value = config.defaults.workflow || 'SINGLE_RENDER';
   $('mode').innerHTML = config.modes.map(item => `<option value="${item.id}">${item.label}</option>`).join('');
+  $('model').innerHTML = (config.models || []).map(item => `<option value="${item.id}">${item.label}${item.available ? '' : ' (unavailable)'}</option>`).join('');
+  $('model').value = config.defaults.model_id;
   $('text-encoder').innerHTML = (config.text_encoders || []).map(item => `<option value="${item.id}" ${item.available ? '' : 'disabled'}>${item.label}</option>`).join('');
   $('text-encoder').value = config.defaults.text_encoder_id || 'canonical-qwen3-vl';
   $('turbo-preset').innerHTML = (config.turbo_presets || []).map(item => `<option value="${item.id}">${item.label}</option>`).join('');
-  $('turbo-preset').value = config.defaults.turbo_preset_id || 'none';
+  $('turbo-preset').value = config.defaults.turbo_preset_id;
   const bounds = config.resolution_contract || {min_dimension: 128, max_dimension: 1344, step: 32};
   for (const axis of ['width', 'height']) {
     $(`${axis}-range`).min = bounds.min_dimension;
@@ -565,13 +595,13 @@ async function boot() {
   $('output-root').value = config.defaults.output_root; $('output-name').value = config.defaults.output_name;
   $('mode').onchange = updateMode;
   $('workflow').onchange = updateWorkflow;
+  $('model').onchange = updateModelControls;
   $('text-encoder').onchange = updateTextEncoderControls;
   $('turbo-preset').onchange = updateTurboPresetControls;
   renderStoryboardCards();
   updateTurboPresetControls(); updateWorkflow(); updateGeometry();
-  $('runtime').textContent = `Checkpoint: ${config.runtime.checkpoint_root} · Transformer: ${config.runtime.transformer_path || 'from checkpoint'} · generator: ${config.runtime.generator}`;
-  if (!config.runtime.checkpoint_exists || !config.runtime.transformer_exists) { $('runtime-warning').textContent = 'Configured checkpoint or transformer path is not currently readable. Set H3_CHECKPOINT_ROOT and H3_TRANSFORMER before rendering.'; $('runtime-warning').classList.remove('hidden'); }
-  else if (config.runtime.transformer_mode !== config.runtime.transformer_required_mode) { $('runtime-warning').textContent = `Render Lab requires ${config.runtime.transformer_required_mode}; the configured transformer is not admitted.`; $('runtime-warning').classList.remove('hidden'); }
+  $('runtime').textContent = `Checkpoint: ${config.runtime.checkpoint_root} · Default model: ${config.defaults.model_id} · generator: ${config.runtime.generator}`;
+  updateModelControls();
   startStatusPolling(); refreshHistory();
 }
 boot();
@@ -637,6 +667,7 @@ def _render_request_from_fields(fields: dict[str, object]) -> RenderRequest:
         mode=fields.get("mode", ""),
         prompt=fields.get("prompt") or "",
         workflow=fields.get("workflow", SINGLE_RENDER_WORKFLOW),
+        model_id=fields.get("model_id") or DEFAULT_MODEL_ID,
         text_encoder_id=fields.get("text_encoder_id", "canonical-qwen3-vl"),
         conditioning_artifact_path=fields.get("conditioning_artifact_path") or None,
         resolution_id=fields.get("resolution_id") or None,
@@ -653,7 +684,7 @@ def _render_request_from_fields(fields: dict[str, object]) -> RenderRequest:
         additional_loras=parse_additional_loras_payload(fields.get("additional_loras")),
         turbo_enabled=fields.get("turbo_enabled", "false"),
         turbo_steps=fields.get("turbo_steps") or None,
-        turbo_preset_id=fields.get("turbo_preset_id") or None,
+        turbo_preset_id=fields.get("turbo_preset_id") or DEFAULT_TURBO_PRESET_ID,
         storyboard_card_paths=parse_storyboard_card_paths(fields.get("storyboard_card_paths")),
     )
 

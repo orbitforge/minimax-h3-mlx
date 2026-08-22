@@ -46,6 +46,7 @@ from .encoder_catalog import (
     text_encoder_payload,
     validate_text_encoder_selection,
 )
+from minimax_h3_mlx.checkpoint_format import CACHE_ONLY_CONSTRUCTION, inspect_checkpoint_format
 from minimax_h3_mlx.lora import LoRAError, LoRAStack
 from .turbo_presets import (
     HOST_ASSET_MANIFEST_NOTE,
@@ -69,6 +70,14 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "out" / "render-lab"
 DEFAULT_OUTPUT_NAME = "render.mp4"
 CANONICAL_TRANSFORMER_NAME = "minimax-h3-mlx-6bit-streamed-adaln"
 CANONICAL_TRANSFORMER_MODE = "streamed-adaln-q6"
+CURRENT_MODEL_ID = "current"
+BETA_MODEL_ID = "beta-0.6"
+DEFAULT_MODEL_ID = BETA_MODEL_ID
+BETA_TRANSFORMER_NAME = "minimax-h3-mlx-beta-0.6-q6-q8-corrected-slice-025-streamed-adaln"
+MODEL_CHOICES = (
+    (CURRENT_MODEL_ID, "Current", CANONICAL_TRANSFORMER_NAME),
+    (BETA_MODEL_ID, "Beta 0.6", BETA_TRANSFORMER_NAME),
+)
 FORBIDDEN_TRANSFORMER_NAME = "minimax-h3-mlx-6bit"
 
 T2V = "T2V"
@@ -92,7 +101,12 @@ MAX_DURATION_SECONDS = 15.0
 MIN_INFERENCE_STEPS = 2
 MAX_INFERENCE_STEPS = 40
 DEFAULT_DURATION_SECONDS = 5.0
-DEFAULT_INFERENCE_STEPS = 16
+DEFAULT_TURBO_PRESET_ID = "lightx-4step-v01"
+_DEFAULT_TURBO_PRESET = turbo_preset_by_id(DEFAULT_TURBO_PRESET_ID)
+if _DEFAULT_TURBO_PRESET is None:
+    raise RuntimeError(f"Render Lab default Turbo preset is unavailable: {DEFAULT_TURBO_PRESET_ID}")
+DEFAULT_TURBO_PRESET_NFE = _DEFAULT_TURBO_PRESET.nfe
+DEFAULT_INFERENCE_STEPS = DEFAULT_TURBO_PRESET_NFE
 DEFAULT_SEED = 0
 DEFAULT_RESOLUTION_ID = "canonical-128-square-v05d"
 
@@ -200,7 +214,7 @@ class RenderRequest:
     output_name: str = DEFAULT_OUTPUT_NAME
     image_paths: tuple[str | Path, ...] = ()
     checkpoint_root: str | Path = field(default_factory=lambda: default_checkpoint_root())
-    transformer_path: str | Path | None = field(default_factory=lambda: default_transformer_path())
+    transformer_path: str | Path | None = None
     width: int | str | None = None
     height: int | str | None = None
     lora_enabled: bool = False
@@ -209,11 +223,12 @@ class RenderRequest:
     additional_loras: tuple[AdditionalLoRA, ...] = ()
     turbo_enabled: bool = False
     turbo_steps: int | str | None = None
-    turbo_preset_id: str | None = None
+    turbo_preset_id: str | None = DEFAULT_TURBO_PRESET_ID
     text_encoder_id: str = CANONICAL_ENCODER_ID
     conditioning_artifact_path: str | Path | None = None
     workflow: str = SINGLE_RENDER_WORKFLOW
     storyboard_card_paths: tuple[str | Path, ...] = ()
+    model_id: str | None = DEFAULT_MODEL_ID
 
     def normalized(self) -> "RenderRequest":
         return replace(
@@ -221,6 +236,11 @@ class RenderRequest:
             mode=str(self.mode).upper(),
             prompt=str(self.prompt),
             workflow=(str(self.workflow or SINGLE_RENDER_WORKFLOW).strip().upper()),
+            model_id=(
+                DEFAULT_MODEL_ID
+                if self.model_id is None or not str(self.model_id).strip()
+                else str(self.model_id).strip()
+            ),
             resolution_id=(
                 None
                 if self.resolution_id is None or not str(self.resolution_id).strip()
@@ -401,14 +421,76 @@ def default_checkpoint_root(repo_root: Path = REPO_ROOT) -> Path:
     return _first_existing(candidates) or candidates[0]
 
 
-def default_transformer_path(repo_root: Path = REPO_ROOT) -> Path | None:
-    env_value = os.environ.get("H3_TRANSFORMER")
-    candidates = [
-        Path(env_value).expanduser()
-        if env_value
-        else repo_root.parent / "models" / CANONICAL_TRANSFORMER_NAME,
-    ]
-    return _first_existing(candidates) or candidates[0]
+def _normalize_model_id(value: object) -> str:
+    normalized = str(value).strip() if value is not None else DEFAULT_MODEL_ID
+    if not normalized:
+        normalized = DEFAULT_MODEL_ID
+    if normalized not in {item[0] for item in MODEL_CHOICES}:
+        choices = ", ".join(item[0] for item in MODEL_CHOICES)
+        raise RenderValidationError(f"Unknown Render Lab model {value!r}; choose one of: {choices}")
+    return normalized
+
+
+def model_transformer_path(model_id: object, repo_root: Path = REPO_ROOT) -> Path:
+    """Resolve one logical Render Lab model to its exact admitted streamed transformer path."""
+    normalized = _normalize_model_id(model_id)
+    transformer_name = next(name for identifier, _label, name in MODEL_CHOICES if identifier == normalized)
+    return (Path(repo_root).expanduser().resolve().parent / "models" / transformer_name).resolve(strict=False)
+
+
+def model_label(model_id: object) -> str:
+    normalized = _normalize_model_id(model_id)
+    return next(label for identifier, label, _name in MODEL_CHOICES if identifier == normalized)
+
+
+def streamed_transformer_asset_available(path: str | Path) -> tuple[bool, str | None]:
+    """Check one streamed-AdaLN asset through the shared metadata-only checkpoint contract."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    if not candidate.is_dir():
+        return False, "the streamed transformer directory is missing"
+    try:
+        format_info = inspect_checkpoint_format(candidate)
+    except (OSError, TypeError, ValueError) as exc:
+        return False, f"the streamed-AdaLN checkpoint metadata is invalid: {exc}"
+    if format_info.checkpoint_format != "derived" or format_info.construction_mode != CACHE_ONLY_CONSTRUCTION:
+        return False, "the directory does not satisfy the complete derived streamed-AdaLN format contract"
+    if not (candidate / "config.json").is_file():
+        return False, "the derived streamed-AdaLN config.json is missing"
+    if not (candidate / "quant_config.json").is_file():
+        return False, "the derived streamed-AdaLN quant_config.json is missing"
+    return True, None
+
+
+def model_selection_payload(repo_root: Path = REPO_ROOT) -> list[dict[str, Any]]:
+    """Serialize only the bounded logical choices; filesystem paths stay server-side."""
+    payload = []
+    for identifier, label, _transformer_name in MODEL_CHOICES:
+        transformer = model_transformer_path(identifier, repo_root)
+        available, reason = streamed_transformer_asset_available(transformer)
+        payload.append({
+            "id": identifier,
+            "label": label,
+            "available": available,
+            "transformer_mode": CANONICAL_TRANSFORMER_MODE,
+            "disabled_reason": None if available else reason,
+        })
+    return payload
+
+
+def default_transformer_path(repo_root: Path = REPO_ROOT) -> Path:
+    return model_transformer_path(DEFAULT_MODEL_ID, repo_root)
+
+
+def _resolve_model_selection(request: RenderRequest, repo_root: Path) -> tuple[str, Path]:
+    model_id = _normalize_model_id(request.model_id)
+    selected = model_transformer_path(model_id, repo_root)
+    if request.transformer_path is not None:
+        supplied = Path(request.transformer_path).expanduser().resolve(strict=False)
+        if supplied != selected:
+            raise RenderValidationError(
+                f"Model {model_id!r} owns transformer {selected.name}; arbitrary transformer overrides are rejected"
+            )
+    return model_id, selected
 
 
 def expected_image_count(mode: str) -> int:
@@ -637,7 +719,10 @@ def _validate_turbo_preset(
 
 
 def _transformer_mode(transformer_path: Path | None) -> str:
-    if transformer_path is not None and transformer_path.name == CANONICAL_TRANSFORMER_NAME:
+    if transformer_path is not None and transformer_path.name in {
+        CANONICAL_TRANSFORMER_NAME,
+        BETA_TRANSFORMER_NAME,
+    }:
         return CANONICAL_TRANSFORMER_MODE
     return "unspecified-or-custom"
 
@@ -645,14 +730,12 @@ def _transformer_mode(transformer_path: Path | None) -> str:
 def _validate_transformer_safety(
     transformer_path: Path | None,
     *,
+    repo_root: Path = REPO_ROOT,
+    model_id: str | None = None,
     check_runtime_paths: bool,
 ) -> None:
     if transformer_path is None:
-        if check_runtime_paths:
-            raise RenderValidationError(
-                f"Render Lab requires the canonical {CANONICAL_TRANSFORMER_NAME} transformer"
-            )
-        return
+        raise RenderValidationError("Render Lab requires a selected streamed transformer")
     resolved = transformer_path.expanduser().resolve(strict=False)
     if Path("/Volumes/models") == resolved or Path("/Volumes/models") in resolved.parents:
         raise RenderValidationError(
@@ -661,13 +744,26 @@ def _validate_transformer_safety(
     if transformer_path.name == FORBIDDEN_TRANSFORMER_NAME:
         raise RenderValidationError(
             f"Render Lab rejects the non-streamed {FORBIDDEN_TRANSFORMER_NAME} transformer; "
-            f"use {CANONICAL_TRANSFORMER_NAME}"
+            f"use one of the admitted streamed choices"
         )
-    if check_runtime_paths and transformer_path.name != CANONICAL_TRANSFORMER_NAME:
+    admitted_paths = {
+        model_transformer_path(identifier, repo_root)
+        for identifier, _label, _transformer_name in MODEL_CHOICES
+    }
+    if resolved not in admitted_paths:
         raise RenderValidationError(
-            f"Render Lab requires the canonical {CANONICAL_TRANSFORMER_NAME} transformer; "
+            "Render Lab admits only the Current or Beta 0.6 streamed transformers; "
             f"got {transformer_path.name}"
         )
+    if model_id is not None and resolved != model_transformer_path(model_id, repo_root):
+        raise RenderValidationError("Selected model and resolved transformer do not agree")
+    if check_runtime_paths:
+        available, reason = streamed_transformer_asset_available(resolved)
+        if not available:
+            selection_label = model_id if model_id is not None else "selection"
+            raise RenderValidationError(
+                f"Model {selection_label!r} is unavailable at {resolved}: {reason}"
+            )
 
 
 def _validate_number_fields(request: RenderRequest) -> None:
@@ -882,10 +978,13 @@ def validate_render_request(
     if check_images:
         image_paths = tuple(validate_image_path(value) for value in image_paths)
     checkpoint_root = Path(request.checkpoint_root).expanduser().resolve(strict=False)
-    transformer_path = (
-        None if request.transformer_path is None else Path(request.transformer_path).expanduser().resolve(strict=False)
+    model_id, transformer_path = _resolve_model_selection(request, repo_root)
+    _validate_transformer_safety(
+        transformer_path,
+        repo_root=repo_root,
+        model_id=model_id,
+        check_runtime_paths=check_runtime_paths,
     )
-    _validate_transformer_safety(transformer_path, check_runtime_paths=check_runtime_paths)
     if check_runtime_paths:
         if not checkpoint_root.is_dir() or not (checkpoint_root / "model_index.json").is_file():
             raise RenderValidationError(
@@ -893,10 +992,6 @@ def validate_render_request(
             )
         effective_transformer = transformer_path
         assert effective_transformer is not None
-        if not effective_transformer.is_dir() or not (effective_transformer / "config.json").is_file():
-            raise RenderValidationError(
-                f"Transformer path is not a usable H3 transformer directory: {effective_transformer}"
-            )
         transformer_path = effective_transformer
     conditioning_artifact_path, conditioning_artifact_evidence = _validate_conditioning_artifact(
         request,
@@ -904,6 +999,7 @@ def validate_render_request(
     )
     normalized_request = replace(
         request,
+        model_id=model_id,
         resolution_id=preset.preset_id if explicit_dimensions else request.resolution_id,
         width=runtime_width,
         height=runtime_height,
@@ -1234,6 +1330,9 @@ def runtime_identity(validated: ValidatedRequest, repo_root: Path = REPO_ROOT) -
     transformer = validated.transformer_path or validated.checkpoint_root / "transformer"
     explicit_dimensions = validated.preset.evidence_class == "explicit-independent-dimensions"
     return {
+        "model_id": validated.request.model_id,
+        "model_label": model_label(validated.request.model_id),
+        "resolved_transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
         "generation_entrypoint": _file_identity(GENERATOR),
         "checkpoint_model_index": _file_identity(validated.checkpoint_root / "model_index.json"),
         "transformer_config": _file_identity(transformer / "config.json"),
@@ -1273,6 +1372,16 @@ def _additional_lora_evidence(validated: ValidatedRequest) -> list[dict[str, Any
         }
         for index, entry in enumerate(validated.additional_loras)
     ]
+
+
+def _model_evidence(validated: ValidatedRequest) -> dict[str, Any]:
+    model_id = validated.request.model_id
+    return {
+        "id": model_id,
+        "label": model_label(model_id),
+        "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
+        "transformer_mode": _transformer_mode(validated.transformer_path),
+    }
 
 
 def _turbo_evidence(validated: ValidatedRequest) -> dict[str, Any]:
@@ -1707,6 +1816,8 @@ def build_render_config(
         "checkpoint_root": str(validated.checkpoint_root),
         "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
         "transformer_mode": _transformer_mode(validated.transformer_path),
+        "model_id": request.model_id,
+        "model": _model_evidence(validated),
         "text_encoder_id": request.text_encoder_id,
         "text_encoder": _text_encoder_evidence(validated, namespace),
         "conditioning_source": _conditioning_source(validated),
@@ -1754,6 +1865,10 @@ def _storyboard_shared_settings(validated: ValidatedRequest) -> dict[str, Any]:
         "additional_loras": _additional_lora_evidence(validated),
         "output_root": str(validated.output_root),
         "output_name": request.output_name,
+        "model_id": request.model_id,
+        "model": _model_evidence(validated),
+        "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
+        "transformer_mode": _transformer_mode(validated.transformer_path),
     }
 
 
@@ -1794,6 +1909,8 @@ def build_storyboard_config(
         "output_root": str(shared.output_root),
         "output_name": shared.request.output_name,
         "output_path": str(namespace.output_path),
+        "model_id": shared.request.model_id,
+        "model": _model_evidence(shared),
         "storyboard": {
             "manifest_path": str(namespace.output_path),
             "card_count": len(validated.card_paths),
@@ -2195,6 +2312,7 @@ def _storyboard_segment_record(
         "segment_index": job.segment_index,
         "start_card_index": job.start_card_index,
         "end_card_index": job.end_card_index,
+        "model_id": job.request.model_id,
         "start_card_path": str(job.start_path),
         "end_card_path": str(job.end_path),
         "child_run_id": child_namespace.run_id if child_namespace is not None else None,
@@ -2770,6 +2888,7 @@ def history_rows(output_root: str | Path, *, limit: int = 25) -> list[dict[str, 
             "run_id": run_dir.name,
             "timestamp": config.get("timestamp"),
             "mode": display_mode,
+            "model_id": config.get("model_id", shared.get("model_id")),
             "resolution": f"{config.get('width', shared.get('width'))} × {config.get('height', shared.get('height'))}",
             "width": config.get("width", shared.get("width")),
             "height": config.get("height", shared.get("height")),
@@ -2925,6 +3044,8 @@ class RenderController:
                             "checkpoint_root": str(validated.checkpoint_root),
                             "transformer_path": str(validated.transformer_path) if validated.transformer_path else None,
                             "transformer_mode": _transformer_mode(validated.transformer_path),
+                            "model_id": validated.request.model_id,
+                            "model": _model_evidence(validated),
                             "text_encoder_id": request.text_encoder_id,
                             "text_encoder": _text_encoder_evidence(validated, namespace),
                             "conditioning_source": _conditioning_source(validated),
@@ -3145,7 +3266,11 @@ class RenderController:
     def config_payload(self) -> dict[str, Any]:
         checkpoint = default_checkpoint_root(self.repo_root)
         transformer = default_transformer_path(self.repo_root)
+        models = model_selection_payload(self.repo_root)
+        model_status = {item["id"]: item for item in models}
+        default_model_status = model_status[DEFAULT_MODEL_ID]
         return {
+            "models": models,
             "modes": [{"id": mode, "label": MODE_LABELS[mode], "image_count": expected_image_count(mode)} for mode in (T2V, I2V, FIRST_LAST)],
             "workflows": [
                 {"id": workflow, "label": WORKFLOW_LABELS[workflow]}
@@ -3156,6 +3281,7 @@ class RenderController:
             "turbo_presets": turbo_preset_payload(self.repo_root),
             "defaults": {
                 "workflow": SINGLE_RENDER_WORKFLOW,
+                "model_id": DEFAULT_MODEL_ID,
                 "output_root": str(DEFAULT_OUTPUT_ROOT.relative_to(self.repo_root)),
                 "output_name": DEFAULT_OUTPUT_NAME,
                 "duration_seconds": DEFAULT_DURATION_SECONDS,
@@ -3169,8 +3295,8 @@ class RenderController:
                 "lora_scale": 1.0,
                 "additional_loras": [],
                 "turbo_enabled": False,
-                "turbo_steps": 8,
-                "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
+                "turbo_steps": DEFAULT_TURBO_PRESET_NFE,
+                "turbo_preset_id": DEFAULT_TURBO_PRESET_ID,
                 "text_encoder_id": CANONICAL_ENCODER_ID,
                 "conditioning_artifact_path": "",
             },
@@ -3190,15 +3316,21 @@ class RenderController:
                 "source": "tools/render_lab/resolutions.py:independent-dimensions-v1",
             },
             "runtime": {
+                "default_model_id": DEFAULT_MODEL_ID,
+                "models": {
+                    item["id"]: {
+                        "available": item["available"],
+                        "transformer_mode": item["transformer_mode"],
+                    }
+                    for item in models
+                },
                 "checkpoint_root": str(checkpoint),
                 "transformer_path": str(transformer) if transformer else None,
                 "transformer_name": transformer.name if transformer else None,
                 "transformer_mode": _transformer_mode(transformer),
                 "transformer_required_mode": CANONICAL_TRANSFORMER_MODE,
                 "checkpoint_exists": checkpoint.is_dir() and (checkpoint / "model_index.json").is_file(),
-                "transformer_exists": bool(
-                    transformer and transformer.is_dir() and (transformer / "config.json").is_file()
-                ),
+                "transformer_exists": default_model_status["available"],
                 "generator": str(GENERATOR),
                 "host_asset_manifest": {
                     "status": HOST_ASSET_MANIFEST_STATUS,

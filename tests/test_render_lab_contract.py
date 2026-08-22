@@ -21,6 +21,7 @@ from tools.render_lab.resolutions import (
 from tools.render_lab.runner import (
     FIRST_LAST,
     I2V,
+    REFERENCE_TURBO_PRESET_ID,
     T2V,
     RenderController,
     RenderFileLock,
@@ -64,7 +65,7 @@ def request(tmp: Path, *, mode: str = T2V, images: tuple[Path, ...] = (), **chan
         "output_name": "test.mp4",
         "image_paths": images,
         "checkpoint_root": tmp / "checkpoint",
-        "transformer_path": tmp / "transformer",
+        "turbo_preset_id": REFERENCE_TURBO_PRESET_ID,
     }
     values.update(changes)
     return RenderRequest(**values)
