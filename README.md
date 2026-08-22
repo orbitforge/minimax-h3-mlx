@@ -658,10 +658,15 @@ H3_CHECKPOINT_ROOT=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/checkpoi
 H3_TRANSFORMER=/Users/elbancol/Documents/Codex/2026-08-03/i-am/work/models/minimax-h3-mlx-6bit-streamed-adaln
 ```
 
-Normal/current Render Lab operation uses the streamed-AdaLN Q6 transformer
-shown above. Historical original-checkpoint paths elsewhere in this document
+The `Current` Render Lab choice uses the streamed-AdaLN Q6 transformer shown
+above. Historical original-checkpoint paths elsewhere in this document
 remain source inputs for forge and probe examples, not the current canonical
 Render Lab transformer.
+
+For normal local operation, open `Launch MiniMax H3.command`. It requires the
+repository `.venv/bin/python` and launches `tools/render_lab/server.py --open`,
+failing closed when that interpreter is unavailable. Render Lab exposes the
+logical model choices `Current` and `Beta 0.6`; `Beta 0.6` is the default.
 
 ### Turbo LoRA adapters
 

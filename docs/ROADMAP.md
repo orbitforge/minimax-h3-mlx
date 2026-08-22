@@ -687,6 +687,43 @@ media acceptance.
 
 ---
 
+## Slice 029 - Render Lab Beta Selection
+
+**Status:** Implementation complete — independent review complete; post-promotion
+Render Lab UI/storyboard host acceptance required. See the [Slice 029
+closeout](slice-029-render-lab-beta-selection-closeout.md).
+
+### Delivered scope
+
+- restored `Launch MiniMax H3.command` to launch `tools/render_lab/server.py
+  --open` through the repository `.venv/bin/python`, failing closed when that
+  interpreter is unavailable;
+- added logical Render Lab model choices `Current` and `Beta 0.6`, with
+  `Beta 0.6` as the default and exact streamed-transformer mappings owned by
+  the runner rather than the browser;
+- propagated the selected logical model through ordinary renders and all
+  sequential FL2V storyboard children while preserving the existing `N` cards
+  to `N - 1` adjacent-segment contract;
+- retained `LightX 4-Step v0.1` as the default Turbo preset at 4 NFE and kept
+  native LightX scheduling ownership; and
+- added shared metadata-only streamed-transformer admission with fail-closed
+  config, quantization, topology, sidecar, and byte-count validation.
+
+### Evidence and boundaries
+
+- final model-selection/byte-count contracts passed `17/17`, runtime-selection
+  metadata contracts passed `27/27`, and the broader recorded MLX-free review
+  regression passed `128` tests;
+- real Current and corrected Beta assets admitted metadata-only; and
+- implementation/review did not perform generation or MLX/Metal execution.
+
+Prior external host evidence exists for Current + LightX FL2V Turbo 4-step and
+for corrected Beta 0.6 + LightX FL2V Turbo 4-step, including visual acceptance
+of the latter. Slice 029 itself did not perform those renders. Post-promotion
+Render Lab UI/storyboard host acceptance remains the next required gate.
+
+---
+
 # Later Workflow Improvements
 
 After LoRA stacking and Heretic reconciliation, reassess based on actual Render Lab usage.
